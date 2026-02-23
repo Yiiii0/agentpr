@@ -1,0 +1,52 @@
+diff --git a/env.example b/env.example
+index 5b38960..7d7a727 100644
+--- a/env.example
++++ b/env.example
+@@ -4,6 +4,7 @@ ANTHROPIC_API_KEY=your-api-key
+ GOOGLE_API_KEY=your-api-key
+ XAI_API_KEY=your-api-key
+ OPENROUTER_API_KEY=your-api-key
++FORGE_API_KEY=your-api-key
+ 
+ # Ollama (Local LLM)
+ OLLAMA_BASE_URL=http://127.0.0.1:11434
+diff --git a/src/model/llm.ts b/src/model/llm.ts
+index a0f956d..4eb2911 100644
+--- a/src/model/llm.ts
++++ b/src/model/llm.ts
+@@ -22,6 +22,7 @@ const FAST_MODELS: Record<string, string> = {
+   google: 'gemini-3-flash-preview',
+   xai: 'grok-4-1-fast-reasoning',
+   openrouter: 'openrouter:openai/gpt-4o-mini',
++  forge: 'forge:OpenAI/gpt-4o-mini',
+ };
+ 
+ /**
+@@ -91,6 +92,15 @@ const MODEL_PROVIDERS: Record<string, ModelFactory> = {
+         baseURL: 'https://openrouter.ai/api/v1',
+       },
+     }),
++  'forge:': (name, opts) =>
++    new ChatOpenAI({
++      model: name.replace(/^forge:/, ''),
++      ...opts,
++      apiKey: getApiKey('FORGE_API_KEY', 'Forge'),
++      configuration: {
++        baseURL: 'https://api.forge.tensorblock.co/v1',
++      },
++    }),
+   'ollama:': (name, opts) =>
+     new ChatOllama({
+       model: name.replace(/^ollama:/, ''),
+diff --git a/src/utils/env.ts b/src/utils/env.ts
+index 7aea4ce..525bfe1 100644
+--- a/src/utils/env.ts
++++ b/src/utils/env.ts
+@@ -15,6 +15,7 @@ const PROVIDERS: Record<string, ProviderConfig> = {
+   anthropic: { displayName: 'Anthropic', apiKeyEnvVar: 'ANTHROPIC_API_KEY' },
+   google: { displayName: 'Google', apiKeyEnvVar: 'GOOGLE_API_KEY' },
+   openrouter: { displayName: 'OpenRouter', apiKeyEnvVar: 'OPENROUTER_API_KEY' },
++  forge: { displayName: 'Forge', apiKeyEnvVar: 'FORGE_API_KEY' },
+   ollama: { displayName: 'Ollama' },
+ };
+ 

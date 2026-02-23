@@ -1,0 +1,121 @@
+diff --git a/docs/components/llms/models/forge.mdx b/docs/components/llms/models/forge.mdx
+new file mode 100644
+index 00000000..f7d003aa
+--- /dev/null
++++ b/docs/components/llms/models/forge.mdx
+@@ -0,0 +1,44 @@
++---
++title: Forge
++---
++
++[Forge](https://forge.tensorblock.co) is an LLM router that provides unified access to multiple AI providers (OpenAI, Anthropic, Google, and more) through a single API. It's compatible with the OpenAI API format, making it easy to integrate with existing applications.
++
++## Usage
++
++```python
++import os
++from mem0 import Memory
++
++os.environ["FORGE_API_KEY"] = "your-api-key"
++
++config = {
++    "llm": {
++        "provider": "openai",
++        "config": {
++            "model": "OpenAI/gpt-4o-mini",
++            "temperature": 0.2,
++            "max_tokens": 2000,
++        }
++    }
++}
++
++m = Memory.from_config(config)
++messages = [
++    {"role": "user", "content": "I'm planning to watch a movie tonight. Any recommendations?"},
++    {"role": "assistant", "content": "How about thriller movies? They can be quite engaging."},
++    {"role": "user", "content": "I'm not a big fan of thriller movies but I love sci-fi movies."},
++    {"role": "assistant", "content": "Got it! I'll avoid thriller recommendations and suggest sci-fi movies in the future."}
++]
++m.add(messages, user_id="alice", metadata={"category": "movies"})
++```
++
++You can optionally set a custom base URL:
++
++```python
++os.environ["FORGE_API_BASE"] = "https://api.forge.tensorblock.co/v1"
++```
++
++## Config
++
++All available parameters for the `openai` config are present in [Master List of All Params in Config](../config).
+diff --git a/docs/llms.txt b/docs/llms.txt
+index fed2454a..e9ff6b73 100644
+--- a/docs/llms.txt
++++ b/docs/llms.txt
+@@ -106,6 +106,7 @@ Key differentiators:
+ - [Sarvam](https://docs.mem0.ai/components/llms/models/sarvam): Indian language models
+ - [XAI](https://docs.mem0.ai/components/llms/models/xai): xAI models integration
+ - [LiteLLM](https://docs.mem0.ai/components/llms/models/litellm): Unified LLM interface and proxy
++- [Forge](https://docs.mem0.ai/components/llms/models/forge): LLM router with unified access to multiple AI providers
+ - [LangChain](https://docs.mem0.ai/components/llms/models/langchain): LangChain LLM integration
+ - [OpenAI Structured](https://docs.mem0.ai/components/llms/models/openai_structured): OpenAI with structured output support
+ - [Azure OpenAI Structured](https://docs.mem0.ai/components/llms/models/azure_openai_structured): Azure OpenAI with structured outputs
+diff --git a/mem0/llms/openai.py b/mem0/llms/openai.py
+index a486ff86..1c16bcb8 100644
+--- a/mem0/llms/openai.py
++++ b/mem0/llms/openai.py
+@@ -37,7 +37,12 @@ class OpenAILLM(LLMBase):
+         if not self.config.model:
+             self.config.model = "gpt-4.1-nano-2025-04-14"
+ 
+-        if os.environ.get("OPENROUTER_API_KEY"):  # Use OpenRouter
++        if os.environ.get("FORGE_API_KEY"):  # Use Forge
++            self.client = OpenAI(
++                api_key=os.environ.get("FORGE_API_KEY"),
++                base_url=os.getenv("FORGE_API_BASE") or "https://api.forge.tensorblock.co/v1",
++            )
++        elif os.environ.get("OPENROUTER_API_KEY"):  # Use OpenRouter
+             self.client = OpenAI(
+                 api_key=os.environ.get("OPENROUTER_API_KEY"),
+                 base_url=self.config.openrouter_base_url
+@@ -102,13 +107,18 @@ class OpenAILLM(LLMBase):
+             json: The generated response.
+         """
+         params = self._get_supported_params(messages=messages, **kwargs)
+-        
+-        params.update({
+-            "model": self.config.model,
+-            "messages": messages,
+-        })
+ 
+-        if os.getenv("OPENROUTER_API_KEY"):
++        params.update(
++            {
++                "model": self.config.model,
++                "messages": messages,
++            }
++        )
++
++        if os.getenv("FORGE_API_KEY"):
++            # Forge uses standard OpenAI API format, no special parameters needed
++            pass
++        elif os.getenv("OPENROUTER_API_KEY"):
+             openrouter_params = {}
+             if self.config.models:
+                 openrouter_params["models"] = self.config.models
+@@ -123,13 +133,13 @@ class OpenAILLM(LLMBase):
+                 openrouter_params["extra_headers"] = extra_headers
+ 
+             params.update(**openrouter_params)
+-        
++
+         else:
+             openai_specific_generation_params = ["store"]
+             for param in openai_specific_generation_params:
+                 if hasattr(self.config, param):
+                     params[param] = getattr(self.config, param)
+-            
++
+         if response_format:
+             params["response_format"] = response_format
+         if tools:  # TODO: Remove tools if no issues found with new memory addition logic
