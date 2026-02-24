@@ -1,0 +1,21 @@
+[Unit]
+Description=AgentPR GitHub Webhook Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=CHANGE_ME
+Group=CHANGE_ME
+WorkingDirectory=/ABSOLUTE/PATH/TO/TensorBlcok/agentpr
+Environment=PYTHONUNBUFFERED=1
+Environment=AGENTPR_GITHUB_WEBHOOK_SECRET=CHANGE_ME
+ExecStartPre=/opt/homebrew/bin/python3.11 -m orchestrator.cli doctor --skip-network-check --no-require-gh-auth --require-webhook-secret
+ExecStart=/opt/homebrew/bin/python3.11 -m orchestrator.cli run-github-webhook --host 0.0.0.0 --port 8787
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

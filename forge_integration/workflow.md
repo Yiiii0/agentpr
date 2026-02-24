@@ -113,6 +113,11 @@ Add env var detection in OpenAI initialization.
 6. **Never** raw `pip install -e .` unless project docs explicitly say to
 7. **Never** `rye sync` without `--no-lock` (regenerates lock files, breaks diff)
 
+**Manager runtime isolation (AgentPR):**
+1. All tool caches/data are redirected to `<repo>/.agentpr_runtime/*` via env vars.
+2. If a new tool appears, extend `orchestrator/runtime_env_overrides.json` first.
+3. Treat global-install commands (`brew install`, `npm -g`, `uv tool install`, `poetry self`) as violations.
+
 ## Common Pitfalls
 
 These are distilled from 8+ repo integrations. Each one cost significant debugging time.

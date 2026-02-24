@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -263,6 +264,79 @@ class OrchestratorService:
     def get_run_snapshot(self, run_id: str) -> dict[str, Any]:
         return self.db.get_run_snapshot(run_id)
 
+    def get_run_snapshot_by_pr_number(self, pr_number: int) -> dict[str, Any] | None:
+        return self.db.get_run_snapshot_by_pr_number(pr_number)
+
+    def get_run_snapshot_by_repo_and_pr_number(
+        self,
+        *,
+        owner: str,
+        repo: str,
+        pr_number: int,
+    ) -> dict[str, Any] | None:
+        return self.db.get_run_snapshot_by_repo_and_pr_number(
+            owner=owner,
+            repo=repo,
+            pr_number=pr_number,
+        )
+
+    def list_artifacts(
+        self,
+        run_id: str,
+        *,
+        artifact_type: str | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        with self.db.transaction() as conn:
+            self._require_run(conn, run_id)
+            return self.db.list_artifacts(
+                conn,
+                run_id=run_id,
+                artifact_type=artifact_type,
+                limit=limit,
+            )
+
+    def latest_artifact(self, run_id: str, *, artifact_type: str) -> dict[str, Any] | None:
+        rows = self.list_artifacts(run_id, artifact_type=artifact_type, limit=1)
+        if not rows:
+            return None
+        return rows[0]
+
+    def reserve_webhook_delivery(
+        self,
+        *,
+        source: str,
+        delivery_id: str,
+        event_type: str,
+        payload_sha256: str,
+    ) -> bool:
+        with self.db.transaction() as conn:
+            return self.db.reserve_webhook_delivery(
+                conn,
+                source=source,
+                delivery_id=delivery_id,
+                event_type=event_type,
+                payload_sha256=payload_sha256,
+            )
+
+    def cleanup_webhook_deliveries(self, *, source: str, keep_days: int) -> int:
+        keep_days = max(int(keep_days), 1)
+        keep_after = (datetime.now(UTC) - timedelta(days=keep_days)).isoformat()
+        with self.db.transaction() as conn:
+            return self.db.cleanup_webhook_deliveries(
+                conn,
+                source=source,
+                keep_after_iso=keep_after,
+            )
+
+    def release_webhook_delivery(self, *, source: str, delivery_id: str) -> int:
+        with self.db.transaction() as conn:
+            return self.db.delete_webhook_delivery(
+                conn,
+                source=source,
+                delivery_id=delivery_id,
+            )
+
     def add_step_attempt(
         self,
         run_id: str,
@@ -405,6 +479,8 @@ class OrchestratorService:
             step = payload.get("step", "unknown")
             reason_code = payload.get("reason_code", "unknown")
             message = payload.get("error_message", "")
+            if current_state == RunState.PUSHED:
+                return RunState.NEEDS_HUMAN_REVIEW, f"{step}:{reason_code}:{message}"
             return RunState.FAILED_RETRYABLE, f"{step}:{reason_code}:{message}"
 
         if event_type == EventType.GITHUB_CHECK_COMPLETED:

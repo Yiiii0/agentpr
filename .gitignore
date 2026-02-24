@@ -6,4 +6,5 @@ node_modules/
 dist/
 build/
 orchestrator/data/*.db
+orchestrator/data/reports/*.json
 workspaces/

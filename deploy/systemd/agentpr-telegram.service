@@ -1,0 +1,21 @@
+[Unit]
+Description=AgentPR Telegram Manager Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=CHANGE_ME
+Group=CHANGE_ME
+WorkingDirectory=/ABSOLUTE/PATH/TO/TensorBlcok/agentpr
+Environment=PYTHONUNBUFFERED=1
+Environment=AGENTPR_TELEGRAM_BOT_TOKEN=CHANGE_ME
+ExecStartPre=/opt/homebrew/bin/python3.11 -m orchestrator.cli doctor --skip-network-check --no-require-gh-auth --require-telegram-token
+ExecStart=/opt/homebrew/bin/python3.11 -m orchestrator.cli run-telegram-bot --allow-chat-id CHANGE_ME
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

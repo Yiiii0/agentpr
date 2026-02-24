@@ -10,8 +10,13 @@ CHANGES=${1:-"Add Forge as LLM provider option"}
 PROJECT=${2:-$(basename "$(pwd)")}
 COMMIT_TITLE=${3:-"feat: Add Forge LLM provider support"}
 
-if printf '%s' "$COMMIT_TITLE" | grep -q $'\n'; then
+if [[ "$COMMIT_TITLE" == *$'\n'* ]]; then
     echo "❌ COMMIT_TITLE must be a single line."
+    exit 1
+fi
+
+if [[ -z "${COMMIT_TITLE// }" ]]; then
+    echo "❌ COMMIT_TITLE cannot be empty."
     exit 1
 fi
 

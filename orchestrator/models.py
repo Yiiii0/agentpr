@@ -49,9 +49,18 @@ class EventType(StrEnum):
 
 
 class StepName(StrEnum):
+    PREFLIGHT = "preflight"
     PREPARE = "prepare"
     FINISH = "finish"
     AGENT = "agent"
+    PR_CREATE = "pr_create"
+    GITHUB_SYNC = "github_sync"
+
+
+class AgentRuntimeGrade(StrEnum):
+    PASS = "PASS"
+    RETRYABLE = "RETRYABLE"
+    HUMAN_REVIEW = "HUMAN_REVIEW"
 
 
 @dataclass(frozen=True)

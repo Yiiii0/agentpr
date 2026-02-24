@@ -88,11 +88,24 @@ class Database:
                     created_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS webhook_deliveries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source TEXT NOT NULL,
+                    delivery_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    payload_sha256 TEXT NOT NULL,
+                    received_at TEXT NOT NULL,
+                    UNIQUE(source, delivery_id)
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_events_run_created
                 ON events(run_id, created_at);
 
                 CREATE INDEX IF NOT EXISTS idx_attempts_run_step
                 ON step_attempts(run_id, step, attempt_no);
+
+                CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_received
+                ON webhook_deliveries(source, received_at);
                 """
             )
 
@@ -306,3 +319,150 @@ class Database:
                 "state": state.value,
             }
 
+    def get_run_snapshot_by_pr_number(self, pr_number: int) -> dict[str, Any] | None:
+        with self.transaction() as conn:
+            row = conn.execute(
+                """
+                SELECT r.*
+                FROM runs r
+                WHERE r.pr_number = ?
+                ORDER BY r.updated_at DESC
+                LIMIT 1
+                """,
+                (pr_number,),
+            ).fetchone()
+            if row is None:
+                return None
+            run = dict(row)
+            run["budget"] = json.loads(run.pop("budget_json"))
+            state = self.get_state(conn, run["run_id"])
+            return {
+                "run": run,
+                "state": state.value,
+            }
+
+    def get_run_snapshot_by_repo_and_pr_number(
+        self,
+        *,
+        owner: str,
+        repo: str,
+        pr_number: int,
+    ) -> dict[str, Any] | None:
+        with self.transaction() as conn:
+            row = conn.execute(
+                """
+                SELECT r.*
+                FROM runs r
+                WHERE r.owner = ? AND r.repo = ? AND r.pr_number = ?
+                ORDER BY r.updated_at DESC
+                LIMIT 1
+                """,
+                (owner, repo, pr_number),
+            ).fetchone()
+            if row is None:
+                return None
+            run = dict(row)
+            run["budget"] = json.loads(run.pop("budget_json"))
+            state = self.get_state(conn, run["run_id"])
+            return {
+                "run": run,
+                "state": state.value,
+            }
+
+    def list_artifacts(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        run_id: str,
+        artifact_type: str | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        if artifact_type is None:
+            rows = conn.execute(
+                """
+                SELECT id, run_id, artifact_type, uri, metadata_json, created_at
+                FROM artifacts
+                WHERE run_id = ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (run_id, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT id, run_id, artifact_type, uri, metadata_json, created_at
+                FROM artifacts
+                WHERE run_id = ? AND artifact_type = ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (run_id, artifact_type, limit),
+            ).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["metadata"] = json.loads(item.pop("metadata_json"))
+            result.append(item)
+        return result
+
+    def reserve_webhook_delivery(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        source: str,
+        delivery_id: str,
+        event_type: str,
+        payload_sha256: str,
+    ) -> bool:
+        try:
+            conn.execute(
+                """
+                INSERT INTO webhook_deliveries (
+                    source, delivery_id, event_type, payload_sha256, received_at
+                )
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    source,
+                    delivery_id,
+                    event_type,
+                    payload_sha256,
+                    utcnow_iso(),
+                ),
+            )
+        except sqlite3.IntegrityError:
+            return False
+        return True
+
+    def cleanup_webhook_deliveries(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        source: str,
+        keep_after_iso: str,
+    ) -> int:
+        cursor = conn.execute(
+            """
+            DELETE FROM webhook_deliveries
+            WHERE source = ? AND received_at < ?
+            """,
+            (source, keep_after_iso),
+        )
+        return int(cursor.rowcount)
+
+    def delete_webhook_delivery(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        source: str,
+        delivery_id: str,
+    ) -> int:
+        cursor = conn.execute(
+            """
+            DELETE FROM webhook_deliveries
+            WHERE source = ? AND delivery_id = ?
+            """,
+            (source, delivery_id),
+        )
+        return int(cursor.rowcount)

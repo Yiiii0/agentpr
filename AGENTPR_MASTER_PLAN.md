@@ -1,8 +1,18 @@
 # AgentPR Master Plan (Detailed)
 
-> 更新时间：2026-02-23  
+> 更新时间：2026-02-24  
 > 文档状态：实施中（Phase A 已落地）  
 > 项目目标：把现有 Forge 集成流程升级为可持续运营的 AgentPR 系统，在保证最小改动策略下提高成功率、可控性与可回放性。
+
+---
+
+## 0. 决策记忆（锁定项）
+
+1. 运行时 Python 固定 `python3.11`。
+2. 非交互执行器当前阶段固定 `codex exec`。
+3. baseline 验证仓库固定 2 个：`mem0ai/mem0`、`virattt/dexter`。
+4. 本机 codex 默认配置已确认：`model=gpt-5.3-codex`、`model_reasoning_effort=xhigh`，manager 默认不传 `--codex-model`。
+5. manager MVP 运行预设：`--codex-sandbox danger-full-access`（由 preflight + 运行时隔离策略兜底）。
 
 ---
 
@@ -19,7 +29,7 @@
 
 1. 不是“改代码能力不足”，而是“首轮读仓库 + 规则合规 + 状态追踪”成本高。
 2. 需要统一的状态事实源与事件闭环，不再依赖手工表格维护。
-3. 非交互执行（`codex exec`/`claude -p`）成功率未知，必须先做基线验证再扩控制面。
+3. 非交互执行（`codex exec`）成功率未知，必须先做基线验证再扩控制面。
 
 ---
 
@@ -31,16 +41,18 @@
 
 2. PR gate：`bot_approve_then_create_pr`  
 - 需要人工审批后才可调用 `gh pr create`。
-- 强制二次确认：`approve_open_pr --confirm`。
+- 强制二次确认：`approve-open-pr --confirm`。
 
 3. bot 平台：`telegram_first`  
 - 先做 Telegram，后续可扩展 Slack。
 
-4. 执行器：`codex exec` 默认，`claude -p` 备选。
+4. 执行器：当前阶段固定 `codex exec`。
 
 5. 存储：MVP 用 SQLite，满足升级阈值后切 Postgres。
 
 6. 预算护栏：MVP 启用，且全部可配置。
+
+7. baseline 仓库：固定 `mem0` 与 `dexter`。
 
 默认阈值（可调）：
 1. `max_run_minutes = 90`
@@ -100,7 +112,7 @@
 5. 合规通过后 commit + push，状态到 `PUSHED`。
 6. 人工 review：
 - `deny`：终止或转人工修正
-- `approve_open_pr --confirm`：创建 PR 并绑定 `pr_number`
+- `approve-open-pr --confirm`：创建 PR 并绑定 `pr_number`
 7. 进入 CI/review 迭代（`CI_WAIT/REVIEW_WAIT/ITERATING`）。
 8. 满足完成条件后转 `DONE`，merge 人工执行。
 
@@ -223,16 +235,37 @@
 
 ### 9.4 非交互执行器契约（新增）
 
-1. 新增命令：`python3 -m orchestrator.cli run-agent-step`
-2. 支持执行器：`codex`、`claude`
+1. 新增命令：`python3.11 -m orchestrator.cli run-agent-step`
+2. 执行器固定：`codex exec`
 3. 输入：`run_id` + `--prompt` 或 `--prompt-file` + 可选 `--agent-arg`
 4. 行为：
+- 默认先执行 preflight（`.git` 写权限、工具链、依赖源网络）  
+- preflight 不通过则直接收敛到 `NEEDS_HUMAN_REVIEW`
 - 自动在 run workspace 内执行
+- 支持显式指定 `codex` 参数（sandbox/model/full-auto）
 - 记录 `step_attempts(step=agent)`
 - 失败时记录 `worker.step.failed`
+- 生成结构化 runtime report，并自动产出 verdict（`PASS/RETRYABLE/HUMAN_REVIEW`）
+- verdict 元数据写入 run artifact（`grade/reason_code/next_action`）
+- 仅当 verdict=`PASS` 时才应用 `--success-state`
+4.1 codex 参数约束：
+- `--codex-sandbox`: `read-only` / `workspace-write` / `danger-full-access`
+- `--codex-model`: 透传给 codex CLI，默认沿用本地 profile
+- `--no-codex-full-auto`: 关闭 full-auto（默认开启）
+4.2 命令映射（当前实现）：
+- 默认：`codex exec --sandbox danger-full-access --ask-for-approval on-request "<prompt>"`
+- 非 `workspace-write` 但保持自动执行：`codex exec --sandbox <mode> --ask-for-approval on-request "<prompt>"`
+- 设定模型：`codex exec --sandbox <mode> ... --model <model> "<prompt>"`
+- 关闭 full-auto：`codex exec --sandbox <mode> [--model <model>] "<prompt>"`
+4.3 preflight 参数：
+- `run-preflight` 与 `run-agent-step` 都支持 `--codex-sandbox`
+- 当 `--codex-sandbox read-only` 时，preflight 直接失败（阻断建环境/测试）
 5. 状态约束：
 - 仅允许在 `DISCOVERY/IMPLEMENTING/LOCAL_VALIDATING/ITERATING`
 - `QUEUED` 调用时自动推进到 `DISCOVERY`
+6. 当前形态说明：
+- 目前是“单次大 prompt”执行，不是 skills 分段执行
+- `run-agent-step` 已带自动分级与状态分流（失败或证据不足会自动收敛到 `FAILED_RETRYABLE` / `NEEDS_HUMAN_REVIEW`）
 
 ---
 
@@ -253,6 +286,7 @@
 说明：
 1. 3-skill 是最小可运营切片。
 2. 后续可按复杂度再拆。
+3. 当前代码尚未接入 skills 执行链；baseline 仍是单体 prompt 模式。
 
 ---
 
@@ -269,11 +303,15 @@
 1. 全局工具预装（brew/gh/python/bun/uv/rye/hatch/poetry/tox）。
 2. 自动执行中禁止新增全局安装。
 3. repo 依赖按仓库规范在局部环境安装（venv/node_modules）。
+4. worker 运行时强制本地化缓存/数据目录（`<repo>/.agentpr_runtime`）。
+5. Python 侧强制 `PIP_REQUIRE_VIRTUALENV=true`，避免误写全局 site-packages。
+6. 可扩展隔离策略文件：`orchestrator/runtime_env_overrides.json`（新增工具优先改配置而非改代码）。
 
 ### 11.3 失败策略
 
 1. 权限不足/环境缺失必须结构化报错。
 2. 错误分流：`FAILED_RETRYABLE` 或 `NEEDS_HUMAN_REVIEW`。
+3. repo 不在 `workspace_root` 范围内时 preflight 直接失败（阻断越界执行）。
 
 ---
 
@@ -303,11 +341,11 @@
 5. 非交互执行入口（`run-agent-step`）
 6. CLI 命令集（含 `mark-done`、`idempotency-key`）
 
-### Phase B（下一阶段）
+### Phase B（进行中）
 
-1. Telegram bot 命令层
-2. `approve_open_pr --confirm` 与 `gh pr create` 集成
-3. GitHub 事件自动消费（check/review/comment）
+1. Telegram bot 命令层（已完成 MVP：`run-telegram-bot` + 基础命令）
+2. `request-open-pr` / `approve-open-pr --confirm` 与 `gh pr create` 集成（已完成 CLI 版本）
+3. GitHub 事件自动消费（已完成轮询版：`sync-github` + webhook 版：`run-github-webhook`）
 
 ### Phase C（增强）
 
@@ -317,7 +355,7 @@
 
 ---
 
-## 14. 当前实现状态（2026-02-23）
+## 14. 当前实现状态（2026-02-24）
 
 ### 14.1 已完成实现
 
@@ -329,72 +367,158 @@
 3. `orchestrator/db.py`
 4. `orchestrator/service.py`
 5. `orchestrator/executor.py`
-6. `orchestrator/cli.py`
-7. `orchestrator/__main__.py`
-8. `orchestrator/README.md`
+6. `orchestrator/preflight.py`
+7. `orchestrator/cli.py`
+8. `orchestrator/__main__.py`
+9. `orchestrator/README.md`
+10. `orchestrator/github_sync.py`
+11. `orchestrator/telegram_bot.py`
+12. `orchestrator/github_webhook.py`
 
 辅助更新：
 1. `agentpr/README.md`（加入 quick start）
 2. `agentpr/.gitignore`（忽略 `orchestrator/data/*.db` 和 `workspaces/`）
+3. `agentpr/deploy/`（systemd / supervisord 模板）
 
 ### 14.2 当前可用方法
 
 1. 初始化数据库
 ```bash
-python3 -m orchestrator.cli init-db
+python3.11 -m orchestrator.cli init-db
+python3.11 -m orchestrator.cli doctor --require-codex
 ```
 
 2. 创建并推进 run
 ```bash
-python3 -m orchestrator.cli create-run --owner OWNER --repo REPO --prompt-version v1
-python3 -m orchestrator.cli start-discovery --run-id <run_id>
-python3 -m orchestrator.cli run-prepare --run-id <run_id>
-python3 -m orchestrator.cli mark-plan-ready --run-id <run_id> --contract-path <path>
-python3 -m orchestrator.cli start-implementation --run-id <run_id>
-python3 -m orchestrator.cli mark-local-validated --run-id <run_id>
-python3 -m orchestrator.cli run-finish --run-id <run_id> --changes "..." --project REPO --commit-title "feat(scope): ..."
+python3.11 -m orchestrator.cli create-run --owner OWNER --repo REPO --prompt-version v1
+python3.11 -m orchestrator.cli start-discovery --run-id <run_id>
+python3.11 -m orchestrator.cli run-prepare --run-id <run_id>
+python3.11 -m orchestrator.cli mark-plan-ready --run-id <run_id> --contract-path <path>
+python3.11 -m orchestrator.cli start-implementation --run-id <run_id>
+python3.11 -m orchestrator.cli mark-local-validated --run-id <run_id>
+python3.11 -m orchestrator.cli run-finish --run-id <run_id> --changes "..." --project REPO --commit-title "feat(scope): ..."
 ```
 
-3. 关联 PR 与记录检查
+3. 开 PR（双确认 gate）与记录检查
 ```bash
-python3 -m orchestrator.cli link-pr --run-id <run_id> --pr-number 123
-python3 -m orchestrator.cli record-check --run-id <run_id> --conclusion success --pr-number 123
-python3 -m orchestrator.cli record-review --run-id <run_id> --state changes_requested
-python3 -m orchestrator.cli mark-done --run-id <run_id>
+python3.11 -m orchestrator.cli request-open-pr --run-id <run_id> --title "feat(scope): ..." --body-file forge_integration/pr_description_template.md
+python3.11 -m orchestrator.cli approve-open-pr --run-id <run_id> --request-file <request.json> --confirm-token <token> --confirm
+python3.11 -m orchestrator.cli record-check --run-id <run_id> --conclusion success --pr-number 123
+python3.11 -m orchestrator.cli record-review --run-id <run_id> --state changes_requested
+python3.11 -m orchestrator.cli mark-done --run-id <run_id>
+```
+
+3.1 手动关联 PR（备用路径）
+```bash
+python3.11 -m orchestrator.cli link-pr --run-id <run_id> --pr-number 123
+python3.11 -m orchestrator.cli record-check --run-id <run_id> --conclusion success --pr-number 123
+python3.11 -m orchestrator.cli record-review --run-id <run_id> --state changes_requested
+python3.11 -m orchestrator.cli mark-done --run-id <run_id>
 ```
 
 4. 非交互执行（基线验证）
 ```bash
-python3 -m orchestrator.cli run-agent-step --run-id <run_id> --engine codex --prompt-file <prompt.md>
+python3.11 -m orchestrator.cli run-preflight --run-id <run_id>
+python3.11 -m orchestrator.cli run-agent-step --run-id <run_id> --prompt-file <prompt.md>
 # 或
-python3 -m orchestrator.cli run-agent-step --run-id <run_id> --engine claude --prompt "<prompt>"
+python3.11 -m orchestrator.cli run-agent-step --run-id <run_id> --prompt "<prompt>"
 ```
 
 5. 运维命令
 ```bash
-python3 -m orchestrator.cli list-runs
-python3 -m orchestrator.cli show-run --run-id <run_id>
-python3 -m orchestrator.cli pause --run-id <run_id>
-python3 -m orchestrator.cli resume --run-id <run_id> --target-state DISCOVERY
-python3 -m orchestrator.cli retry --run-id <run_id> --target-state IMPLEMENTING
+python3.11 -m orchestrator.cli list-runs
+python3.11 -m orchestrator.cli show-run --run-id <run_id>
+python3.11 -m orchestrator.cli doctor
+python3.11 -m orchestrator.cli pause --run-id <run_id>
+python3.11 -m orchestrator.cli resume --run-id <run_id> --target-state DISCOVERY
+python3.11 -m orchestrator.cli retry --run-id <run_id> --target-state IMPLEMENTING
+python3.11 -m orchestrator.cli sync-github --dry-run
+python3.11 -m orchestrator.cli sync-github --loop --interval-sec 120
+python3.11 -m orchestrator.cli run-telegram-bot --allow-chat-id <chat_id>
+python3.11 -m orchestrator.cli run-github-webhook --host 0.0.0.0 --port 8787
+python3.11 -m orchestrator.cli cleanup-webhook-deliveries --keep-days 30
 ```
+说明：可变命令默认启用 startup doctor gate；仅在调试时使用全局 `--skip-doctor` 跳过。
 
 ### 14.3 已验证情况
 
-1. 语法编译通过：`python3 -m compileall agentpr/orchestrator`
+1. 语法编译通过：`python3.11 -m compileall agentpr/orchestrator`
 2. CLI 参数解析与命令执行通过
 3. 关键状态转移路径可达
 4. 非法状态转移会显式报错（不再静默）
 5. 脚本执行失败可被记录并进入 `FAILED_RETRYABLE`
 6. 幂等重复已验证（同 payload 默认 key 下第二次事件被判定 duplicate）
 7. `mark-done` 路径已验证（`PUSHED -> DONE`）
+8. preflight 门禁已接入（环境不满足时快速失败并转人工）
+9. preflight 已覆盖 sandbox 策略检查（`read-only` 会被明确拦截）
+10. 每次 agent 执行会产出结构化 runtime report（命令样本、测试/推送信号、安全违规信号）
+11. runtime report 已包含自动分级判定与原因码（`PASS/RETRYABLE/HUMAN_REVIEW`）
+12. PR gate CLI 已实现：`request-open-pr`（生成 token）+ `approve-open-pr --confirm`（二次确认后创建 PR 并自动 link）
+13. PR gate 已做本地 smoke 验证：token/过期/确认参数校验路径与失败分流路径可用
+14. Telegram bot MVP 已实现：`/list`、`/show`、`/status`、`/pending_pr`、`/approve_pr`、`/pause`、`/resume`、`/retry`
+15. GitHub 轮询同步已实现：`sync-github` 支持 dry-run/loop，把 check/review 结果映射回状态机事件
+16. GitHub webhook server 已实现：签名校验 + 事件解析 + 状态机映射（check/review）
+17. Webhook 重放保护已实现：按 `X-GitHub-Delivery` 去重并落库（`webhook_deliveries`）
+18. Webhook 失败重试通路已打通：处理失败会释放去重锁并返回 retryable 响应
+19. Telegram allowlist 默认强制：未配置 `--allow-chat-id` 时需显式 `--allow-any-chat` 才可启动
+20. 部署模板已提供：`deploy/systemd/*` 与 `deploy/supervisord/agentpr-manager.conf`
+21. startup doctor 已实现：`doctor` 命令支持 auth/network/tooling/secrets 可配置检查
+22. mutable 命令默认启用 doctor gate，失败将快速阻断并给出修复入口（`doctor`）
+23. deploy 模板已接入启动前 gate：systemd `ExecStartPre` / supervisord `doctor && main process`
 
 ### 14.4 当前未实现项
 
-1. Telegram bot（命令层）
-2. 自动 PR 创建命令链（含二次确认）
-3. GitHub webhook/server 事件接入
-4. 真实 repo 非交互成功率基线（3-5 个样本）尚未完成
+1. Telegram bot 生产加固（审计日志、限流与命令级权限）
+2. GitHub webhook 生产加固（公网入口、监控告警、持久化可观测性）
+3. skills 执行链接入（repo-preflight-contract / implement-and-validate / ci-review-fix）
+4. agent 自动状态收敛的可配置策略（当前已实现默认分级分流，待补可调阈值）
+
+### 14.5 Baseline 结果（`mem0` + `dexter`）
+
+1. 结论：2/2 均完成非交互执行并产出改动，结果分类均为 `NEEDS REVIEW`。
+2. `mem0`：
+- agent 第 1 次失败（连接/环境），第 2 次成功
+- 成功耗时约 6m20s
+- 产出 4 个改动文件（代码 + 测试 + 文档）
+- 明确读取了 `CONTRIBUTING.md`、`PULL_REQUEST_TEMPLATE.md`、CI workflow 并尝试执行 `make lint` / `make test`
+3. `dexter`：
+- agent 第 1 次成功
+- 成功耗时约 4m59s
+- 产出 6 个改动文件
+- 明确读取了 `AGENTS.md`、CI workflow 并尝试执行 `bun run typecheck` / `bun test`
+4. 共性阻塞：
+- 当前运行环境对 `.git` 写入受限，`finish.sh` 无法完成 commit/push
+- 部分仓库依赖安装受网络/权限限制，导致无法完整跑 lint/test
+5. 工程修正：
+- `finish.sh` 的 `COMMIT_TITLE` 单行校验已修复（避免误报）
+6. 状态修正：
+- 两个 baseline run 已手动收敛到 `NEEDS_HUMAN_REVIEW`
+
+### 14.6 环境可执行性结论（基于 baseline）
+
+1. “能改代码”已验证，但“能完整建环境+跑测试+提交”未完全验证。
+2. 主阻塞来自运行环境而非代码逻辑：
+- 依赖源网络不可达时，安装失败，测试只能部分执行或无法执行
+- worker 运行时的 sandbox 策略会影响可执行能力
+3. preflight 已经接入，可在 worker 启动前识别这些阻塞并快速失败。
+4. 仍需在目标运行环境中验证：
+- 依赖安装成功率
+- repo 规定测试命令完整通过率
+- commit/push 通过 manager gate 的稳定性
+
+### 14.7 当前主要问题（实事求是）
+
+1. 执行环境问题仍是第一阻塞：
+- 外网依赖源不可达会直接导致“无法证明测试通过”
+- `.git` 写权限受限会导致“无法提交/推送”
+- 现已通过 startup doctor + repo preflight 双门禁将失败前置，但仍依赖真实运行环境可达性
+ - 实测样例：`doctor --require-codex` 失败于 `gh.auth + net.*`，`run-preflight` 在 mem0 上 `git.write` 为通过
+2. 当前仍是“单次大 prompt”：
+- skills 边界已定义，但未接入自动执行链
+3. manager 能力还未闭环：
+- CLI/bot/轮询/webhook 已接通，且守护模板已提供；但生产部署与监控告警尚未落地
+4. 质量证据结构化仍不足：
+- 结构化 report + 自动分级已上线，但判定阈值仍需参数化（如 test 证据阈值、重试上限联动）
 
 ---
 
@@ -423,9 +547,41 @@ python3 -m orchestrator.cli retry --run-id <run_id> --target-state IMPLEMENTING
 
 ## 16. 下一步执行清单（从现在开始）
 
-1. 先做首轮 3-5 repo 非交互基线（`run-agent-step` + 统一 prompt），统计成功率与失败类型。
-2. 根据基线结果调 prompt/分步策略，再进入 Telegram bot 开发。
-3. 实现 Telegram bot 命令入口（status/detail/retry/pause/approve_open_pr）。
-4. 实现 `approve_open_pr --confirm` 二次确认 + `gh pr create`。
-5. 增加 GitHub 事件消费器（check/review/comment）。
-6. 加入配置文件（预算、超时、重试、并发）。
+1. 固化 startup doctor 作为 manager 启动前置 gate（将 CI/守护进程启动脚本统一接入 `doctor`）。
+2. 在“可访问依赖源 + `.git` 可写”的环境重跑 `mem0`、`dexter`，先拿到真实非交互成功率基线。
+3. 将自动分级判定参数化（阈值、模式、白名单规则），并与重试策略联动。
+4. 为 Telegram bot 增加部署与安全配置（强制 allowlist、systemd/pm2/supervisord）。
+5. 为 webhook 增加公网接入方案与监控告警（保留 `sync-github` 作为 fallback）。
+6. 增加配置文件（预算、超时、重试、并发）并将 bot/sync/webhook 参数集中化。
+7. 视基线结果再决定是否引入 skills 分段执行（当前不作为阻塞项）。
+
+---
+
+## 17. 对话沉淀 Insights（2026-02-24）
+
+1. 主要矛盾优先级  
+- 第一位是“可执行环境”（网络、`.git` 可写、依赖安装可达），不是“再加更多编排层”。
+
+2. manager 与 worker 职责边界  
+- worker 专注读仓库、最小改动实现、验证与报告；  
+- manager 专注状态管理、策略判断、审批门禁、最终 push/PR 动作。
+
+3. skills 的正确定位  
+- skills 是分段契约（输入/输出/验收标准），不是必须多次起 CLI 的机械拆分。
+
+4. 自动化安全观  
+- `danger-full-access` 可提升成功率，但必须配套边界：workspace 范围检查、局部缓存/环境、禁止全局安装、禁止 sudo。
+- 若要硬隔离，仍应落到容器/VM，不应把“提示约束”当安全边界。
+
+5. 评估方法论  
+- 先拿真实 baseline（成功率/失败类型），再决定是否继续扩控制面或优化 prompt/skills。
+- 没有 baseline 指标的系统设计讨论，容易过度工程化。
+
+6. 交互方式定位  
+- CLI 是 manager 的执行接口，不是最终用户主入口。  
+- 最终用户应通过 Telegram/对话入口下发任务与审批，manager 再调用 CLI。
+
+7. 未知工具链应对原则  
+- 先扩展 `runtime_env_overrides.json` 做环境隔离覆盖；  
+- 再通过 preflight 增加命令/网络检测；  
+- 最后才改执行流程代码。
