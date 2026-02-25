@@ -257,11 +257,15 @@ MVP 仅开放下列 actions：
 6. Webhook/轮询/审计与告警模板。
 7. `skills-metrics` + `skills-feedback`。
 8. Phase B1 规则版 manager loop 已落地：`manager-tick` / `run-manager-loop`。
+9. Bot 双模路由已落地：`/` 开头按命令执行，非 `/` 文本按自然语言 intent 路由；每次回复附带固定 rules 尾注。
+10. Manager 决策模式已扩展：`rules|llm|hybrid`（OpenAI-compatible function-calling，支持 Forge 网关）。
+11. Bot 自然语言已接入 Manager LLM 路由（`rules|hybrid|llm`），并支持会话级 `run_id` 绑定（内存态）。
+12. CLI 支持自动加载项目根目录 `.env`；新增 `.env.example` 作为标准环境模板。
 
 未完成（关键）：
-1. Manager LLM API 决策层（当前仍是规则版决策）。
-2. Telegram 自然语言路由。
-3. manager 与 bot 的 NL 对话上下文持久化与工具调用审计。
+1. manager 与 bot 的 NL 对话上下文持久化（当前为进程内内存态）。
+2. bot 侧 tool-calling 决策轨迹的结构化审计字段（当前主要体现在响应文本/audit response）。
+3. LLM 决策模式在线上环境的策略校准（action 命中率、fallback 率、误路由率）。
 
 ---
 
@@ -289,11 +293,10 @@ MVP 仅开放下列 actions：
 
 ## 15. 下一步（直接执行）
 
-1. 实现 `manager_decision.py`（rules）。
-2. 实现 `manager_loop.py`（自动推进）。
-3. 实现 `manager_llm.py`（Forge function-calling）。
-4. Telegram 接入 NL 路由。
-5. 文档与 runbook 更新到“bot-only 操作”。
+1. 将 bot 会话上下文从内存态升级为可恢复存储（SQLite 表或 run artifact）。
+2. 扩展 bot 审计日志：单独记录 NL 决策输入摘要、action、fallback 原因。
+3. 接通 B4：把 `skills-feedback` 自动转为 prompt/skill patch 草案（默认人工审批）。
+4. 完善 bot-only runbook：从 `.env` 到上线检查的全链路脚本化。
 
 ---
 

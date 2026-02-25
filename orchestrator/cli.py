@@ -41,6 +41,33 @@ from .state_machine import InvalidTransitionError, allowed_targets
 from .telegram_bot import TelegramClient, run_telegram_bot_loop
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def load_dotenv(path: Path) -> None:
+    if not path.exists() or not path.is_file():
+        return
+    raw_lines = path.read_text(encoding="utf-8").splitlines()
+    for raw in raw_lines:
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :].strip()
+        if "=" not in line:
+            continue
+        key_raw, value_raw = line.split("=", 1)
+        key = key_raw.strip()
+        if not key or key.startswith("#"):
+            continue
+        value = value_raw.strip()
+        if value and value[0] in {'"', "'"} and value[-1:] == value[0]:
+            value = value[1:-1]
+        if key not in os.environ:
+            os.environ[key] = value
+
+
+load_dotenv(PROJECT_ROOT / ".env")
+
 DEFAULT_DB_PATH = PROJECT_ROOT / "orchestrator" / "data" / "agentpr.db"
 DEFAULT_WORKSPACE_ROOT = Path(
     os.environ.get("AGENTPR_BASE_DIR", str(PROJECT_ROOT / "workspaces"))
@@ -146,6 +173,37 @@ def add_manager_common_args(command_parser: argparse.ArgumentParser) -> None:
         "--dry-run",
         action="store_true",
         help="Plan actions without executing them.",
+    )
+    command_parser.add_argument(
+        "--decision-mode",
+        choices=["rules", "llm", "hybrid"],
+        default="rules",
+        help="Manager decision strategy (default: rules).",
+    )
+    command_parser.add_argument(
+        "--manager-api-base",
+        help=(
+            "OpenAI-compatible API base for manager LLM "
+            "(default: AGENTPR_MANAGER_API_BASE or https://api.openai.com/v1)."
+        ),
+    )
+    command_parser.add_argument(
+        "--manager-model",
+        help="Manager LLM model (default: AGENTPR_MANAGER_MODEL or gpt-4o-mini).",
+    )
+    command_parser.add_argument(
+        "--manager-timeout-sec",
+        type=int,
+        default=20,
+        help="Manager LLM HTTP timeout seconds (default: 20).",
+    )
+    command_parser.add_argument(
+        "--manager-api-key-env",
+        default="AGENTPR_MANAGER_API_KEY",
+        help=(
+            "Env var name storing manager API key "
+            "(default: AGENTPR_MANAGER_API_KEY)."
+        ),
     )
 
 
@@ -993,6 +1051,13 @@ def build_manager_loop_config_from_args(args: argparse.Namespace) -> ManagerLoop
         skills_mode=str(args.skills_mode).strip() if args.skills_mode is not None else None,
         agent_args=tuple(str(item) for item in (args.agent_arg or [])),
         dry_run=bool(args.dry_run),
+        decision_mode=str(args.decision_mode).strip().lower(),
+        manager_api_base=(
+            str(args.manager_api_base).strip() if args.manager_api_base is not None else None
+        ),
+        manager_model=str(args.manager_model).strip() if args.manager_model is not None else None,
+        manager_timeout_sec=max(int(args.manager_timeout_sec), 1),
+        manager_api_key_env=str(args.manager_api_key_env).strip() or "AGENTPR_MANAGER_API_KEY",
     )
 
 

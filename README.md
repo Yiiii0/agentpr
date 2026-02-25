@@ -6,11 +6,14 @@ Lightweight orchestrator for Forge OSS integration runs.
 
 ```bash
 cd /Users/yi/Documents/Career/TensorBlcok/agentpr
+cp .env.example .env
 python3.11 -m orchestrator.cli init-db
 python3.11 -m orchestrator.cli doctor --require-codex
 python3.11 -m orchestrator.cli install-skills --install-curated-ci
 python3.11 -m orchestrator.cli skills-status
 ```
+
+`orchestrator.cli` 会在启动时自动加载项目根目录 `.env`（仅在环境变量未设置时填充默认值）。
 
 Create and drive a run:
 
@@ -143,7 +146,27 @@ python3.11 -m orchestrator.cli run-manager-loop \
   --prompt-file orchestrator/data/prompts/baseline_mem0_20260224.md \
   --skills-mode agentpr \
   --interval-sec 300
+
+# LLM decision mode (OpenAI-compatible API)
+AGENTPR_MANAGER_API_KEY=*** \
+AGENTPR_MANAGER_MODEL=gpt-4o-mini \
+python3.11 -m orchestrator.cli manager-tick \
+  --decision-mode hybrid \
+  --prompt-file orchestrator/data/prompts/baseline_mem0_20260224.md \
+  --skills-mode agentpr
 ```
+
+Manager LLM envs for `--decision-mode llm|hybrid`:
+- `AGENTPR_MANAGER_API_KEY` (required)
+- `AGENTPR_MANAGER_MODEL` (optional, default `gpt-4o-mini`)
+- `AGENTPR_MANAGER_API_BASE` (optional, default `https://api.openai.com/v1`, can point to Forge/OpenAI-compatible gateway)
+
+Telegram NL router envs:
+- `AGENTPR_TELEGRAM_NL_MODE` (`rules` | `hybrid` | `llm`, default `rules`)
+- `AGENTPR_TELEGRAM_NL_MODEL` (optional; fallback to `AGENTPR_MANAGER_MODEL`)
+- `AGENTPR_TELEGRAM_NL_API_BASE` (optional; fallback to `AGENTPR_MANAGER_API_BASE`)
+- `AGENTPR_TELEGRAM_NL_API_KEY_ENV` (optional; default `AGENTPR_MANAGER_API_KEY`)
+- `AGENTPR_TELEGRAM_NL_TIMEOUT_SEC` (optional; default `20`)
 
 `inspect-run` now exposes agent black-box internals from codex JSONL events:
 - `latest_agent_runtime.agent_event_summary.event_type_counts`
@@ -169,11 +192,17 @@ Telegram command tiers:
 - `write`: `/pause` `/resume` `/retry`
 - `admin`: `/approve_pr`
 
-Manager interaction mode (current vs target):
-- Current: Telegram is command-first (deterministic control actions).
-- Target: command + natural-language dual mode.
-- Planned architecture: Telegram -> manager LLM (API function-calling) -> orchestrator actions -> worker (`codex exec`).
+Manager interaction mode:
+- Telegram is dual-mode:
+  - starts with `/` => command mode (deterministic actions)
+  - plain text => natural-language mode (manager routing)
+- NL router supports `rules|hybrid|llm`:
+  - `rules`: deterministic intent parser only
+  - `hybrid`: manager LLM first, deterministic fallback on failure
+  - `llm`: manager LLM only
+- Architecture: Telegram -> manager LLM (API function-calling) -> orchestrator actions -> worker (`codex exec`).
 - Manager does not directly run arbitrary shell; it calls whitelisted orchestration actions.
+- Bot now appends a fixed rules footer in every reply so users always see available actions and safety gates.
 
 Notes:
 - mutable commands now run a startup doctor gate by default (workspace write/tooling/auth/network profile checks).

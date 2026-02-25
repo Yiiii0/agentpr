@@ -12,7 +12,7 @@ This package provides a minimal Phase A implementation:
 6. Environment preflight checks before worker execution
 7. Startup doctor gate for manager/worker prerequisite validation
 8. Skills-mode prompt envelope + task packet artifacts for worker-stage execution
-9. Command-first Telegram control plane (NL manager routing is a planned Phase B upgrade)
+9. Telegram dual-mode control plane (`/` command mode + NL routing `rules|hybrid|llm`)
 
 ## Core Modules
 
@@ -31,7 +31,7 @@ This package provides a minimal Phase A implementation:
 13. Manager policy file: `manager_policy.json` (sandbox/skills-mode/timeout/diff budget/retry cap/test-evidence defaults + repo overrides)
 14. PR gate commands: `request-open-pr` -> `approve-open-pr --confirm` (double confirmation + DoD gate)
 15. `github_sync.py`: gh PR payload -> check/review sync decisions
-16. `telegram_bot.py`: Telegram long-poll command loop for manager actions
+16. `telegram_bot.py`: Telegram long-poll dual-mode loop for manager actions
 17. `github_webhook.py`: webhook signature verification + event ingestion server
 18. Webhook delivery dedup ledger (`webhook_deliveries`) + cleanup command
 19. Automatic startup doctor gate on mutable CLI commands (`--skip-doctor` override)
@@ -40,6 +40,7 @@ This package provides a minimal Phase A implementation:
 22. Stage-level observability is persisted in `run_digest.stages` (step totals/attempt timeline/top step)
 23. `manager_decision.py`: rule-based next-action decision for manager loop
 24. `manager_loop.py`: manager automation runner (`manager-tick` / `run-manager-loop`)
+25. `manager_llm.py`: OpenAI-compatible manager LLM function-calling client (`rules|llm|hybrid`)
 
 Operational commands added:
 
@@ -93,3 +94,5 @@ Operational commands added:
 31. Known baseline test failures can be allowlisted in policy (`known_test_failure_allowlist`) to avoid blocking on verified non-scope test noise.
 32. `skills-feedback` converts skills runtime metrics to deterministic iteration actions for manager prompt/skill governance.
 33. Manager LLM should consume orchestrator actions via API function-calling, while worker execution remains `codex exec`.
+34. Telegram NL mode supports `rules|hybrid|llm`; `hybrid` is recommended for production-safe rollout.
+35. `manager-tick`/`run-manager-loop` support `--decision-mode rules|llm|hybrid`; `llm/hybrid` needs manager API key env.

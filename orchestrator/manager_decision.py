@@ -137,3 +137,40 @@ def decide_next_action(facts: ManagerRunFacts) -> ManagerAction:
         kind=ManagerActionKind.WAIT_HUMAN,
         reason=f"unsupported manager state: {state.value}",
     )
+
+
+def allowed_action_kinds(facts: ManagerRunFacts) -> tuple[ManagerActionKind, ...]:
+    state = facts.state
+
+    if state in _TERMINAL:
+        return (ManagerActionKind.NOOP,)
+
+    if state in {RunState.PAUSED, RunState.PUSHED, RunState.NEEDS_HUMAN_REVIEW}:
+        return (ManagerActionKind.WAIT_HUMAN,)
+
+    if state == RunState.QUEUED:
+        return (ManagerActionKind.START_DISCOVERY, ManagerActionKind.WAIT_HUMAN)
+
+    if state == RunState.DISCOVERY:
+        if facts.prepare_attempts <= 0:
+            return (ManagerActionKind.RUN_PREPARE, ManagerActionKind.WAIT_HUMAN)
+        return (ManagerActionKind.MARK_PLAN_READY, ManagerActionKind.WAIT_HUMAN)
+
+    if state == RunState.PLAN_READY:
+        return (ManagerActionKind.START_IMPLEMENTATION, ManagerActionKind.WAIT_HUMAN)
+
+    if state in {RunState.IMPLEMENTING, RunState.ITERATING}:
+        if not facts.has_prompt:
+            return (ManagerActionKind.WAIT_HUMAN,)
+        return (ManagerActionKind.RUN_AGENT_STEP, ManagerActionKind.WAIT_HUMAN)
+
+    if state == RunState.LOCAL_VALIDATING:
+        return (ManagerActionKind.RUN_FINISH, ManagerActionKind.WAIT_HUMAN)
+
+    if state == RunState.FAILED_RETRYABLE:
+        return (ManagerActionKind.RETRY, ManagerActionKind.WAIT_HUMAN)
+
+    if state in {RunState.CI_WAIT, RunState.REVIEW_WAIT}:
+        return (ManagerActionKind.SYNC_GITHUB, ManagerActionKind.WAIT_HUMAN)
+
+    return (ManagerActionKind.WAIT_HUMAN,)

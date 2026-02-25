@@ -8,7 +8,14 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from .manager_decision import ManagerAction, ManagerActionKind, ManagerRunFacts, decide_next_action
+from .manager_decision import (
+    ManagerAction,
+    ManagerActionKind,
+    ManagerRunFacts,
+    allowed_action_kinds,
+    decide_next_action,
+)
+from .manager_llm import ManagerLLMClient, ManagerLLMError
 from .models import RunState, StepName
 from .service import OrchestratorService
 
@@ -32,6 +39,11 @@ class ManagerLoopConfig:
     skills_mode: str | None
     agent_args: tuple[str, ...]
     dry_run: bool
+    decision_mode: str
+    manager_api_base: str | None
+    manager_model: str | None
+    manager_timeout_sec: int
+    manager_api_key_env: str
     skip_doctor_for_inner_commands: bool = True
 
 
@@ -39,6 +51,17 @@ class ManagerLoopRunner:
     def __init__(self, *, service: OrchestratorService, config: ManagerLoopConfig) -> None:
         self.service = service
         self.config = config
+        self._llm_client: ManagerLLMClient | None = None
+        if self.config.decision_mode in {"llm", "hybrid"}:
+            try:
+                self._llm_client = ManagerLLMClient.from_runtime(
+                    api_base=self.config.manager_api_base,
+                    model=self.config.manager_model,
+                    timeout_sec=self.config.manager_timeout_sec,
+                    api_key_env=self.config.manager_api_key_env,
+                )
+            except ManagerLLMError:
+                self._llm_client = None
 
     def tick(self) -> dict[str, Any]:
         started_at = datetime.now(UTC)
@@ -83,11 +106,12 @@ class ManagerLoopRunner:
 
         while attempts < max(self.config.max_actions_per_run, 1):
             facts = self._build_run_facts(run_id)
-            action = decide_next_action(facts)
+            action, decision_source = self._decide_action(facts)
             action_record: dict[str, Any] = {
                 "state": facts.state.value,
                 "action": action.kind.value,
                 "reason": action.reason,
+                "decision_source": decision_source,
             }
 
             signature = (facts.state.value, action.kind.value)
@@ -131,6 +155,61 @@ class ManagerLoopRunner:
             "actions": actions,
             "errors": errors,
         }
+
+    def _decide_action(self, facts: ManagerRunFacts) -> tuple[ManagerAction, str]:
+        rules_action = decide_next_action(facts)
+        mode = self.config.decision_mode
+        if mode == "rules":
+            return rules_action, "rules"
+
+        allowed = [item.value for item in allowed_action_kinds(facts)]
+        if self._llm_client is None:
+            if mode == "llm":
+                return (
+                    ManagerAction(
+                        kind=ManagerActionKind.WAIT_HUMAN,
+                        reason="manager llm unavailable; waiting human",
+                    ),
+                    "llm_unavailable",
+                )
+            return rules_action, "rules_fallback_llm_unavailable"
+
+        try:
+            selection = self._llm_client.decide_action(
+                facts={
+                    "run_id": facts.run_id,
+                    "owner": facts.owner,
+                    "repo": facts.repo,
+                    "state": facts.state.value,
+                    "prepare_attempts": facts.prepare_attempts,
+                    "has_contract": facts.has_contract,
+                    "has_prompt": facts.has_prompt,
+                    "pr_number": facts.pr_number,
+                },
+                allowed_actions=allowed,
+            )
+            kind = ManagerActionKind(selection.action)
+            if kind.value not in allowed:
+                raise ManagerLLMError(
+                    f"selected action not allowed in current state: {kind.value}"
+                )
+            metadata: dict[str, Any] = {}
+            if kind == ManagerActionKind.RETRY and selection.target_state:
+                metadata["target_state"] = selection.target_state
+            return (
+                ManagerAction(kind=kind, reason=selection.reason, metadata=metadata),
+                "llm",
+            )
+        except (ManagerLLMError, ValueError) as exc:
+            if mode == "llm":
+                return (
+                    ManagerAction(
+                        kind=ManagerActionKind.WAIT_HUMAN,
+                        reason=f"manager llm error: {exc}",
+                    ),
+                    "llm_error",
+                )
+            return rules_action, "rules_fallback_llm_error"
 
     def _build_run_facts(self, run_id: str) -> ManagerRunFacts:
         snapshot = self.service.get_run_snapshot(run_id)
