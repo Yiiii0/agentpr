@@ -138,7 +138,7 @@ If the repo has `.github/PULL_REQUEST_TEMPLATE.md`:
 
 ## Phase 4: Commit and Push
 
-Only for PASS and NEEDS REVIEW:
+Only for PASS and NEEDS REVIEW when manager explicitly allows push:
 
 ```bash
 # Stage any NEW files first (finish.sh only auto-stages modified tracked files)
@@ -147,6 +147,10 @@ git add path/to/new_file.py
 # Then run finish.sh
 bash .../scripts/finish.sh "description of changes" "ProjectName" "repo-required-commit-title"
 ```
+
+Manager-mode note:
+- If run under AgentPR non-interactive worker, default policy is no-push.
+- In that mode, do NOT run commit/push and do NOT run `finish.sh`; return commit-ready summary only.
 
 ---
 

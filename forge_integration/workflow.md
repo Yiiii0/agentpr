@@ -99,6 +99,7 @@ Add env var detection in OpenAI initialization.
 15. **Python path** — `which python3.11` first; if wrong venv, use `/opt/homebrew/bin/python3.11`
 16. **Isolated deps** — Use project-local venv/node_modules, never install globally
 17. **Stop at push** — Do not create PRs automatically
+18. **Manager-mode default is no-push** — For `run-agent-step`, worker should return commit-ready summary unless manager explicitly enables push
 
 ## Toolchain Reference
 
@@ -117,6 +118,10 @@ Add env var detection in OpenAI initialization.
 1. All tool caches/data are redirected to `<repo>/.agentpr_runtime/*` via env vars.
 2. If a new tool appears, extend `orchestrator/runtime_env_overrides.json` first.
 3. Treat global-install commands (`brew install`, `npm -g`, `uv tool install`, `poetry self`) as violations.
+4. `run-agent-step` quality guardrails:
+   - default block if workspace has pre-existing dirty diff in `DISCOVERY/IMPLEMENTING`
+   - default no-push policy (`--allow-agent-push` required to permit commit/push)
+   - diff budget thresholds (`--max-changed-files`, `--max-added-lines`) drive automatic review classification
 
 ## Common Pitfalls
 

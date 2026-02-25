@@ -1,0 +1,4 @@
+interface:
+  display_name: "AgentPR Repo Preflight"
+  short_description: "Analyze repo rules and output contract"
+  default_prompt: "Use $agentpr-repo-preflight-contract to generate a strict repo contract before implementation."

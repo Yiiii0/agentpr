@@ -1,0 +1,4 @@
+interface:
+  display_name: "AgentPR Implement Validate"
+  short_description: "Implement minimal diff and validate"
+  default_prompt: "Use $agentpr-implement-and-validate to implement the approved contract and run required validation."

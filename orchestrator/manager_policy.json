@@ -1,0 +1,43 @@
+{
+  "run_agent_step": {
+    "codex_sandbox": "danger-full-access",
+    "skills_mode": "off",
+    "max_changed_files": 8,
+    "max_added_lines": 150,
+    "max_retryable_attempts": 3,
+    "min_test_commands": 1,
+    "success_event_stream_sample_pct": 15,
+    "success_state": "LOCAL_VALIDATING",
+    "on_retryable_state": "FAILED_RETRYABLE",
+    "on_human_review_state": "NEEDS_HUMAN_REVIEW",
+    "repo_overrides": {
+      "mem0ai/mem0": {
+        "skills_mode": "agentpr",
+        "max_changed_files": 5,
+        "max_added_lines": 90,
+        "min_test_commands": 2,
+        "success_event_stream_sample_pct": 10
+      },
+      "virattt/dexter": {
+        "skills_mode": "agentpr",
+        "max_changed_files": 5,
+        "max_added_lines": 80,
+        "min_test_commands": 2,
+        "success_event_stream_sample_pct": 10
+      }
+    }
+  },
+  "telegram_bot": {
+    "poll_timeout_sec": 30,
+    "idle_sleep_sec": 2,
+    "list_limit": 20,
+    "rate_limit_window_sec": 60,
+    "rate_limit_per_chat": 12,
+    "rate_limit_global": 120,
+    "audit_log_file": "orchestrator/data/reports/telegram_audit.jsonl"
+  },
+  "github_webhook": {
+    "max_payload_bytes": 1048576,
+    "audit_log_file": "orchestrator/data/reports/github_webhook_audit.jsonl"
+  }
+}

@@ -285,6 +285,81 @@ class Database:
             ),
         )
 
+    def count_step_attempts(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        run_id: str,
+        step: str,
+    ) -> int:
+        row = conn.execute(
+            """
+            SELECT COUNT(1) AS c
+            FROM step_attempts
+            WHERE run_id = ? AND step = ?
+            """,
+            (run_id, step),
+        ).fetchone()
+        if row is None:
+            return 0
+        return int(row["c"])
+
+    def list_step_attempts(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        run_id: str,
+        step: str | None = None,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        if step is None:
+            rows = conn.execute(
+                """
+                SELECT id, run_id, step, attempt_no, exit_code, stdout_log, stderr_log, duration_ms, created_at
+                FROM step_attempts
+                WHERE run_id = ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (run_id, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT id, run_id, step, attempt_no, exit_code, stdout_log, stderr_log, duration_ms, created_at
+                FROM step_attempts
+                WHERE run_id = ? AND step = ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (run_id, step, limit),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_events(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        run_id: str,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        rows = conn.execute(
+            """
+            SELECT event_id, run_id, event_type, idempotency_key, payload_json, created_at
+            FROM events
+            WHERE run_id = ?
+            ORDER BY event_id DESC
+            LIMIT ?
+            """,
+            (run_id, limit),
+        ).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["payload"] = json.loads(item.pop("payload_json"))
+            result.append(item)
+        return result
+
     def insert_artifact(
         self,
         conn: sqlite3.Connection,
@@ -398,6 +473,41 @@ class Database:
                 LIMIT ?
                 """,
                 (run_id, artifact_type, limit),
+            ).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["metadata"] = json.loads(item.pop("metadata_json"))
+            result.append(item)
+        return result
+
+    def list_artifacts_global(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        artifact_type: str | None = None,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        if artifact_type is None:
+            rows = conn.execute(
+                """
+                SELECT id, run_id, artifact_type, uri, metadata_json, created_at
+                FROM artifacts
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT id, run_id, artifact_type, uri, metadata_json, created_at
+                FROM artifacts
+                WHERE artifact_type = ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (artifact_type, limit),
             ).fetchall()
         result: list[dict[str, Any]] = []
         for row in rows:

@@ -12,6 +12,8 @@ from typing import Any
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
+from .codex_bin import resolve_codex_binary
+
 
 @dataclass(frozen=True)
 class CheckResult:
@@ -318,7 +320,7 @@ class RuntimeDoctor:
         checks.append(self._check_command("python3.11"))
         checks.append(self._check_command("gh"))
         if self.require_codex:
-            checks.append(self._check_command("codex"))
+            checks.append(self._check_codex_binary())
         if self.require_gh_auth:
             checks.append(self._check_gh_auth())
         if self.require_telegram_token:
@@ -375,10 +377,19 @@ class RuntimeDoctor:
             return CheckResult(f"cmd.{command}", True, path)
         return CheckResult(f"cmd.{command}", False, "Not found in PATH")
 
+    @staticmethod
+    def _check_codex_binary() -> CheckResult:
+        resolved, source = resolve_codex_binary()
+        if resolved:
+            return CheckResult("cmd.codex", True, f"{resolved} ({source})")
+        return CheckResult("cmd.codex", False, source)
+
     def _check_workspace_write(self) -> CheckResult:
         try:
             self.workspace_root.mkdir(parents=True, exist_ok=True)
-            probe = self.workspace_root / ".agentpr_doctor_probe"
+            probe = self.workspace_root / (
+                f".agentpr_doctor_probe_{os.getpid()}_{time.time_ns()}"
+            )
             probe.write_text("ok", encoding="utf-8")
             probe.unlink()
             return CheckResult("workspace.write", True, f"Writable: {self.workspace_root}")

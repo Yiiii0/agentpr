@@ -8,6 +8,8 @@ Lightweight orchestrator for Forge OSS integration runs.
 cd /Users/yi/Documents/Career/TensorBlcok/agentpr
 python3.11 -m orchestrator.cli init-db
 python3.11 -m orchestrator.cli doctor --require-codex
+python3.11 -m orchestrator.cli install-skills --install-curated-ci
+python3.11 -m orchestrator.cli skills-status
 ```
 
 Create and drive a run:
@@ -24,6 +26,8 @@ python3.11 -m orchestrator.cli mark-plan-ready --run-id <run_id> --contract-path
 python3.11 -m orchestrator.cli start-implementation --run-id <run_id>
 python3.11 -m orchestrator.cli run-preflight --run-id <run_id> --codex-sandbox danger-full-access
 python3.11 -m orchestrator.cli run-agent-step --run-id <run_id> --prompt-file <prompt.md> --codex-sandbox danger-full-access --success-state NEEDS_HUMAN_REVIEW
+# skills-mode (worker invokes stage skills, manager injects task packet):
+python3.11 -m orchestrator.cli run-agent-step --run-id <run_id> --prompt-file <prompt.md> --skills-mode agentpr --codex-sandbox danger-full-access --success-state NEEDS_HUMAN_REVIEW
 python3.11 -m orchestrator.cli mark-local-validated --run-id <run_id>
 python3.11 -m orchestrator.cli run-finish --run-id <run_id> --changes "..." --project REPO --commit-title "feat(scope): ..."
 ```
@@ -41,6 +45,7 @@ python3.11 -m orchestrator.cli approve-open-pr \
   --request-file <request.json> \
   --confirm-token <token> \
   --confirm
+# emergency only: add --allow-dod-bypass
 ```
 
 Or link PR number manually:
@@ -70,6 +75,8 @@ Run GitHub webhook server:
 ```bash
 export AGENTPR_GITHUB_WEBHOOK_SECRET=...
 python3.11 -m orchestrator.cli run-github-webhook --host 0.0.0.0 --port 8787
+# override defaults when needed:
+# python3.11 -m orchestrator.cli run-github-webhook --max-payload-bytes 2097152 --audit-log-file orchestrator/data/reports/github_webhook_audit.jsonl
 # local dev only:
 # python3.11 -m orchestrator.cli run-github-webhook --allow-unsigned
 ```
@@ -79,6 +86,8 @@ Run Telegram control bot:
 ```bash
 export AGENTPR_TELEGRAM_BOT_TOKEN=...
 python3.11 -m orchestrator.cli run-telegram-bot --allow-chat-id <chat_id>
+# optional command-tier ACL:
+# python3.11 -m orchestrator.cli run-telegram-bot --allow-chat-id <read_chat> --write-chat-id <write_chat> --admin-chat-id <admin_chat>
 # local dev only:
 # python3.11 -m orchestrator.cli run-telegram-bot --allow-any-chat
 ```
@@ -88,6 +97,39 @@ Cleanup old webhook dedup records:
 ```bash
 python3.11 -m orchestrator.cli cleanup-webhook-deliveries --keep-days 30
 ```
+
+Summarize webhook audit health (manager/monitoring):
+
+```bash
+python3.11 -m orchestrator.cli webhook-audit-summary --since-minutes 60 --max-lines 5000
+# fail fast for monitors:
+# python3.11 -m orchestrator.cli webhook-audit-summary --fail-on-retryable-failures 0 --fail-on-http5xx-rate 5
+```
+
+Summarize skills quality metrics:
+
+```bash
+python3.11 -m orchestrator.cli skills-metrics --limit 200
+# scope to one run:
+python3.11 -m orchestrator.cli skills-metrics --run-id <run_id>
+```
+
+Manager-facing run diagnostics:
+
+```bash
+python3.11 -m orchestrator.cli inspect-run --run-id <run_id>
+python3.11 -m orchestrator.cli inspect-run --run-id <run_id> --include-log-tails
+python3.11 -m orchestrator.cli run-bottlenecks --limit 20
+```
+
+`inspect-run` now exposes agent black-box internals from codex JSONL events:
+- `latest_agent_runtime.agent_event_summary.event_type_counts`
+- `latest_agent_runtime.agent_event_summary.command_events_sample`
+- `latest_agent_runtime.agent_event_summary.top_commands_by_duration` (derived from local stream timestamps)
+- `latest_agent_runtime.event_stream_path` (raw JSONL)
+- `latest_agent_runtime.last_message_path` / `last_message_preview`
+- `latest_run_digest` (structured deterministic run summary JSON)
+- `latest_manager_insight` (manager-facing markdown insight generated from run digest)
 
 Telegram commands:
 - `/list [N]`
@@ -99,25 +141,45 @@ Telegram commands:
 - `/resume <run_id> <target_state>`
 - `/retry <run_id> <target_state>`
 
+Telegram command tiers:
+- `read`: `/start` `/help` `/list` `/show` `/status` `/pending_pr`
+- `write`: `/pause` `/resume` `/retry`
+- `admin`: `/approve_pr`
+
 Notes:
 - mutable commands now run a startup doctor gate by default (workspace write/tooling/auth/network profile checks).
 - run `python3.11 -m orchestrator.cli doctor` for detailed readiness checks before manager loop start.
 - use global `--skip-doctor` only for local debugging or controlled recovery workflows.
 - `run-agent-step` runs preflight by default. Use `--skip-preflight` only for debugging.
+- `run-agent-step` now runs codex with `--json` and captures event stream + final message for inspectability.
+- `run-agent-step` now also emits `run_digest` + `manager_insight` artifacts for every attempt.
+- `run-agent-step` now keeps raw `agent_event_stream` for non-pass runs and deterministic sampled pass runs (digest is always kept).
+- Manager policy: use `run_digest` as machine-checkable truth; treat `manager_insight` as decision support, not as source of truth.
+- `run-agent-step --skills-mode agentpr` means worker uses stage-specific `$agentpr-*` skills; manager only injects task packet and policy.
+- In `--skills-mode agentpr`, contract artifacts are now materialized inside repo runtime path (`.agentpr_runtime/contracts/*`) so worker skills can read them without cross-repo path access.
+- install/check skill readiness with `install-skills` / `skills-status`.
+- `inspect-run` is the primary manager artifact for per-run timing/step/event/runtime breakdown.
+- `run-bottlenecks` aggregates durations across recent runs to find slow phases before prompt tuning.
 - Use `run-preflight --skip-network-check` when you intentionally run in offline mode.
 - `run-preflight` now validates the selected sandbox policy (`--codex-sandbox`).
 - `approve-open-pr` requires both `--confirm-token` and `--confirm`.
+- `approve-open-pr` now enforces a DoD gate using latest `run_digest` + manager policy thresholds + contract artifact.
+- use `--allow-dod-bypass` only for manual emergency override.
 - `approve-open-pr` needs authenticated GitHub CLI in the repo context (`gh auth status` should pass).
 - `sync-github` needs authenticated GitHub CLI with repo read permissions.
 - `run-telegram-bot` requires `--allow-chat-id` unless explicitly using `--allow-any-chat` (development only).
+- `run-telegram-bot` supports per-command ACL (`--write-chat-id`, `--admin-chat-id`), rate limiting, and JSONL audit logs.
 - `run-github-webhook` should use a secret (`AGENTPR_GITHUB_WEBHOOK_SECRET`) in production.
 - `run-github-webhook` now deduplicates deliveries by `X-GitHub-Delivery` (replay-safe).
+- `run-github-webhook` enforces max payload size and writes JSONL audit outcomes for observability.
 - webhook processing failures return `500` and release dedup lock so GitHub retries can re-process.
+- `webhook-audit-summary` can be used by cron/systemd timers to emit non-zero exit code on alert thresholds.
 - Deployment templates are in `agentpr/deploy/systemd/` and `agentpr/deploy/supervisord/`.
 - Deployment templates already include startup doctor gate (`ExecStartPre` / `doctor && process`) for Telegram/webhook manager processes.
 - To confirm "real readiness" before automation:
   - global: `python3.11 -m orchestrator.cli doctor --require-codex`
   - repo-level: `python3.11 -m orchestrator.cli run-preflight --run-id <run_id> --codex-sandbox danger-full-access`
+- If `doctor` only fails on `cmd.codex`, set `AGENTPR_CODEX_BIN` to absolute codex path.
 - For end-to-end git operations, set codex sandbox explicitly when needed:
   `--codex-sandbox danger-full-access`
 - Override model with:
@@ -141,13 +203,37 @@ Notes:
 - `--no-codex-full-auto`
   - Disable `--full-auto`.
   - Default behavior keeps no-prompt automation behavior enabled.
+- `--allow-agent-push`
+  - Allow worker to run commit/push directly during `run-agent-step`.
+  - Default is disabled; manager should run commit/push gate separately.
+- `--max-changed-files`
+  - Diff budget upper bound for changed files (default: `8`).
+- `--max-added-lines`
+  - Diff budget upper bound for added lines (default: `150`).
+- `--allow-dirty-worktree`
+  - Allow agent execution with pre-existing workspace changes.
+  - Default blocks dirty worktree in `DISCOVERY/IMPLEMENTING`.
+- `--skills-mode`
+  - `off`: legacy single-prompt mode.
+  - `agentpr`: wrap prompt with task packet and stage skill chain (`$agentpr-*`).
+- `--allow-missing-skills`
+  - Continue even if required stage skill is not installed.
+  - Default is strict fail-to-review.
+- `--task-packet-file`
+  - Merge operator-provided JSON/Markdown into generated task packet.
+- `--max-retryable-attempts`
+  - Retry cap for retryable failures; when exceeded, verdict upgrades to `HUMAN_REVIEW`.
+  - If omitted, uses manager policy default.
+- `--min-test-commands`
+  - Minimum number of test/lint evidence commands required in implementation states for a success verdict.
+  - If omitted, uses manager policy default (can be overridden per repo in manager policy).
 
 Runtime mapping:
 
 - Default command emitted by `run-agent-step`:
-  - `codex exec --sandbox danger-full-access --ask-for-approval on-request "<prompt>"`
-- If sandbox is not `workspace-write` and full-auto behavior is enabled:
-  - `codex exec --sandbox <mode> --ask-for-approval on-request "<prompt>"`
+  - `codex exec --sandbox danger-full-access "<prompt>"`
+- If sandbox is `workspace-write` and full-auto behavior is enabled:
+  - `codex exec --sandbox workspace-write --full-auto "<prompt>"`
 - If `--codex-model` is set:
   - `codex exec --sandbox <mode> ... --model <model> "<prompt>"`
 - If `--no-codex-full-auto` is set:
@@ -187,6 +273,92 @@ Recommended presets:
 - Tight safety fallback:
   - `--codex-sandbox workspace-write`
 
+Manager policy defaults:
+
+- Global `--policy-file` (default `orchestrator/manager_policy.json`) controls defaults for:
+  - `run_agent_step`: sandbox / skills mode / diff budgets / retry cap / test evidence threshold / verdict convergence targets / repo-level overrides
+  - `telegram_bot`: polling defaults / list limit / rate limits / audit log path
+  - `github_webhook`: payload limit / audit log path
+- CLI flags still override policy values per command.
+
+Policy file example:
+
+```json
+{
+  "run_agent_step": {
+    "codex_sandbox": "danger-full-access",
+    "skills_mode": "off",
+    "max_changed_files": 8,
+    "max_added_lines": 150,
+    "max_retryable_attempts": 3,
+    "min_test_commands": 1,
+    "success_event_stream_sample_pct": 15,
+    "success_state": "LOCAL_VALIDATING",
+    "on_retryable_state": "FAILED_RETRYABLE",
+    "on_human_review_state": "NEEDS_HUMAN_REVIEW",
+    "repo_overrides": {
+      "mem0ai/mem0": {
+        "skills_mode": "agentpr",
+        "max_changed_files": 5,
+        "max_added_lines": 90,
+        "min_test_commands": 2,
+        "success_event_stream_sample_pct": 10
+      },
+      "virattt/dexter": {
+        "skills_mode": "agentpr",
+        "max_changed_files": 5,
+        "max_added_lines": 80,
+        "min_test_commands": 2,
+        "success_event_stream_sample_pct": 10
+      }
+    }
+  },
+  "telegram_bot": {
+    "poll_timeout_sec": 30,
+    "idle_sleep_sec": 2,
+    "list_limit": 20,
+    "rate_limit_window_sec": 60,
+    "rate_limit_per_chat": 12,
+    "rate_limit_global": 120,
+    "audit_log_file": "orchestrator/data/reports/telegram_audit.jsonl"
+  },
+  "github_webhook": {
+    "max_payload_bytes": 1048576,
+    "audit_log_file": "orchestrator/data/reports/github_webhook_audit.jsonl"
+  }
+}
+```
+
+## Skills Chain
+
+`run-agent-step --skills-mode agentpr` uses this split:
+
+1. `DISCOVERY/PLAN_READY` -> `$agentpr-repo-preflight-contract`
+2. `IMPLEMENTING/LOCAL_VALIDATING` -> `$agentpr-implement-and-validate`
+3. `ITERATING/CI_WAIT/REVIEW_WAIT` -> `$agentpr-ci-review-fix`
+
+Manager vs worker boundary:
+
+1. Manager injects stage skill plan + task packet + policy.
+2. Worker (`codex exec`) executes the skill logic and code changes.
+
+Skill locations and install flow:
+
+1. Source-of-truth skills are versioned in `agentpr/skills/`.
+2. Worker-visible skills are installed to `~/.codex/skills` via:
+   `python3.11 -m orchestrator.cli install-skills --install-curated-ci`
+3. Check readiness with:
+   `python3.11 -m orchestrator.cli skills-status`
+
+Reference docs:
+
+1. https://developers.openai.com/codex/advanced#tools-skills
+2. https://developers.openai.com/codex/cli/#custom-skills
+3. https://github.com/openai/skills/tree/main/skills/.curated
+
+Note:
+- Current local `codex` CLI build does not expose `codex create skill`; AgentPR uses the official `skill-creator` scripts (`init_skill.py`, `quick_validate.py`) to scaffold and validate skills.
+
 ## Can It Build Env And Run Tests?
 
 Yes, if preflight passes and repo commands are valid.
@@ -210,28 +382,33 @@ Agent runtime reports are saved to:
   - `RETRYABLE`
   - `HUMAN_REVIEW`
 
+Task packet artifacts are saved to:
+
+- `agentpr/orchestrator/data/task_packets/<run_id>_task_packet_<timestamp>.json`
+
 Classification behavior:
 
 1. `PASS`
    - exit code is 0, no safety violations
-   - and (for implementation/validation states) test command evidence is present
+   - and (for implementation/validation states) test command evidence meets `min_test_commands`
 2. `RETRYABLE`
    - transient/runtime failures (network/timeout/rate-limit-like signals)
 3. `HUMAN_REVIEW`
    - safety violations, hard permission/auth/tooling failures, or missing test evidence
+   - test/lint/typecheck commands executed but failed (`reason_code=test_command_failed`)
 
 `run-agent-step` state behavior with classification:
 
-1. non-zero exit + `HUMAN_REVIEW` -> state converges to `NEEDS_HUMAN_REVIEW`
-2. non-zero exit + `RETRYABLE` -> state remains `FAILED_RETRYABLE`
-3. zero exit + non-`PASS` -> command returns non-zero and state converges by verdict (`NEEDS_HUMAN_REVIEW` or `FAILED_RETRYABLE`)
-4. zero exit + `PASS` -> optional `--success-state` is applied
+1. non-zero exit + `HUMAN_REVIEW` -> converges to `--on-human-review-state` (or policy default)
+2. non-zero exit + `RETRYABLE` -> converges to `--on-retryable-state` (or policy default)
+3. zero exit + non-`PASS` -> command returns non-zero and converges by the same configurable verdict mapping
+4. zero exit + `PASS` -> applies `--success-state` (or policy default)
 
 ## Current Status (2026-02-24)
 
 1. Baseline runs (`mem0`, `dexter`) confirm codex can read rules/docs and produce minimal code changes.
-2. Required repo test/lint commands were attempted, but dependency install was blocked by network in this environment.
-3. Commit/push was blocked by `.git/index.lock` permission in worker sandbox context.
+2. Environment gates are now green in real host execution (`doctor --require-codex` + repo preflight pass).
+3. Commit/push succeeded in rerun baselines; no `.git` permission blocker in current host mode.
 4. `finish.sh` commit title validation bug was fixed (single-line check + empty-title check).
 5. MVP default sandbox is now `danger-full-access` with runtime guardrails and workspace-boundary preflight checks.
 6. Structured runtime report is now generated for each agent attempt, with automatic verdict classification and artifact metadata (`grade/reason_code/next_action`).
@@ -241,12 +418,30 @@ Classification behavior:
 10. Webhook replay hardening is enabled via delivery-id dedup records and cleanup command.
 11. Telegram bot now defaults to allowlist-only mode; deployment templates are included under `deploy/`.
 12. Startup doctor + automatic gate is now implemented to fail fast on environment/auth/network prerequisites.
+13. Codex binary resolution now supports `AGENTPR_CODEX_BIN` and Cursor extension fallback for daemon/PATH stability.
+14. Runtime guardrails now include dirty-worktree blocking, no-push default, and diff-budget classification for `run-agent-step`.
+15. Skills chain is now integrated in `run-agent-step` (`--skills-mode agentpr`), with task packet artifact generation and stage-based required skill checks.
+16. Local AgentPR skills are now versioned under `agentpr/skills/` and installable via `install-skills`; curated CI helpers (`gh-fix-ci`, `gh-address-comments`) can be installed in the same command.
+17. `install-skills --install-curated-ci` is now idempotent for already-installed curated skills.
+18. Retry-cap policy is now configurable and enforced in runtime classification (`retryable_limit_exceeded`).
+19. `skills-metrics` command now provides per-skill aggregates (`per_skill`, `missing_required_counts`) for manager-side tuning.
+20. Telegram bot production hardening is implemented (ACL + rate limits + JSONL audit).
+21. GitHub webhook production hardening is implemented (payload-size guard + JSONL audit + `webhook-audit-summary`).
+22. `run_digest` now includes stage-level observability (`stages.step_totals`, `stages.attempts_recent`, `stages.top_step`) and command-category shares.
+23. Manager policy now supports repo-specific runtime thresholds (`run_agent_step.repo_overrides`), including `min_test_commands`.
+24. Skills-mode now materializes contract artifacts into repo runtime path (`.agentpr_runtime/contracts/*`) to avoid cross-root path blockers.
+25. Runtime classification now blocks false PASS when test/typecheck commands fail (`reason_code=test_command_failed`).
+26. Startup doctor workspace-write probe now uses process-unique filenames to avoid parallel probe collisions.
+27. `approve-open-pr` now includes DoD gate checks (digest pass + policy thresholds + contract evidence) with explicit emergency bypass.
+28. Runtime analysis code was split from `cli.py` into `orchestrator/runtime_analysis.py` to reduce coupling and drift risk.
+29. Manager policy now supports repo-level `skills_mode` override and event-stream sampling (`success_event_stream_sample_pct`).
 
 ## Insights (Conversation)
 
-1. Primary bottleneck is execution environment quality (network/.git write), not state-machine complexity.
+1. Primary bottleneck shifted from environment access to repo-specific test baseline quality and workspace hygiene.
 2. Manager should own final push/PR gate decisions; worker should prioritize patch/report quality.
 3. Non-interactive baseline must be measured first before expanding control-plane complexity.
 4. "Skills" should be treated as contracts/boundaries, not necessarily separate CLI invocations.
-5. `danger-full-access` is acceptable only with explicit guardrails and preferably container/VM isolation.
-6. Unknown future toolchains should be handled by extending `orchestrator/runtime_env_overrides.json` first, then code only if needed.
+5. Manager does not execute skill logic itself; worker executes skills, manager enforces stage/policy and artifact tracking.
+6. `danger-full-access` is acceptable only with explicit guardrails and preferably container/VM isolation.
+7. Unknown future toolchains should be handled by extending `orchestrator/runtime_env_overrides.json` first, then code only if needed.

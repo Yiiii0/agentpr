@@ -13,9 +13,10 @@ Execution requirements:
 - Do NOT run prepare.sh (repo is already prepared).
 - Determine correct base branch and contribution rules from this repo.
 - Implement Forge integration with minimal diff and follow existing project patterns.
+- Hard minimal-diff budget: prefer <= 4 changed files and <= 120 added lines.
+- Prefer wiring through existing OpenAI/common path; avoid introducing new provider modules unless strictly required by existing architecture.
 - Run required tests/lint exactly as this repo expects.
-- If status is PASS or NEEDS REVIEW, commit and push using:
-  bash /Users/yi/Documents/Career/TensorBlcok/agentpr/forge_integration/scripts/finish.sh "integrate forge provider" "mem0" "feat(mem0): add forge provider integration"
+- Do NOT run git commit/git push and do NOT run finish.sh; manager handles commit/push gate.
 - Do not create PR.
 - If blocked by pre-existing issues, still provide a clear final summary.
 

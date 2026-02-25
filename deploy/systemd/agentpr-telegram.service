@@ -10,8 +10,9 @@ Group=CHANGE_ME
 WorkingDirectory=/ABSOLUTE/PATH/TO/TensorBlcok/agentpr
 Environment=PYTHONUNBUFFERED=1
 Environment=AGENTPR_TELEGRAM_BOT_TOKEN=CHANGE_ME
+Environment=AGENTPR_CODEX_BIN=/ABSOLUTE/PATH/TO/codex
 ExecStartPre=/opt/homebrew/bin/python3.11 -m orchestrator.cli doctor --skip-network-check --no-require-gh-auth --require-telegram-token
-ExecStart=/opt/homebrew/bin/python3.11 -m orchestrator.cli run-telegram-bot --allow-chat-id CHANGE_ME
+ExecStart=/opt/homebrew/bin/python3.11 -m orchestrator.cli run-telegram-bot --allow-chat-id CHANGE_ME --write-chat-id CHANGE_ME --admin-chat-id CHANGE_ME
 Restart=always
 RestartSec=5
 NoNewPrivileges=true

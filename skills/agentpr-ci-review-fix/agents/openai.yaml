@@ -1,0 +1,4 @@
+interface:
+  display_name: "AgentPR CI Review Fix"
+  short_description: "Triage CI and review feedback"
+  default_prompt: "Use $agentpr-ci-review-fix to diagnose CI/review failures and prepare focused fixes."

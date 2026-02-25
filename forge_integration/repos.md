@@ -11,21 +11,30 @@
 
 | Repo | Run ID | Result | State | Agent Duration | Key Blocker |
 |------|--------|--------|-------|----------------|-------------|
-| mem0 | baseline_mem0_20260224 | NEEDS REVIEW | NEEDS_HUMAN_REVIEW | 6m20s (attempt 2) | commit/push blocked in current sandbox (`.git/index.lock` permission) |
-| dexter | baseline_dexter_20260224 | NEEDS REVIEW | NEEDS_HUMAN_REVIEW | 4m59s | dependency install/typecheck blocked by environment/network; commit/push blocked by `.git` permission |
+| mem0 | baseline_mem0_20260224_033111 | NEEDS REVIEW (classification=PASS) | NEEDS_HUMAN_REVIEW | see runtime report | full test suite has pre-existing optional dependency/config issues; focused forge/openai/deepseek tests pass |
+| mem0 (minimal rerun) | baseline_mem0_min_20260224_154627 | NEEDS REVIEW (classification=PASS) | NEEDS_HUMAN_REVIEW | see runtime report | no push mode; diff reduced to 2 files / +41 lines |
+| dexter | baseline_dexter_20260224_033111 | NEEDS REVIEW (classification=PASS) | NEEDS_HUMAN_REVIEW | see runtime report | one pre-existing test fails due local path `~/.dexter/gateway-debug.log` missing (unrelated to Forge routing) |
+
+## Calibration Runs (2026-02-25)
+
+| Repo | Run ID | Prompt | Result | State | Key Insight |
+|------|--------|--------|--------|-------|-------------|
+| mem0 | calib_mem0_20260225_r2 | calib-v2 + skills-mode | PASS | LOCAL_VALIDATING | Contract materialization fix worked (`.agentpr_runtime/contracts/*` readable); CI-style lint/test evidence present (9 test/lint commands). |
+| dexter | calib_dexter_20260225_r2 | calib-v2 + validation short prompt | HUMAN_REVIEW (`reason_code=test_command_failed`) | NEEDS_HUMAN_REVIEW | `bun run typecheck` + `bun test` failed with pre-existing issues; new classifier correctly blocks false PASS. |
 
 ## Operational Notes
 
 1. `run-preflight` now checks selected codex sandbox policy and blocks `read-only` mode for integration runs.
-2. Current environment still blocks dependency download (PyPI/npm), so required repo tests cannot be fully validated.
-3. `finish.sh` commit-title single-line validation was fixed; remaining push blocker is `.git` write permission.
+2. Current environment is now green on `doctor --require-codex` and repo-level preflight (`git.write` + network checks).
+3. `finish.sh` commit-title single-line validation was fixed; commit/push now succeeds in rerun baseline.
 
 ## Insights (2026-02-24)
 
-1. Agent can follow repo rules and produce minimal diffs, but execution environment determines whether validation/commit can complete.
-2. Network and `.git` writability are first-order gates; prompt quality is second-order once those fail.
-3. Preflight should be treated as hard gate, not optional diagnostics, for non-interactive manager-driven runs.
-4. Each future baseline attempt should include the new agent runtime report artifact for auditable command/test evidence.
+1. Agent can follow repo rules and produce minimal diffs; after environment gates are green, primary risk shifts to repo-specific test baselines and optional dependency combinations.
+2. `doctor + preflight` should remain hard gates, but transient network flakiness requires retry-tolerant orchestration.
+3. Workspace hygiene is critical: rerun前必须清理历史脏改动，否则 non-interactive worker 会主动中止。
+4. Each baseline attempt should include runtime report artifact for auditable test/commit evidence.
+5. Manager policy must not treat "tests executed" as equivalent to "tests passed"; classification now uses failed test command detection.
 
 ## To Do
 

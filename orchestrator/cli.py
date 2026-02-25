@@ -5,8 +5,11 @@ import json
 import os
 import re
 import secrets
+import statistics
+import subprocess
 import sys
 import time
+from collections import defaultdict
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -16,9 +19,24 @@ from .executor import ScriptExecutor
 from .github_webhook import run_github_webhook_server
 from .github_sync import build_sync_decision
 from .models import AgentRuntimeGrade, RunCreateInput, RunMode, RunState, StepName
+from .manager_policy import load_manager_policy, resolve_run_agent_effective_policy
 from .preflight import PreflightChecker, RuntimeDoctor
+from . import runtime_analysis as rt
 from .service import OrchestratorService, RunNotFoundError
-from .state_machine import InvalidTransitionError
+from .skills import (
+    AGENTPR_REQUIRED_SKILLS,
+    OPTIONAL_CURATED_CI_SKILLS,
+    build_skill_plan,
+    build_task_packet,
+    discover_installed_skills,
+    install_local_skills,
+    list_local_skill_dirs,
+    load_user_task_packet,
+    render_skill_chain_prompt,
+    resolve_codex_home,
+    resolve_codex_skills_root,
+)
+from .state_machine import InvalidTransitionError, allowed_targets
 from .telegram_bot import TelegramClient, run_telegram_bot_loop
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -27,6 +45,39 @@ DEFAULT_WORKSPACE_ROOT = Path(
     os.environ.get("AGENTPR_BASE_DIR", str(PROJECT_ROOT / "workspaces"))
 )
 DEFAULT_INTEGRATION_ROOT = PROJECT_ROOT / "forge_integration"
+DEFAULT_SKILLS_SOURCE_ROOT = PROJECT_ROOT / "skills"
+DEFAULT_POLICY_PATH = PROJECT_ROOT / "orchestrator" / "manager_policy.json"
+DIFF_IGNORE_RUNTIME_PREFIXES: tuple[str, ...] = (
+    ".agentpr_runtime/",
+    ".venv/",
+    "node_modules/",
+    ".tox/",
+    ".pytest_cache/",
+    ".mypy_cache/",
+    ".ruff_cache/",
+)
+DIFF_IGNORE_RUNTIME_EXACT: set[str] = {
+    ".agentpr_runtime",
+    ".venv",
+    "node_modules",
+    ".tox",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+}
+
+
+def _normalize_repo_relpath(path: str) -> str:
+    return path.strip().replace("\\", "/")
+
+
+def _is_ignored_runtime_path(path: str) -> bool:
+    normalized = _normalize_repo_relpath(path)
+    if not normalized:
+        return True
+    if normalized in DIFF_IGNORE_RUNTIME_EXACT:
+        return True
+    return normalized.startswith(DIFF_IGNORE_RUNTIME_PREFIXES)
 
 
 def add_idempotency_arg(command_parser: argparse.ArgumentParser) -> None:
@@ -55,6 +106,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=DEFAULT_INTEGRATION_ROOT,
         help=f"forge_integration root (default: {DEFAULT_INTEGRATION_ROOT})",
+    )
+    parser.add_argument(
+        "--policy-file",
+        type=Path,
+        default=DEFAULT_POLICY_PATH,
+        help=f"Manager policy JSON path (default: {DEFAULT_POLICY_PATH})",
     )
     parser.add_argument(
         "--skip-doctor",
@@ -182,10 +239,36 @@ def build_parser() -> argparse.ArgumentParser:
         choices=[
             RunState.LOCAL_VALIDATING.value,
             RunState.NEEDS_HUMAN_REVIEW.value,
+            "UNCHANGED",
         ],
         help=(
             "Optional state convergence after a successful agent run. "
-            "Supported: LOCAL_VALIDATING, NEEDS_HUMAN_REVIEW."
+            "Supported: LOCAL_VALIDATING, NEEDS_HUMAN_REVIEW, UNCHANGED. "
+            "If omitted, uses manager policy default."
+        ),
+    )
+    ag.add_argument(
+        "--on-retryable-state",
+        choices=[
+            RunState.FAILED_RETRYABLE.value,
+            RunState.NEEDS_HUMAN_REVIEW.value,
+            "UNCHANGED",
+        ],
+        help=(
+            "State convergence when runtime classification is RETRYABLE. "
+            "If omitted, uses manager policy default."
+        ),
+    )
+    ag.add_argument(
+        "--on-human-review-state",
+        choices=[
+            RunState.NEEDS_HUMAN_REVIEW.value,
+            RunState.FAILED_RETRYABLE.value,
+            "UNCHANGED",
+        ],
+        help=(
+            "State convergence when runtime classification is HUMAN_REVIEW. "
+            "If omitted, uses manager policy default."
         ),
     )
     ag.add_argument(
@@ -207,8 +290,10 @@ def build_parser() -> argparse.ArgumentParser:
     ag.add_argument(
         "--codex-sandbox",
         choices=["read-only", "workspace-write", "danger-full-access"],
-        default="danger-full-access",
-        help="Codex sandbox mode for this run.",
+        help=(
+            "Codex sandbox mode for this run. "
+            "If omitted, uses manager policy default."
+        ),
     )
     ag.add_argument(
         "--codex-model",
@@ -218,6 +303,77 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-codex-full-auto",
         action="store_true",
         help="Disable codex --full-auto.",
+    )
+    ag.add_argument(
+        "--allow-agent-push",
+        action="store_true",
+        help="Allow agent to run commit/push during run-agent-step (default: disabled).",
+    )
+    ag.add_argument(
+        "--max-changed-files",
+        type=int,
+        help=(
+            "Diff budget: max changed files before forcing HUMAN_REVIEW. "
+            "If omitted, uses manager policy default."
+        ),
+    )
+    ag.add_argument(
+        "--max-added-lines",
+        type=int,
+        help=(
+            "Diff budget: max added lines before forcing HUMAN_REVIEW. "
+            "If omitted, uses manager policy default."
+        ),
+    )
+    ag.add_argument(
+        "--max-retryable-attempts",
+        type=int,
+        help=(
+            "Escalate RETRYABLE verdicts to HUMAN_REVIEW when agent attempt_no "
+            "exceeds this value. If omitted, uses manager policy default."
+        ),
+    )
+    ag.add_argument(
+        "--min-test-commands",
+        type=int,
+        help=(
+            "Minimum number of test/lint evidence commands required in "
+            "IMPLEMENTING/LOCAL_VALIDATING/ITERATING on successful exit. "
+            "If omitted, uses manager policy default."
+        ),
+    )
+    ag.add_argument(
+        "--allow-dirty-worktree",
+        action="store_true",
+        help=(
+            "Allow starting agent step with pre-existing local changes in workspace "
+            "(default: blocked in DISCOVERY/IMPLEMENTING)."
+        ),
+    )
+    ag.add_argument(
+        "--skills-mode",
+        choices=["off", "agentpr"],
+        help=(
+            "Enable skills-based prompt envelope for this run. "
+            "agentpr mode invokes stage-specific AgentPR skills. "
+            "If omitted, uses manager policy default."
+        ),
+    )
+    ag.add_argument(
+        "--allow-missing-skills",
+        action="store_true",
+        help=(
+            "Do not hard-fail when required skills are missing; "
+            "continue with best-effort prompt envelope."
+        ),
+    )
+    ag.add_argument(
+        "--task-packet-file",
+        type=Path,
+        help=(
+            "Optional JSON/Markdown payload merged into generated task packet "
+            "when skills-mode is enabled."
+        ),
     )
 
     f = sub.add_parser("run-finish", help="Execute finish.sh")
@@ -262,6 +418,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Allow approving an expired request file.",
     )
+    ao.add_argument(
+        "--allow-dod-bypass",
+        action="store_true",
+        help="Bypass PR DoD gate checks (manual emergency use only).",
+    )
 
     sg = sub.add_parser("sync-github", help="Poll GitHub PR checks/reviews and sync run states")
     sg.add_argument("--run-id", help="Optional run id. If omitted, scans active PR runs.")
@@ -290,9 +451,61 @@ def build_parser() -> argparse.ArgumentParser:
             "Required unless --allow-any-chat is used."
         ),
     )
-    tb.add_argument("--poll-timeout-sec", type=int, default=30, help="Telegram long-poll timeout.")
-    tb.add_argument("--idle-sleep-sec", type=int, default=2, help="Sleep when no updates.")
-    tb.add_argument("--list-limit", type=int, default=20, help="Default /list limit.")
+    tb.add_argument(
+        "--write-chat-id",
+        action="append",
+        type=int,
+        default=[],
+        help=(
+            "Chat id allowed to run mutating commands (/pause,/resume,/retry). "
+            "Defaults to allowed chat ids when omitted."
+        ),
+    )
+    tb.add_argument(
+        "--admin-chat-id",
+        action="append",
+        type=int,
+        default=[],
+        help=(
+            "Chat id allowed to run privileged commands (/approve_pr). "
+            "Defaults to write chat ids when omitted."
+        ),
+    )
+    tb.add_argument(
+        "--poll-timeout-sec",
+        type=int,
+        help="Telegram long-poll timeout. If omitted, uses manager policy default.",
+    )
+    tb.add_argument(
+        "--idle-sleep-sec",
+        type=int,
+        help="Sleep when no updates. If omitted, uses manager policy default.",
+    )
+    tb.add_argument(
+        "--list-limit",
+        type=int,
+        help="Default /list limit. If omitted, uses manager policy default.",
+    )
+    tb.add_argument(
+        "--rate-limit-window-sec",
+        type=int,
+        help="Rate-limit window size in seconds. If omitted, uses manager policy default.",
+    )
+    tb.add_argument(
+        "--rate-limit-per-chat",
+        type=int,
+        help="Max bot commands per chat in rate-limit window. If omitted, uses manager policy default.",
+    )
+    tb.add_argument(
+        "--rate-limit-global",
+        type=int,
+        help="Max bot commands globally in rate-limit window. If omitted, uses manager policy default.",
+    )
+    tb.add_argument(
+        "--audit-log-file",
+        type=Path,
+        help="Audit log JSONL file path. If omitted, uses manager policy default.",
+    )
     tb.add_argument(
         "--allow-any-chat",
         action="store_true",
@@ -316,6 +529,16 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Allow unsigned webhook requests (development only).",
     )
+    wh.add_argument(
+        "--max-payload-bytes",
+        type=int,
+        help="Max webhook request payload size in bytes. If omitted, uses manager policy default.",
+    )
+    wh.add_argument(
+        "--audit-log-file",
+        type=Path,
+        help="Webhook audit JSONL file path. If omitted, uses manager policy default.",
+    )
 
     cw = sub.add_parser(
         "cleanup-webhook-deliveries",
@@ -331,6 +554,38 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=30,
         help="Keep last N days of delivery records (default: 30).",
+    )
+
+    ws = sub.add_parser(
+        "webhook-audit-summary",
+        help="Summarize webhook audit JSONL for observability/alert thresholds",
+    )
+    ws.add_argument(
+        "--audit-log-file",
+        type=Path,
+        help="Webhook audit JSONL file path. If omitted, uses manager policy default.",
+    )
+    ws.add_argument(
+        "--since-minutes",
+        type=int,
+        default=60,
+        help="Only include entries in the last N minutes (default: 60).",
+    )
+    ws.add_argument(
+        "--max-lines",
+        type=int,
+        default=5000,
+        help="Read at most the latest N lines from audit log (default: 5000).",
+    )
+    ws.add_argument(
+        "--fail-on-retryable-failures",
+        type=int,
+        help="Return non-zero when retryable failure count exceeds this threshold.",
+    )
+    ws.add_argument(
+        "--fail-on-http5xx-rate",
+        type=float,
+        help="Return non-zero when HTTP 5xx rate (%%) exceeds this threshold.",
     )
 
     pr = sub.add_parser("link-pr", help="Link PR number and move to CI_WAIT")
@@ -366,6 +621,122 @@ def build_parser() -> argparse.ArgumentParser:
     rt.add_argument("--run-id", required=True)
     rt.add_argument("--target-state", choices=[s.value for s in RunState], required=True)
     add_idempotency_arg(rt)
+
+    ss = sub.add_parser("skills-status", help="Show AgentPR skill availability for codex")
+    ss.add_argument(
+        "--codex-home",
+        type=Path,
+        help="Optional CODEX_HOME override (defaults to $CODEX_HOME or ~/.codex).",
+    )
+    ss.add_argument(
+        "--skills-root",
+        type=Path,
+        help="Optional skills root override (defaults to <CODEX_HOME>/skills).",
+    )
+    ss.add_argument(
+        "--local-skills-root",
+        type=Path,
+        default=DEFAULT_SKILLS_SOURCE_ROOT,
+        help=f"Local AgentPR skills source root (default: {DEFAULT_SKILLS_SOURCE_ROOT}).",
+    )
+
+    ins = sub.add_parser("install-skills", help="Install local AgentPR skills into codex skills root")
+    ins.add_argument(
+        "--codex-home",
+        type=Path,
+        help="Optional CODEX_HOME override (defaults to $CODEX_HOME or ~/.codex).",
+    )
+    ins.add_argument(
+        "--skills-root",
+        type=Path,
+        help="Optional destination skills root (defaults to <CODEX_HOME>/skills).",
+    )
+    ins.add_argument(
+        "--local-skills-root",
+        type=Path,
+        default=DEFAULT_SKILLS_SOURCE_ROOT,
+        help=f"Local AgentPR skills source root (default: {DEFAULT_SKILLS_SOURCE_ROOT}).",
+    )
+    ins.add_argument(
+        "--name",
+        action="append",
+        default=[],
+        help="Optional skill name to install. Can be repeated.",
+    )
+    ins.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite existing destination skill folders.",
+    )
+    ins.add_argument(
+        "--install-curated-ci",
+        action="store_true",
+        help=(
+            "Also install curated ci/review helper skills from openai/skills "
+            "(gh-fix-ci and gh-address-comments)."
+        ),
+    )
+
+    sm = sub.add_parser(
+        "skills-metrics",
+        help="Summarize skills-mode runtime quality from agent runtime reports",
+    )
+    sm.add_argument(
+        "--run-id",
+        help="Optional run id to scope metrics to one run.",
+    )
+    sm.add_argument(
+        "--limit",
+        type=int,
+        default=200,
+        help="Maximum runtime reports to scan (default: 200).",
+    )
+
+    ir = sub.add_parser(
+        "inspect-run",
+        help="Build manager-facing diagnostic snapshot for one run",
+    )
+    ir.add_argument("--run-id", required=True)
+    ir.add_argument(
+        "--attempt-limit",
+        type=int,
+        default=120,
+        help="Max step attempts to include (default: 120).",
+    )
+    ir.add_argument(
+        "--event-limit",
+        type=int,
+        default=60,
+        help="Max events to include (default: 60).",
+    )
+    ir.add_argument(
+        "--command-limit",
+        type=int,
+        default=20,
+        help="Max sampled shell commands from runtime report (default: 20).",
+    )
+    ir.add_argument(
+        "--include-log-tails",
+        action="store_true",
+        help="Include short stdout/stderr tails per step attempt.",
+    )
+
+    rb = sub.add_parser(
+        "run-bottlenecks",
+        help="Summarize runtime bottlenecks across recent runs",
+    )
+    rb.add_argument(
+        "--limit",
+        type=int,
+        default=20,
+        help="Number of recent runs to analyze (default: 20).",
+    )
+    rb.add_argument(
+        "--attempt-limit-per-run",
+        type=int,
+        default=200,
+        help="Step-attempt rows loaded per run (default: 200).",
+    )
 
     return parser
 
@@ -506,6 +877,118 @@ def main() -> int:
             print_json(report)
             return 0 if report["ok"] else 1
 
+        if args.command == "skills-status":
+            codex_home = (
+                Path(args.codex_home).expanduser().resolve()
+                if args.codex_home is not None
+                else resolve_codex_home()
+            )
+            skills_root = (
+                Path(args.skills_root).expanduser().resolve()
+                if args.skills_root is not None
+                else resolve_codex_skills_root(codex_home=codex_home)
+            )
+            local_root = Path(args.local_skills_root).expanduser().resolve()
+            installed = discover_installed_skills(skills_root=skills_root)
+            local_dirs = list_local_skill_dirs(source_root=local_root)
+            local_names = [path.name for path in local_dirs]
+            missing_required = [
+                name for name in AGENTPR_REQUIRED_SKILLS if name not in installed
+            ]
+            optional_curated = list(OPTIONAL_CURATED_CI_SKILLS)
+            missing_optional = [name for name in optional_curated if name not in installed]
+            print_json(
+                {
+                    "ok": True,
+                    "codex_home": str(codex_home),
+                    "skills_root": str(skills_root),
+                    "local_skills_root": str(local_root),
+                    "local_skill_names": local_names,
+                    "installed_skill_count": len(installed),
+                    "installed_required": [
+                        name for name in AGENTPR_REQUIRED_SKILLS if name in installed
+                    ],
+                    "missing_required": missing_required,
+                    "installed_optional_ci": [
+                        name for name in optional_curated if name in installed
+                    ],
+                    "missing_optional_ci": missing_optional,
+                }
+            )
+            return 0
+
+        if args.command == "install-skills":
+            codex_home = (
+                Path(args.codex_home).expanduser().resolve()
+                if args.codex_home is not None
+                else resolve_codex_home()
+            )
+            skills_root = (
+                Path(args.skills_root).expanduser().resolve()
+                if args.skills_root is not None
+                else resolve_codex_skills_root(codex_home=codex_home)
+            )
+            local_root = Path(args.local_skills_root).expanduser().resolve()
+            requested_names = [str(item).strip() for item in args.name if str(item).strip()]
+            results = install_local_skills(
+                source_root=local_root,
+                skills_root=skills_root,
+                names=requested_names or None,
+                force=bool(args.force),
+            )
+            curated_result: dict[str, Any] | None = None
+            if bool(args.install_curated_ci):
+                curated_result = install_curated_ci_skills(skills_root=skills_root)
+            installed = discover_installed_skills(skills_root=skills_root)
+            print_json(
+                {
+                    "ok": True,
+                    "codex_home": str(codex_home),
+                    "skills_root": str(skills_root),
+                    "local_skills_root": str(local_root),
+                    "results": results,
+                    "curated_ci_install": curated_result,
+                    "missing_required_after_install": [
+                        name for name in AGENTPR_REQUIRED_SKILLS if name not in installed
+                    ],
+                    "missing_optional_ci_after_install": [
+                        name for name in OPTIONAL_CURATED_CI_SKILLS if name not in installed
+                    ],
+                    "note": "Restart codex-managed sessions if skill discovery is cached.",
+                }
+            )
+            return 0
+
+        if args.command == "skills-metrics":
+            report = gather_skills_metrics(
+                service=service,
+                run_id=args.run_id,
+                limit=max(int(args.limit), 1),
+            )
+            print_json(report)
+            return 0
+
+        if args.command == "inspect-run":
+            report = gather_run_inspect(
+                service=service,
+                run_id=args.run_id,
+                attempt_limit=max(int(args.attempt_limit), 1),
+                event_limit=max(int(args.event_limit), 1),
+                command_limit=max(int(args.command_limit), 1),
+                include_log_tails=bool(args.include_log_tails),
+            )
+            print_json(report)
+            return 0
+
+        if args.command == "run-bottlenecks":
+            report = gather_run_bottlenecks(
+                service=service,
+                limit=max(int(args.limit), 1),
+                attempt_limit_per_run=max(int(args.attempt_limit_per_run), 1),
+            )
+            print_json(report)
+            return 0
+
         enforce_startup_doctor_gate(args)
 
         if args.command == "create-run":
@@ -628,8 +1111,55 @@ def main() -> int:
             return 0 if report["ok"] else 1
 
         if args.command == "run-agent-step":
+            manager_policy = load_manager_policy(Path(args.policy_file))
+            policy_agent = manager_policy.run_agent_step
             snapshot = service.get_run_snapshot(args.run_id)
             run = snapshot["run"]
+            effective_policy = resolve_run_agent_effective_policy(
+                policy_agent,
+                owner=str(run["owner"]),
+                repo=str(run["repo"]),
+            )
+            resolved_codex_sandbox = args.codex_sandbox or str(effective_policy["codex_sandbox"])
+            resolved_skills_mode = args.skills_mode or str(effective_policy["skills_mode"])
+            resolved_max_changed_files = (
+                max(int(args.max_changed_files), 0)
+                if args.max_changed_files is not None
+                else int(effective_policy["max_changed_files"])
+            )
+            resolved_max_added_lines = (
+                max(int(args.max_added_lines), 0)
+                if args.max_added_lines is not None
+                else int(effective_policy["max_added_lines"])
+            )
+            resolved_max_retryable_attempts = (
+                max(int(args.max_retryable_attempts), 0)
+                if args.max_retryable_attempts is not None
+                else int(effective_policy["max_retryable_attempts"])
+            )
+            resolved_min_test_commands = (
+                max(int(args.min_test_commands), 0)
+                if args.min_test_commands is not None
+                else int(effective_policy["min_test_commands"])
+            )
+            resolved_success_event_stream_sample_pct = int(
+                effective_policy["success_event_stream_sample_pct"]
+            )
+            resolved_success_state = (
+                str(args.success_state).strip().upper()
+                if args.success_state is not None
+                else str(effective_policy["success_state"])
+            )
+            resolved_on_retryable_state = (
+                str(args.on_retryable_state).strip().upper()
+                if args.on_retryable_state is not None
+                else str(effective_policy["on_retryable_state"])
+            )
+            resolved_on_human_review_state = (
+                str(args.on_human_review_state).strip().upper()
+                if args.on_human_review_state is not None
+                else str(effective_policy["on_human_review_state"])
+            )
             current_state = RunState(snapshot["state"])
             preflight_report: dict[str, Any] | None = None
             if current_state == RunState.QUEUED:
@@ -648,6 +1178,31 @@ def main() -> int:
             repo_dir = Path(run["workspace_dir"])
             if not repo_dir.exists():
                 raise ValueError(f"Workspace not found: {repo_dir}")
+            if (
+                not args.allow_dirty_worktree
+                and current_state in {RunState.DISCOVERY, RunState.IMPLEMENTING}
+            ):
+                preexisting_diff = collect_repo_diff_summary(repo_dir=repo_dir)
+                if int(preexisting_diff.get("changed_files_count", 0)) > 0:
+                    service.record_step_failure(
+                        args.run_id,
+                        step=StepName.AGENT,
+                        reason_code="dirty_workspace_before_agent",
+                        error_message="workspace has pre-existing local changes",
+                    )
+                    state_result = service.retry_run(
+                        args.run_id,
+                        target_state=RunState.NEEDS_HUMAN_REVIEW,
+                    )
+                    print_json(
+                        {
+                            "ok": False,
+                            "error": "workspace has pre-existing local changes",
+                            "state": state_result["state"],
+                            "diff": preexisting_diff,
+                        }
+                    )
+                    return 1
             if not args.skip_preflight:
                 preflight_report = run_preflight_checks(
                     service,
@@ -656,7 +1211,7 @@ def main() -> int:
                     workspace_root=Path(args.workspace_root),
                     skip_network_check=args.skip_network_check,
                     network_timeout_sec=args.network_timeout_sec,
-                    codex_sandbox=args.codex_sandbox,
+                    codex_sandbox=resolved_codex_sandbox,
                 )
                 if not preflight_report["ok"]:
                     service.record_step_failure(
@@ -680,14 +1235,128 @@ def main() -> int:
                     return 1
             runtime_policy = executor.runtime_policy_summary(repo_dir)
             prompt = load_prompt(args)
+            skill_plan_payload: dict[str, Any] | None = None
+            task_packet_path: Path | None = None
+            if resolved_skills_mode == "agentpr":
+                installed_skills = discover_installed_skills()
+                plan = build_skill_plan(
+                    run_state=current_state,
+                    mode=resolved_skills_mode,
+                    installed_skills=installed_skills,
+                )
+                skill_plan_payload = plan.to_dict()
+                if plan.missing_required and not args.allow_missing_skills:
+                    service.record_step_failure(
+                        args.run_id,
+                        step=StepName.AGENT,
+                        reason_code="skills_missing",
+                        error_message=(
+                            "missing required skills: " + ", ".join(plan.missing_required)
+                        ),
+                    )
+                    state_result = service.retry_run(
+                        args.run_id,
+                        target_state=RunState.NEEDS_HUMAN_REVIEW,
+                    )
+                    install_cmd = (
+                        "python3.11 -m orchestrator.cli install-skills "
+                        f"--local-skills-root {DEFAULT_SKILLS_SOURCE_ROOT}"
+                    )
+                    print_json(
+                        {
+                            "ok": False,
+                            "error": "required skills are missing for agentpr skills-mode",
+                            "missing_required": list(plan.missing_required),
+                            "skills_root": str(plan.skills_root),
+                            "state": state_result["state"],
+                            "next_command": install_cmd,
+                        }
+                    )
+                    return 1
+
+                contract_artifact = service.latest_artifact(
+                    args.run_id,
+                    artifact_type="contract",
+                )
+                contract_source_uri = (
+                    str(contract_artifact.get("uri"))
+                    if contract_artifact is not None and contract_artifact.get("uri")
+                    else None
+                )
+                contract_worker_uri, contract_text = prepare_worker_contract_artifact(
+                    repo_dir=repo_dir,
+                    contract_source_uri=contract_source_uri,
+                )
+                user_packet: Any | None = None
+                if args.task_packet_file is not None:
+                    user_packet = load_user_task_packet(args.task_packet_file)
+                task_packet = build_task_packet(
+                    run=run,
+                    run_state=current_state,
+                    repo_dir=repo_dir,
+                    contract_uri=contract_worker_uri or contract_source_uri,
+                    contract_source_uri=contract_source_uri,
+                    contract_text=contract_text,
+                    codex_sandbox=resolved_codex_sandbox,
+                    allow_agent_push=bool(args.allow_agent_push),
+                    max_changed_files=resolved_max_changed_files,
+                    max_added_lines=resolved_max_added_lines,
+                    integration_root=Path(args.integration_root),
+                    skill_plan=plan,
+                    user_packet=user_packet,
+                )
+                task_packet_path = write_task_packet(args.run_id, task_packet)
+                service.add_artifact(
+                    args.run_id,
+                    artifact_type="task_packet",
+                    uri=str(task_packet_path),
+                    metadata={
+                        "skills_mode": resolved_skills_mode,
+                        "required_now": list(plan.required_now),
+                        "missing_required": list(plan.missing_required),
+                    },
+                )
+                prompt = render_skill_chain_prompt(
+                    base_prompt=prompt,
+                    task_packet=task_packet,
+                    plan=plan,
+                )
             result = executor.run_agent_step(
                 prompt=prompt,
                 repo_dir=repo_dir,
-                codex_sandbox=args.codex_sandbox,
+                codex_sandbox=resolved_codex_sandbox,
                 codex_full_auto=not args.no_codex_full_auto,
                 codex_model=args.codex_model,
+                allow_git_push=bool(args.allow_agent_push),
                 extra_args=args.agent_arg,
             )
+            metadata = result.metadata if isinstance(result.metadata, dict) else {}
+            raw_offsets = metadata.get("stdout_line_offsets_ms")
+            line_offsets: list[int] | None = None
+            if isinstance(raw_offsets, list):
+                parsed_offsets: list[int] = []
+                for item in raw_offsets:
+                    if isinstance(item, int):
+                        parsed_offsets.append(item)
+                    elif isinstance(item, float):
+                        parsed_offsets.append(int(item))
+                line_offsets = parsed_offsets
+            event_summary = rt.summarize_codex_event_stream(
+                result.stdout,
+                line_offsets_ms=line_offsets,
+            )
+            last_message_path: Path | None = None
+            raw_last_message_path = str(metadata.get("last_message_path") or "").strip()
+            if raw_last_message_path:
+                candidate = Path(raw_last_message_path)
+                if candidate.exists():
+                    last_message_path = candidate
+                    service.add_artifact(
+                        args.run_id,
+                        artifact_type="agent_last_message",
+                        uri=str(last_message_path),
+                        metadata={"size_bytes": candidate.stat().st_size},
+                    )
             service.add_step_attempt(
                 args.run_id,
                 step=StepName.AGENT,
@@ -696,19 +1365,87 @@ def main() -> int:
                 stderr_log=result.stderr,
                 duration_ms=result.duration_ms,
             )
-            agent_report = build_agent_runtime_report(
+            agent_attempt_no = service.count_step_attempts(
+                args.run_id,
+                step=StepName.AGENT,
+            )
+            agent_report = rt.build_agent_runtime_report(
                 run_id=args.run_id,
                 engine="codex",
                 result=result,
                 run_state=current_state,
-                codex_sandbox=args.codex_sandbox,
+                codex_sandbox=resolved_codex_sandbox,
                 codex_model=args.codex_model,
                 codex_full_auto=not args.no_codex_full_auto,
                 runtime_policy=runtime_policy,
                 preflight_report=preflight_report,
+                diff_summary=collect_repo_diff_summary(repo_dir=repo_dir),
+                allow_agent_push=bool(args.allow_agent_push),
+                max_changed_files=resolved_max_changed_files,
+                max_added_lines=resolved_max_added_lines,
+                max_retryable_attempts=resolved_max_retryable_attempts,
+                min_test_commands=resolved_min_test_commands,
+                attempt_no=agent_attempt_no,
+                skills_mode=resolved_skills_mode,
+                skill_plan=skill_plan_payload,
+                task_packet_path=str(task_packet_path) if task_packet_path else None,
+                event_summary=event_summary,
+                event_stream_path=None,
+                last_message_path=str(last_message_path) if last_message_path else None,
+                manager_policy={
+                    "path": str(Path(args.policy_file)),
+                    "loaded": manager_policy.source_loaded,
+                    "run_agent_step": {
+                        "codex_sandbox": policy_agent.codex_sandbox,
+                        "skills_mode": policy_agent.skills_mode,
+                        "max_changed_files": policy_agent.max_changed_files,
+                        "max_added_lines": policy_agent.max_added_lines,
+                        "max_retryable_attempts": policy_agent.max_retryable_attempts,
+                        "min_test_commands": policy_agent.min_test_commands,
+                        "success_event_stream_sample_pct": policy_agent.success_event_stream_sample_pct,
+                        "success_state": policy_agent.success_state,
+                        "on_retryable_state": policy_agent.on_retryable_state,
+                        "on_human_review_state": policy_agent.on_human_review_state,
+                        "effective": effective_policy,
+                        "resolved_success_state": resolved_success_state,
+                        "resolved_on_retryable_state": resolved_on_retryable_state,
+                        "resolved_on_human_review_state": resolved_on_human_review_state,
+                        "resolved_success_event_stream_sample_pct": resolved_success_event_stream_sample_pct,
+                    },
+                },
             )
             verdict = agent_report["classification"]
-            agent_report_path = write_agent_runtime_report(args.run_id, agent_report)
+            keep_event_stream, keep_event_stream_reason = rt.should_persist_agent_event_stream(
+                grade=str(verdict.get("grade") or ""),
+                run_id=args.run_id,
+                attempt_no=agent_attempt_no,
+                success_sample_pct=resolved_success_event_stream_sample_pct,
+            )
+            event_stream_path: Path | None = None
+            if keep_event_stream:
+                event_stream_path = rt.write_agent_event_stream(args.run_id, result.stdout)
+                service.add_artifact(
+                    args.run_id,
+                    artifact_type="agent_event_stream",
+                    uri=str(event_stream_path),
+                    metadata={
+                        "parsed_event_count": int(event_summary.get("parsed_event_count") or 0),
+                        "parse_error_count": int(event_summary.get("parse_error_count") or 0),
+                        "command_event_count": int(event_summary.get("command_event_count") or 0),
+                        "retention_reason": keep_event_stream_reason,
+                    },
+                )
+            runtime_payload = agent_report.get("runtime")
+            if isinstance(runtime_payload, dict):
+                runtime_payload["event_stream_path"] = str(event_stream_path) if event_stream_path else ""
+                runtime_payload["event_stream_retained"] = bool(event_stream_path)
+                runtime_payload["event_stream_retention_reason"] = keep_event_stream_reason
+            signals_payload = agent_report.get("signals")
+            if isinstance(signals_payload, dict):
+                signals_payload["event_stream_retained"] = bool(event_stream_path)
+                signals_payload["event_stream_retention_reason"] = keep_event_stream_reason
+
+            agent_report_path = rt.write_agent_runtime_report(args.run_id, agent_report)
             service.add_artifact(
                 args.run_id,
                 artifact_type="agent_runtime_report",
@@ -719,6 +1456,10 @@ def main() -> int:
                     "grade": verdict["grade"],
                     "reason_code": verdict["reason_code"],
                     "next_action": verdict["next_action"],
+                    "parsed_event_count": int(event_summary.get("parsed_event_count") or 0),
+                    "command_event_count": int(event_summary.get("command_event_count") or 0),
+                    "event_stream_retained": bool(event_stream_path),
+                    "event_stream_retention_reason": keep_event_stream_reason,
                 },
             )
             if result.exit_code != 0:
@@ -729,54 +1470,120 @@ def main() -> int:
                     error_message=result.stderr.strip() or "agent command failed",
                 )
                 if verdict["grade"] == AgentRuntimeGrade.HUMAN_REVIEW.value:
-                    state_result = service.retry_run(
-                        args.run_id,
-                        target_state=RunState.NEEDS_HUMAN_REVIEW,
+                    state_result = apply_nonpass_verdict_state(
+                        service,
+                        run_id=args.run_id,
+                        target_state=resolved_on_human_review_state,
                     )
+                elif verdict["grade"] == AgentRuntimeGrade.RETRYABLE.value:
+                    state_result = apply_nonpass_verdict_state(
+                        service,
+                        run_id=args.run_id,
+                        target_state=resolved_on_retryable_state,
+                    )
+                state_after = (
+                    str(state_result.get("state"))
+                    if isinstance(state_result, dict)
+                    else str(state_result)
+                )
+                analysis_paths = rt.persist_run_analysis_artifacts(
+                    service=service,
+                    run=run,
+                    state_before=current_state.value,
+                    state_after=state_after,
+                    agent_report=agent_report,
+                    agent_report_path=agent_report_path,
+                    event_stream_path=event_stream_path,
+                    last_message_path=last_message_path,
+                )
                 print_json(
                     {
                         "ok": False,
                         "engine": "codex",
                         "exit_code": result.exit_code,
-                        "state": state_result["state"],
+                        "state": state_after,
                         "stderr": result.stderr.strip(),
                         "classification": verdict,
                         "agent_report": str(agent_report_path),
+                        "agent_event_stream": str(event_stream_path) if event_stream_path else None,
+                        "agent_last_message": str(last_message_path) if last_message_path else None,
+                        "run_digest": analysis_paths["run_digest"],
+                        "manager_insight": analysis_paths["manager_insight"],
                     }
                 )
                 return result.exit_code
             if verdict["grade"] != AgentRuntimeGrade.PASS.value:
                 if verdict["grade"] == AgentRuntimeGrade.HUMAN_REVIEW.value:
-                    state_result = service.retry_run(
-                        args.run_id,
-                        target_state=RunState.NEEDS_HUMAN_REVIEW,
+                    state_result = apply_nonpass_verdict_state(
+                        service,
+                        run_id=args.run_id,
+                        target_state=resolved_on_human_review_state,
                     )
                 else:
-                    state_result = service.retry_run(
-                        args.run_id,
-                        target_state=RunState.FAILED_RETRYABLE,
+                    state_result = apply_nonpass_verdict_state(
+                        service,
+                        run_id=args.run_id,
+                        target_state=resolved_on_retryable_state,
                     )
+                state_after = (
+                    str(state_result.get("state"))
+                    if isinstance(state_result, dict)
+                    else str(state_result)
+                )
+                analysis_paths = rt.persist_run_analysis_artifacts(
+                    service=service,
+                    run=run,
+                    state_before=current_state.value,
+                    state_after=state_after,
+                    agent_report=agent_report,
+                    agent_report_path=agent_report_path,
+                    event_stream_path=event_stream_path,
+                    last_message_path=last_message_path,
+                )
                 print_json(
                     {
                         "ok": False,
                         "engine": "codex",
                         "exit_code": result.exit_code,
-                        "state": state_result["state"],
+                        "state": state_after,
                         "classification": verdict,
                         "stdout_tail": tail(result.stdout),
                         "agent_report": str(agent_report_path),
+                        "agent_event_stream": str(event_stream_path) if event_stream_path else None,
+                        "agent_last_message": str(last_message_path) if last_message_path else None,
+                        "run_digest": analysis_paths["run_digest"],
+                        "manager_insight": analysis_paths["manager_insight"],
                     }
                 )
                 return 1
+            success_state = converge_agent_success_state(
+                service,
+                args,
+                success_state=resolved_success_state,
+            )
+            analysis_paths = rt.persist_run_analysis_artifacts(
+                service=service,
+                run=run,
+                state_before=current_state.value,
+                state_after=success_state,
+                agent_report=agent_report,
+                agent_report_path=agent_report_path,
+                event_stream_path=event_stream_path,
+                last_message_path=last_message_path,
+            )
             print_json(
                 {
                     "ok": True,
                     "engine": "codex",
                     "exit_code": result.exit_code,
-                    "state": converge_agent_success_state(service, args),
+                    "state": success_state,
                     "classification": verdict,
                     "stdout_tail": tail(result.stdout),
                     "agent_report": str(agent_report_path),
+                    "agent_event_stream": str(event_stream_path) if event_stream_path else None,
+                    "agent_last_message": str(last_message_path) if last_message_path else None,
+                    "run_digest": analysis_paths["run_digest"],
+                    "manager_insight": analysis_paths["manager_insight"],
                 }
             )
             return 0
@@ -943,6 +1750,46 @@ def main() -> int:
                     "approve-open-pr is allowed only when run state is PUSHED."
                 )
 
+            policy = load_manager_policy(Path(args.policy_file))
+            effective_policy = resolve_run_agent_effective_policy(
+                policy.run_agent_step,
+                owner=str(run["owner"]),
+                repo=str(run["repo"]),
+            )
+            digest_payload, digest_error = rt.load_digest_artifact_payload(
+                service,
+                run_id=args.run_id,
+            )
+            contract_available = (
+                service.latest_artifact(args.run_id, artifact_type="contract") is not None
+            )
+            gate = rt.evaluate_pr_gate_readiness(
+                digest=digest_payload,
+                expected_policy=effective_policy,
+                contract_available=contract_available,
+            )
+            if digest_error:
+                failed_checks = gate.get("failed_checks")
+                if isinstance(failed_checks, list):
+                    failed_checks.insert(
+                        0,
+                        {"code": "digest_load_error", "message": digest_error},
+                    )
+            if not gate.get("ok", False) and not bool(args.allow_dod_bypass):
+                failed_checks = gate.get("failed_checks")
+                failed_checks = failed_checks if isinstance(failed_checks, list) else []
+                top = failed_checks[:4]
+                details = "; ".join(
+                    f"{item.get('code')}: {item.get('message')}"
+                    for item in top
+                    if isinstance(item, dict)
+                )
+                raise ValueError(
+                    "PR DoD gate blocked approve-open-pr. "
+                    "Fix run quality or pass --allow-dod-bypass for manual emergency. "
+                    f"checks={details}"
+                )
+
             result = executor.run_create_pr(
                 repo_dir=repo_dir,
                 title=str(request_payload["title"]),
@@ -1018,6 +1865,11 @@ def main() -> int:
                     "pr_number": pr_number,
                     "pr_url": pr_url,
                     "state": state_result["state"],
+                    "dod_gate": {
+                        "ok": bool(gate.get("ok", False)),
+                        "bypassed": bool(args.allow_dod_bypass) and not bool(gate.get("ok", False)),
+                        "snapshot": gate.get("snapshot"),
+                    },
                 }
             )
             return 0
@@ -1059,6 +1911,8 @@ def main() -> int:
                 raise ValueError(
                     "Missing Telegram token. Set --telegram-token or AGENTPR_TELEGRAM_BOT_TOKEN."
                 )
+            manager_policy = load_manager_policy(Path(args.policy_file))
+            telegram_policy = manager_policy.telegram_bot
             client = TelegramClient(token)
             allowed_chat_ids = set(args.allow_chat_id)
             if not allowed_chat_ids and not args.allow_any_chat:
@@ -1066,6 +1920,47 @@ def main() -> int:
                     "Missing allowlist. Set --allow-chat-id (repeatable) or use --allow-any-chat "
                     "for local development only."
                 )
+            write_chat_ids = set(args.write_chat_id)
+            admin_chat_ids = set(args.admin_chat_id)
+            if not write_chat_ids and allowed_chat_ids:
+                write_chat_ids = set(allowed_chat_ids)
+            if not admin_chat_ids:
+                admin_chat_ids = set(write_chat_ids) if write_chat_ids else set(allowed_chat_ids)
+            resolved_poll_timeout_sec = (
+                max(int(args.poll_timeout_sec), 1)
+                if args.poll_timeout_sec is not None
+                else telegram_policy.poll_timeout_sec
+            )
+            resolved_idle_sleep_sec = (
+                max(int(args.idle_sleep_sec), 1)
+                if args.idle_sleep_sec is not None
+                else telegram_policy.idle_sleep_sec
+            )
+            resolved_list_limit = (
+                max(int(args.list_limit), 1)
+                if args.list_limit is not None
+                else telegram_policy.list_limit
+            )
+            resolved_rate_limit_window_sec = (
+                max(int(args.rate_limit_window_sec), 1)
+                if args.rate_limit_window_sec is not None
+                else telegram_policy.rate_limit_window_sec
+            )
+            resolved_rate_limit_per_chat = (
+                max(int(args.rate_limit_per_chat), 1)
+                if args.rate_limit_per_chat is not None
+                else telegram_policy.rate_limit_per_chat
+            )
+            resolved_rate_limit_global = (
+                max(int(args.rate_limit_global), 1)
+                if args.rate_limit_global is not None
+                else telegram_policy.rate_limit_global
+            )
+            audit_log_file = (
+                Path(args.audit_log_file)
+                if args.audit_log_file is not None
+                else PROJECT_ROOT / telegram_policy.audit_log_file
+            )
             try:
                 run_telegram_bot_loop(
                     client=client,
@@ -1075,9 +1970,15 @@ def main() -> int:
                     integration_root=Path(args.integration_root),
                     project_root=PROJECT_ROOT,
                     allowed_chat_ids=allowed_chat_ids,
-                    poll_timeout_sec=max(args.poll_timeout_sec, 1),
-                    idle_sleep_sec=max(args.idle_sleep_sec, 1),
-                    list_limit=max(args.list_limit, 1),
+                    write_chat_ids=write_chat_ids,
+                    admin_chat_ids=admin_chat_ids,
+                    poll_timeout_sec=resolved_poll_timeout_sec,
+                    idle_sleep_sec=resolved_idle_sleep_sec,
+                    list_limit=resolved_list_limit,
+                    rate_limit_window_sec=resolved_rate_limit_window_sec,
+                    rate_limit_per_chat=resolved_rate_limit_per_chat,
+                    rate_limit_global=resolved_rate_limit_global,
+                    audit_log_file=audit_log_file,
                 )
             except KeyboardInterrupt:
                 return 130
@@ -1091,6 +1992,18 @@ def main() -> int:
                     "Missing GitHub webhook secret. Set --secret or AGENTPR_GITHUB_WEBHOOK_SECRET, "
                     "or use --allow-unsigned for local development."
                 )
+            manager_policy = load_manager_policy(Path(args.policy_file))
+            webhook_policy = manager_policy.github_webhook
+            resolved_max_payload_bytes = (
+                max(int(args.max_payload_bytes), 1024)
+                if args.max_payload_bytes is not None
+                else webhook_policy.max_payload_bytes
+            )
+            audit_log_file = (
+                Path(args.audit_log_file)
+                if args.audit_log_file is not None
+                else PROJECT_ROOT / webhook_policy.audit_log_file
+            )
             try:
                 run_github_webhook_server(
                     service=service,
@@ -1099,6 +2012,8 @@ def main() -> int:
                     path=args.path,
                     secret=secret,
                     require_signature=require_signature,
+                    max_payload_bytes=resolved_max_payload_bytes,
+                    audit_log_file=audit_log_file,
                 )
             except KeyboardInterrupt:
                 return 130
@@ -1118,6 +2033,24 @@ def main() -> int:
                 }
             )
             return 0
+
+        if args.command == "webhook-audit-summary":
+            manager_policy = load_manager_policy(Path(args.policy_file))
+            webhook_policy = manager_policy.github_webhook
+            audit_log_file = (
+                Path(args.audit_log_file)
+                if args.audit_log_file is not None
+                else PROJECT_ROOT / webhook_policy.audit_log_file
+            )
+            report = summarize_webhook_audit_log(
+                audit_log_file=audit_log_file,
+                since_minutes=max(int(args.since_minutes), 1),
+                max_lines=max(int(args.max_lines), 1),
+                fail_on_retryable_failures=args.fail_on_retryable_failures,
+                fail_on_http5xx_rate=args.fail_on_http5xx_rate,
+            )
+            print_json(report)
+            return 0 if report["ok"] else 1
 
         if args.command == "link-pr":
             print_json(
@@ -1236,7 +2169,7 @@ def load_optional_text(inline: str | None, file_path: Path | None, *, arg_name: 
 def write_pr_open_request(run_id: str, payload: dict[str, Any]) -> Path:
     reports_dir = PROJECT_ROOT / "orchestrator" / "data" / "reports"
     reports_dir.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
     path = reports_dir / f"{run_id}_pr_open_request_{stamp}.json"
     path.write_text(
         json.dumps(payload, ensure_ascii=True, sort_keys=True, indent=2),
@@ -1333,6 +2266,82 @@ def run_preflight_checks(
         metadata={"ok": report.ok},
     )
     return report_payload
+
+
+def install_curated_ci_skills(*, skills_root: Path) -> dict[str, Any]:
+    installer_script = (
+        Path.home()
+        / ".codex"
+        / "skills"
+        / ".system"
+        / "skill-installer"
+        / "scripts"
+        / "install-skill-from-github.py"
+    )
+    if not installer_script.exists():
+        return {
+            "ok": False,
+            "error": f"installer script not found: {installer_script}",
+        }
+    targets = [
+        ("gh-fix-ci", "skills/.curated/gh-fix-ci"),
+        ("gh-address-comments", "skills/.curated/gh-address-comments"),
+    ]
+    results: list[dict[str, Any]] = []
+    all_ok = True
+    for name, remote_path in targets:
+        dest = skills_root / name
+        if dest.exists():
+            results.append(
+                {
+                    "name": name,
+                    "status": "already_exists",
+                    "dest": str(dest),
+                    "command": None,
+                }
+            )
+            continue
+        cmd = [
+            sys.executable,
+            str(installer_script),
+            "--repo",
+            "openai/skills",
+            "--path",
+            remote_path,
+            "--dest",
+            str(skills_root),
+        ]
+        completed = subprocess.run(  # noqa: S603
+            cmd,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        stderr = completed.stderr.strip()
+        stdout = completed.stdout.strip()
+        if completed.returncode == 0:
+            status = "installed"
+        elif "Destination already exists" in stderr and dest.exists():
+            status = "already_exists"
+        else:
+            status = "failed"
+            all_ok = False
+        results.append(
+            {
+                "name": name,
+                "status": status,
+                "dest": str(dest),
+                "command": cmd,
+                "exit_code": completed.returncode,
+                "stdout": stdout,
+                "stderr": stderr,
+            }
+        )
+
+    return {
+        "ok": all_ok,
+        "results": results,
+    }
 
 
 def run_github_sync_once(
@@ -1460,6 +2469,707 @@ def run_github_sync_once(
     return report_payload
 
 
+def gather_skills_metrics(
+    *,
+    service: OrchestratorService,
+    run_id: str | None,
+    limit: int,
+) -> dict[str, Any]:
+    if run_id:
+        artifacts = service.list_artifacts(
+            run_id,
+            artifact_type="agent_runtime_report",
+            limit=limit,
+        )
+    else:
+        artifacts = service.list_artifacts_global(
+            artifact_type="agent_runtime_report",
+            limit=limit,
+        )
+
+    mode_counts: dict[str, int] = {}
+    grade_counts: dict[str, int] = {}
+    reason_counts: dict[str, int] = {}
+    state_counts: dict[str, int] = {}
+    per_skill: dict[str, dict[str, Any]] = {}
+    missing_required_counts: dict[str, int] = {}
+    failures: list[dict[str, Any]] = []
+    rows: list[dict[str, Any]] = []
+
+    for artifact in artifacts:
+        uri = Path(str(artifact.get("uri", "")))
+        if not uri.exists():
+            failures.append(
+                {
+                    "run_id": artifact.get("run_id"),
+                    "artifact_id": artifact.get("id"),
+                    "error": f"missing runtime report: {uri}",
+                }
+            )
+            continue
+        try:
+            payload = json.loads(uri.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            failures.append(
+                {
+                    "run_id": artifact.get("run_id"),
+                    "artifact_id": artifact.get("id"),
+                    "error": f"invalid runtime report {uri}: {exc}",
+                }
+            )
+            continue
+
+        runtime = payload.get("runtime") if isinstance(payload, dict) else {}
+        classification = payload.get("classification") if isinstance(payload, dict) else {}
+        runtime = runtime if isinstance(runtime, dict) else {}
+        classification = classification if isinstance(classification, dict) else {}
+        skills_mode = str(runtime.get("skills_mode", "off"))
+        grade = str(classification.get("grade", "UNKNOWN"))
+        reason_code = str(classification.get("reason_code", "unknown"))
+        skill_plan = runtime.get("skill_plan")
+        run_state = None
+        if isinstance(skill_plan, dict) and skill_plan.get("run_state") is not None:
+            run_state = str(skill_plan.get("run_state"))
+
+        mode_counts[skills_mode] = mode_counts.get(skills_mode, 0) + 1
+        grade_counts[grade] = grade_counts.get(grade, 0) + 1
+        reason_counts[reason_code] = reason_counts.get(reason_code, 0) + 1
+        if run_state:
+            state_counts[run_state] = state_counts.get(run_state, 0) + 1
+
+        required_now: list[str] = []
+        available_optional: list[str] = []
+        missing_required: list[str] = []
+        if isinstance(skill_plan, dict):
+            required_now = [str(item) for item in skill_plan.get("required_now", []) if str(item).strip()]
+            available_optional = [str(item) for item in skill_plan.get("available_optional", []) if str(item).strip()]
+            missing_required = [str(item) for item in skill_plan.get("missing_required", []) if str(item).strip()]
+        for skill_name in missing_required:
+            missing_required_counts[skill_name] = missing_required_counts.get(skill_name, 0) + 1
+
+        seen_skills = sorted(set(required_now + available_optional))
+        for skill_name in seen_skills:
+            stats = per_skill.setdefault(
+                skill_name,
+                {
+                    "skill": skill_name,
+                    "samples": 0,
+                    "grades": {},
+                    "reasons": {},
+                    "states": {},
+                    "runs": [],
+                },
+            )
+            stats["samples"] += 1
+            stats["grades"][grade] = stats["grades"].get(grade, 0) + 1
+            stats["reasons"][reason_code] = stats["reasons"].get(reason_code, 0) + 1
+            if run_state:
+                stats["states"][run_state] = stats["states"].get(run_state, 0) + 1
+            if len(stats["runs"]) < 20:
+                stats["runs"].append(str(payload.get("run_id") or artifact.get("run_id") or ""))
+
+        rows.append(
+            {
+                "run_id": str(payload.get("run_id") or artifact.get("run_id") or ""),
+                "created_at": str(payload.get("created_at") or artifact.get("created_at") or ""),
+                "skills_mode": skills_mode,
+                "run_state": run_state,
+                "grade": grade,
+                "reason_code": reason_code,
+                "attempt_no": runtime.get("attempt_no"),
+                "max_retryable_attempts": runtime.get("max_retryable_attempts"),
+                "required_now": required_now,
+                "available_optional": available_optional,
+                "missing_required": missing_required,
+                "report_path": str(uri),
+            }
+        )
+
+    return {
+        "ok": True,
+        "scope_run_id": run_id,
+        "scanned_artifacts": len(artifacts),
+        "parsed_reports": len(rows),
+        "mode_counts": mode_counts,
+        "grade_counts": grade_counts,
+        "reason_code_counts": reason_counts,
+        "state_counts": state_counts,
+        "per_skill": sorted(per_skill.values(), key=lambda row: int(row.get("samples", 0)), reverse=True),
+        "missing_required_counts": missing_required_counts,
+        "latest": rows[:20],
+        "failures": failures[:20],
+    }
+
+
+def summarize_webhook_audit_log(
+    *,
+    audit_log_file: Path,
+    since_minutes: int,
+    max_lines: int,
+    fail_on_retryable_failures: int | None,
+    fail_on_http5xx_rate: float | None,
+) -> dict[str, Any]:
+    if not audit_log_file.exists():
+        return {
+            "ok": False,
+            "error": f"audit log file not found: {audit_log_file}",
+            "audit_log_file": str(audit_log_file),
+            "since_minutes": since_minutes,
+            "max_lines": max_lines,
+        }
+
+    try:
+        lines = audit_log_file.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        return {
+            "ok": False,
+            "error": f"failed to read audit log: {exc}",
+            "audit_log_file": str(audit_log_file),
+            "since_minutes": since_minutes,
+            "max_lines": max_lines,
+        }
+
+    tail_lines = lines[-max_lines:]
+    now = datetime.now(UTC)
+    window_start = now - timedelta(minutes=max(since_minutes, 1))
+    outcome_counts: dict[str, int] = {}
+    status_code_counts: dict[str, int] = {}
+    error_counts: dict[str, int] = {}
+    retryable_failures = 0
+    http_5xx_count = 0
+    parse_errors = 0
+    considered = 0
+
+    for line in tail_lines:
+        text = line.strip()
+        if not text:
+            continue
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError:
+            parse_errors += 1
+            continue
+        if not isinstance(payload, dict):
+            parse_errors += 1
+            continue
+        raw_ts = payload.get("ts")
+        if raw_ts is None:
+            parse_errors += 1
+            continue
+        try:
+            ts = datetime.fromisoformat(str(raw_ts))
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=UTC)
+            ts = ts.astimezone(UTC)
+        except ValueError:
+            parse_errors += 1
+            continue
+        if ts < window_start:
+            continue
+        considered += 1
+        outcome = str(payload.get("outcome", "unknown"))
+        outcome_counts[outcome] = outcome_counts.get(outcome, 0) + 1
+
+        status_code = int(payload.get("status_code", 0))
+        status_key = str(status_code)
+        status_code_counts[status_key] = status_code_counts.get(status_key, 0) + 1
+        if status_code >= 500:
+            http_5xx_count += 1
+
+        retryable_value = int(payload.get("retryable_failures", 0))
+        retryable_failures += max(retryable_value, 0)
+
+        error_text = str(payload.get("error", "")).strip()
+        if error_text:
+            error_counts[error_text] = error_counts.get(error_text, 0) + 1
+
+    http_5xx_rate_pct = (
+        round((http_5xx_count / considered) * 100.0, 2) if considered > 0 else 0.0
+    )
+    alerts: list[str] = []
+    ok = True
+    if (
+        fail_on_retryable_failures is not None
+        and retryable_failures > int(fail_on_retryable_failures)
+    ):
+        ok = False
+        alerts.append(
+            "retryable_failures_exceeded:"
+            f"{retryable_failures}>{int(fail_on_retryable_failures)}"
+        )
+    if fail_on_http5xx_rate is not None and http_5xx_rate_pct > float(fail_on_http5xx_rate):
+        ok = False
+        alerts.append(
+            "http_5xx_rate_exceeded:"
+            f"{http_5xx_rate_pct}>{float(fail_on_http5xx_rate)}"
+        )
+
+    top_errors = sorted(error_counts.items(), key=lambda item: item[1], reverse=True)[:10]
+    return {
+        "ok": ok,
+        "audit_log_file": str(audit_log_file),
+        "since_minutes": since_minutes,
+        "window_start": window_start.isoformat(),
+        "window_end": now.isoformat(),
+        "max_lines": max_lines,
+        "total_lines_read": len(tail_lines),
+        "parse_errors": parse_errors,
+        "considered_entries": considered,
+        "outcome_counts": outcome_counts,
+        "status_code_counts": status_code_counts,
+        "retryable_failures": retryable_failures,
+        "http_5xx_count": http_5xx_count,
+        "http_5xx_rate_pct": http_5xx_rate_pct,
+        "top_errors": [{"error": text, "count": count} for text, count in top_errors],
+        "alerts": alerts,
+    }
+
+
+def summarize_command_categories(commands: list[str]) -> dict[str, int]:
+    return rt.summarize_command_categories(commands)
+
+
+def extract_failed_test_commands(event_summary: dict[str, Any]) -> list[str]:
+    return rt.extract_failed_test_commands(event_summary)
+
+
+def parse_optional_iso_datetime(value: str | None) -> datetime | None:
+    if value is None:
+        return None
+    raw = str(value).strip()
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def percentile_ms(values: list[int], p: float) -> int:
+    if not values:
+        return 0
+    ordered = sorted(int(v) for v in values)
+    if len(ordered) == 1:
+        return ordered[0]
+    rank = max(0.0, min(1.0, p)) * (len(ordered) - 1)
+    lo = int(rank)
+    hi = min(lo + 1, len(ordered) - 1)
+    if lo == hi:
+        return ordered[lo]
+    frac = rank - lo
+    return int(ordered[lo] + (ordered[hi] - ordered[lo]) * frac)
+
+
+def recommended_actions_for_state(state: RunState) -> list[str]:
+    state_actions: dict[RunState, list[str]] = {
+        RunState.QUEUED: [
+            "start-discovery --run-id <run_id>",
+            "run-prepare --run-id <run_id>",
+        ],
+        RunState.DISCOVERY: [
+            "mark-plan-ready --run-id <run_id> --contract-path <path>",
+            "run-agent-step --run-id <run_id> --prompt-file <path>",
+        ],
+        RunState.PLAN_READY: [
+            "start-implementation --run-id <run_id>",
+            "run-agent-step --run-id <run_id> --prompt-file <path>",
+        ],
+        RunState.IMPLEMENTING: [
+            "run-agent-step --run-id <run_id> --prompt-file <path> --success-state LOCAL_VALIDATING",
+        ],
+        RunState.LOCAL_VALIDATING: [
+            "run-agent-step --run-id <run_id> --prompt-file <path> --success-state LOCAL_VALIDATING",
+            "run-finish --run-id <run_id> --changes <summary>",
+        ],
+        RunState.PUSHED: [
+            "request-open-pr --run-id <run_id> --title <title> --body-file <path>",
+            "or keep push_only and wait for manual PR decision",
+        ],
+        RunState.CI_WAIT: [
+            "sync-github --run-id <run_id>",
+            "run-github-webhook (preferred) + sync-github fallback loop",
+        ],
+        RunState.REVIEW_WAIT: [
+            "sync-github --run-id <run_id>",
+            "retry --run-id <run_id> --target-state ITERATING",
+        ],
+        RunState.ITERATING: [
+            "run-agent-step --run-id <run_id> --prompt-file <path> --success-state LOCAL_VALIDATING",
+            "retry --run-id <run_id> --target-state IMPLEMENTING",
+        ],
+        RunState.NEEDS_HUMAN_REVIEW: [
+            "inspect-run --run-id <run_id>",
+            "retry --run-id <run_id> --target-state IMPLEMENTING",
+        ],
+        RunState.FAILED_RETRYABLE: [
+            "retry --run-id <run_id> --target-state IMPLEMENTING",
+            "inspect-run --run-id <run_id>",
+        ],
+        RunState.PAUSED: [
+            "resume --run-id <run_id> --target-state <state>",
+        ],
+        RunState.DONE: [],
+        RunState.SKIPPED: [],
+        RunState.FAILED_TERMINAL: [],
+    }
+    return state_actions.get(state, [])
+
+
+def gather_run_inspect(
+    *,
+    service: OrchestratorService,
+    run_id: str,
+    attempt_limit: int,
+    event_limit: int,
+    command_limit: int,
+    include_log_tails: bool,
+) -> dict[str, Any]:
+    snapshot = service.get_run_snapshot(run_id)
+    run = snapshot["run"]
+    current_state = RunState(str(snapshot["state"]))
+
+    attempt_rows = service.list_step_attempts(
+        run_id,
+        limit=max(int(attempt_limit), 1),
+    )
+    # DB method returns newest first; manager view prefers chronological timeline.
+    attempt_rows = list(reversed(attempt_rows))
+
+    total_duration_ms = 0
+    per_step: dict[str, dict[str, Any]] = {}
+    attempts_out: list[dict[str, Any]] = []
+    for row in attempt_rows:
+        step = str(row.get("step", "unknown"))
+        duration_ms = int(row.get("duration_ms") or 0)
+        total_duration_ms += max(duration_ms, 0)
+        info = per_step.setdefault(
+            step,
+            {
+                "attempts": 0,
+                "total_duration_ms": 0,
+                "durations_ms": [],
+                "last_exit_code": None,
+            },
+        )
+        info["attempts"] += 1
+        info["total_duration_ms"] += max(duration_ms, 0)
+        info["durations_ms"].append(max(duration_ms, 0))
+        info["last_exit_code"] = int(row.get("exit_code") or 0)
+
+        item = {
+            "step": step,
+            "attempt_no": int(row.get("attempt_no") or 0),
+            "exit_code": int(row.get("exit_code") or 0),
+            "duration_ms": duration_ms,
+            "created_at": str(row.get("created_at") or ""),
+        }
+        if include_log_tails:
+            item["stdout_tail"] = tail(str(row.get("stdout_log") or ""))
+            item["stderr_tail"] = tail(str(row.get("stderr_log") or ""))
+        attempts_out.append(item)
+
+    step_totals: list[dict[str, Any]] = []
+    for step, info in per_step.items():
+        durations = [int(v) for v in info["durations_ms"]]
+        total_ms = int(info["total_duration_ms"])
+        step_totals.append(
+            {
+                "step": step,
+                "attempts": int(info["attempts"]),
+                "total_duration_ms": total_ms,
+                "avg_duration_ms": int(total_ms / max(int(info["attempts"]), 1)),
+                "p50_duration_ms": percentile_ms(durations, 0.50),
+                "p90_duration_ms": percentile_ms(durations, 0.90),
+                "last_exit_code": info["last_exit_code"],
+                "share_of_total_pct": round((100.0 * total_ms / total_duration_ms), 2)
+                if total_duration_ms > 0
+                else 0.0,
+            }
+        )
+    step_totals.sort(key=lambda row: int(row["total_duration_ms"]), reverse=True)
+    warnings: list[str] = []
+    preflight_attempts = next(
+        (int(row["attempts"]) for row in step_totals if str(row["step"]) == StepName.PREFLIGHT.value),
+        0,
+    )
+    if preflight_attempts > 1:
+        warnings.append(
+            "multiple preflight attempts detected; avoid running both standalone "
+            "run-preflight and default preflight inside run-agent-step unless required."
+        )
+    if step_totals and str(step_totals[0]["step"]) == StepName.AGENT.value:
+        share_pct = float(step_totals[0]["share_of_total_pct"])
+        if share_pct >= 85.0:
+            warnings.append(
+                f"agent step dominates runtime ({share_pct:.2f}%). focus optimization on "
+                "dependency install/test scope and prompt-stage tasking."
+            )
+
+    event_rows = service.list_events(
+        run_id,
+        limit=max(int(event_limit), 1),
+    )
+    event_rows = list(reversed(event_rows))
+    events_out: list[dict[str, Any]] = []
+    for row in event_rows:
+        payload = row.get("payload")
+        payload_obj = payload if isinstance(payload, dict) else {}
+        compact_payload = {
+            key: payload_obj[key]
+            for key in sorted(payload_obj.keys())[:8]
+        }
+        events_out.append(
+            {
+                "event_id": int(row.get("event_id") or 0),
+                "event_type": str(row.get("event_type") or ""),
+                "created_at": str(row.get("created_at") or ""),
+                "idempotency_key": str(row.get("idempotency_key") or ""),
+                "payload": compact_payload,
+            }
+        )
+
+    latest_runtime = service.latest_artifact(run_id, artifact_type="agent_runtime_report")
+    runtime_summary: dict[str, Any] | None = None
+    if latest_runtime is not None:
+        path = Path(str(latest_runtime.get("uri", "")))
+        if path.exists():
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                payload = None
+            if isinstance(payload, dict):
+                signals = payload.get("signals")
+                signals = signals if isinstance(signals, dict) else {}
+                classification = payload.get("classification")
+                classification = classification if isinstance(classification, dict) else {}
+                runtime = payload.get("runtime")
+                runtime = runtime if isinstance(runtime, dict) else {}
+                result = payload.get("result")
+                result = result if isinstance(result, dict) else {}
+                commands_sample = [
+                    str(item).strip()
+                    for item in (signals.get("commands_sample") or [])
+                    if str(item).strip()
+                ]
+                test_commands = [
+                    str(item).strip()
+                    for item in (signals.get("test_commands") or [])
+                    if str(item).strip()
+                ]
+                failed_test_commands = [
+                    str(item).strip()
+                    for item in (signals.get("failed_test_commands") or [])
+                    if str(item).strip()
+                ]
+                command_categories = signals.get("command_categories")
+                if not isinstance(command_categories, dict):
+                    command_categories = summarize_command_categories(commands_sample)
+                agent_event_summary = signals.get("agent_event_summary")
+                if not isinstance(agent_event_summary, dict):
+                    agent_event_summary = {}
+                event_stream_path = str(runtime.get("event_stream_path") or "")
+                last_message_path = str(runtime.get("last_message_path") or "")
+                last_message_preview = ""
+                if last_message_path:
+                    preview_path = Path(last_message_path)
+                    if preview_path.exists():
+                        try:
+                            last_message_preview = tail(
+                                preview_path.read_text(encoding="utf-8"),
+                                lines=10,
+                            )
+                        except OSError:
+                            last_message_preview = ""
+                runtime_summary = {
+                    "report_path": str(path),
+                    "created_at": str(payload.get("created_at") or latest_runtime.get("created_at") or ""),
+                    "duration_ms": int(result.get("duration_ms") or 0),
+                    "exit_code": int(result.get("exit_code") or 0),
+                    "grade": str(classification.get("grade") or ""),
+                    "reason_code": str(classification.get("reason_code") or ""),
+                    "next_action": str(classification.get("next_action") or ""),
+                    "skills_mode": str(runtime.get("skills_mode") or "off"),
+                    "attempt_no": runtime.get("attempt_no"),
+                    "test_commands": test_commands[:20],
+                    "test_command_count": len(test_commands),
+                    "failed_test_commands": failed_test_commands[:20],
+                    "failed_test_command_count": len(failed_test_commands),
+                    "command_sample": commands_sample[: max(int(command_limit), 1)],
+                    "command_sample_count": len(commands_sample),
+                    "command_categories": command_categories,
+                    "agent_event_summary": agent_event_summary,
+                    "event_stream_path": event_stream_path,
+                    "last_message_path": last_message_path,
+                    "last_message_preview": last_message_preview,
+                    "diff": signals.get("diff"),
+                }
+
+    latest_digest_summary: dict[str, Any] | None = None
+    latest_digest = service.latest_artifact(run_id, artifact_type="run_digest")
+    if latest_digest is not None:
+        digest_path = Path(str(latest_digest.get("uri", "")))
+        if digest_path.exists():
+            try:
+                digest_payload = json.loads(digest_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                digest_payload = None
+            if isinstance(digest_payload, dict):
+                classification = digest_payload.get("classification")
+                classification = classification if isinstance(classification, dict) else {}
+                state = digest_payload.get("state")
+                state = state if isinstance(state, dict) else {}
+                recommendation = digest_payload.get("manager_recommendation")
+                recommendation = recommendation if isinstance(recommendation, dict) else {}
+                stages = digest_payload.get("stages")
+                stages = stages if isinstance(stages, dict) else {}
+                latest_digest_summary = {
+                    "path": str(digest_path),
+                    "generated_at": str(digest_payload.get("generated_at") or ""),
+                    "grade": str(classification.get("grade") or ""),
+                    "reason_code": str(classification.get("reason_code") or ""),
+                    "state_before": str(state.get("before") or ""),
+                    "state_after": str(state.get("after") or ""),
+                    "recommended_action": str(recommendation.get("action") or ""),
+                    "top_step": str(stages.get("top_step") or ""),
+                    "step_attempt_count": int(stages.get("step_attempt_count") or 0),
+                }
+
+    latest_manager_insight: dict[str, Any] | None = None
+    insight_artifact = service.latest_artifact(run_id, artifact_type="manager_insight")
+    if insight_artifact is not None:
+        insight_path = Path(str(insight_artifact.get("uri", "")))
+        if insight_path.exists():
+            preview = ""
+            try:
+                preview = tail(insight_path.read_text(encoding="utf-8"), lines=24)
+            except OSError:
+                preview = ""
+            latest_manager_insight = {
+                "path": str(insight_path),
+                "preview": preview,
+            }
+
+    step_start = (
+        parse_optional_iso_datetime(str(attempt_rows[0]["created_at"]))
+        if attempt_rows
+        else None
+    )
+    step_end = (
+        parse_optional_iso_datetime(str(attempt_rows[-1]["created_at"]))
+        if attempt_rows
+        else None
+    )
+    run_created = parse_optional_iso_datetime(str(run.get("created_at")))
+    run_updated = parse_optional_iso_datetime(str(run.get("updated_at")))
+
+    return {
+        "ok": True,
+        "run": {
+            "run_id": str(run["run_id"]),
+            "owner": str(run["owner"]),
+            "repo": str(run["repo"]),
+            "mode": str(run["mode"]),
+            "prompt_version": str(run["prompt_version"]),
+            "workspace_dir": str(run["workspace_dir"]),
+            "pr_number": run.get("pr_number"),
+            "created_at": str(run["created_at"]),
+            "updated_at": str(run["updated_at"]),
+        },
+        "state": current_state.value,
+        "allowed_targets": [item.value for item in allowed_targets(current_state)],
+        "recommended_actions": recommended_actions_for_state(current_state),
+        "warnings": warnings,
+        "timing": {
+            "step_attempt_count": len(attempt_rows),
+            "total_step_duration_ms": total_duration_ms,
+            "run_wall_clock_ms": int((run_updated - run_created).total_seconds() * 1000)
+            if run_created is not None and run_updated is not None
+            else None,
+            "step_window_ms": int((step_end - step_start).total_seconds() * 1000)
+            if step_start is not None and step_end is not None
+            else None,
+            "step_totals": step_totals,
+            "attempts": attempts_out,
+        },
+        "events": {
+            "count": len(events_out),
+            "items": events_out,
+        },
+        "latest_agent_runtime": runtime_summary,
+        "latest_run_digest": latest_digest_summary,
+        "latest_manager_insight": latest_manager_insight,
+    }
+
+
+def gather_run_bottlenecks(
+    *,
+    service: OrchestratorService,
+    limit: int,
+    attempt_limit_per_run: int,
+) -> dict[str, Any]:
+    runs = service.list_runs(limit=max(int(limit), 1))
+    per_step_samples: dict[str, list[int]] = defaultdict(list)
+    run_totals: list[dict[str, Any]] = []
+    analyzed_runs = 0
+    for run in runs:
+        run_id = str(run["run_id"])
+        attempts = service.list_step_attempts(
+            run_id,
+            limit=max(int(attempt_limit_per_run), 1),
+        )
+        if not attempts:
+            continue
+        analyzed_runs += 1
+        total_ms = 0
+        by_step: dict[str, int] = defaultdict(int)
+        for row in attempts:
+            step = str(row.get("step") or "unknown")
+            duration_ms = max(int(row.get("duration_ms") or 0), 0)
+            total_ms += duration_ms
+            by_step[step] += duration_ms
+            per_step_samples[step].append(duration_ms)
+        run_totals.append(
+            {
+                "run_id": run_id,
+                "repo": str(run.get("repo") or ""),
+                "owner": str(run.get("owner") or ""),
+                "state": str(run.get("current_state") or ""),
+                "prompt_version": str(run.get("prompt_version") or ""),
+                "total_step_duration_ms": total_ms,
+                "top_step": max(by_step.items(), key=lambda x: x[1])[0] if by_step else None,
+                "top_step_duration_ms": max(by_step.values()) if by_step else 0,
+                "updated_at": str(run.get("updated_at") or ""),
+            }
+        )
+
+    step_stats: list[dict[str, Any]] = []
+    for step, samples in per_step_samples.items():
+        ordered = sorted(samples)
+        step_stats.append(
+            {
+                "step": step,
+                "samples": len(ordered),
+                "avg_duration_ms": int(sum(ordered) / max(len(ordered), 1)),
+                "median_duration_ms": int(statistics.median(ordered)),
+                "p90_duration_ms": percentile_ms(ordered, 0.90),
+                "max_duration_ms": int(max(ordered)),
+            }
+        )
+    step_stats.sort(key=lambda row: int(row["avg_duration_ms"]), reverse=True)
+    run_totals.sort(key=lambda row: int(row["total_step_duration_ms"]), reverse=True)
+
+    return {
+        "ok": True,
+        "scanned_runs": len(runs),
+        "analyzed_runs": analyzed_runs,
+        "step_bottlenecks": step_stats,
+        "slowest_runs": run_totals[:20],
+    }
+
+
 def resolve_github_sync_candidates(
     *,
     service: OrchestratorService,
@@ -1492,7 +3202,7 @@ def resolve_github_sync_candidates(
 def write_github_sync_report(payload: dict[str, Any]) -> Path:
     reports_dir = PROJECT_ROOT / "orchestrator" / "data" / "reports"
     reports_dir.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
     report_path = reports_dir / f"github_sync_{stamp}.json"
     report_path.write_text(
         json.dumps(payload, ensure_ascii=True, sort_keys=True, indent=2),
@@ -1509,258 +3219,131 @@ def write_preflight_report(run_id: str, report_json: str) -> Path:
     return report_path
 
 
-def build_agent_runtime_report(
-    *,
-    run_id: str,
-    engine: str,
-    result: Any,
-    run_state: RunState,
-    codex_sandbox: str,
-    codex_model: str | None,
-    codex_full_auto: bool,
-    runtime_policy: dict[str, Any],
-    preflight_report: dict[str, Any] | None,
-) -> dict[str, Any]:
-    commands = extract_shell_commands(f"{result.stdout}\n{result.stderr}")
-    if not commands:
-        commands = [line for line in result.stderr.splitlines() if line.strip()][:20]
-
-    safety_patterns: list[tuple[str, str]] = [
-        ("sudo", r"\bsudo\b"),
-        ("brew_install", r"\bbrew\s+install\b"),
-        ("npm_global", r"\bnpm\b.*\s(-g|--global)\b"),
-        ("pnpm_global", r"\bpnpm\b.*\s(-g|--global)\b"),
-        ("yarn_global", r"\byarn\s+global\b"),
-        ("uv_tool_install", r"\buv\s+tool\s+install\b"),
-        ("poetry_self", r"\bpoetry\s+self\b"),
-    ]
-    violations: list[dict[str, str]] = []
-    for command in commands:
-        for tag, pattern in safety_patterns:
-            if re.search(pattern, command):
-                violations.append({"rule": tag, "command": command})
-
-    test_patterns = [
-        r"\bmake\s+test\b",
-        r"\bmake\s+lint\b",
-        r"\bpytest\b",
-        r"\btox\b",
-        r"\bhatch\s+run\s+test\b",
-        r"\bpoetry\s+run\s+(pytest|tox)\b",
-        r"\buv\s+run\s+(pytest|tox)\b",
-        r"\bbun\s+test\b",
-        r"\bbun\s+run\s+typecheck\b",
-        r"\bnpm\s+test\b",
-        r"\bpnpm\s+test\b",
-        r"\byarn\s+test\b",
-    ]
-    test_signals = sorted(
-        {command for command in commands for pattern in test_patterns if re.search(pattern, command)}
-    )
-    git_signals = sorted(
-        {
-            command
-            for command in commands
-            for pattern in (r"\bgit\s+commit\b", r"\bgit\s+push\b", r"\bfinish\.sh\b")
-            if re.search(pattern, command)
-        }
-    )
-    classification = classify_agent_runtime(
-        run_state=run_state,
-        result=result,
-        preflight_report=preflight_report,
-        safety_violations=violations,
-        test_signals=test_signals,
-    )
-
-    return {
-        "run_id": run_id,
-        "created_at": datetime.now(UTC).isoformat(),
-        "engine": engine,
-        "result": {
-            "exit_code": result.exit_code,
-            "duration_ms": result.duration_ms,
-        },
-        "runtime": {
-            "codex_sandbox": codex_sandbox,
-            "codex_model": codex_model,
-            "codex_full_auto": codex_full_auto,
-            "policy": runtime_policy,
-        },
-        "preflight": preflight_report,
-        "signals": {
-            "commands_sample": commands[:40],
-            "test_commands": test_signals,
-            "git_commands": git_signals,
-        },
-        "safety": {
-            "violations": violations,
-            "violation_count": len(violations),
-        },
-        "classification": classification,
-    }
-
-
-def classify_agent_runtime(
-    *,
-    run_state: RunState,
-    result: Any,
-    preflight_report: dict[str, Any] | None,
-    safety_violations: list[dict[str, str]],
-    test_signals: list[str],
-) -> dict[str, Any]:
-    if preflight_report is not None and not preflight_report.get("ok", True):
-        failures = [str(item) for item in preflight_report.get("failures", [])]
-        failure_text = "\n".join(failures)
-        if contains_any_pattern(failure_text, RETRYABLE_FAILURE_PATTERNS):
-            return {
-                "grade": AgentRuntimeGrade.RETRYABLE.value,
-                "reason_code": "preflight_transient_failure",
-                "next_action": "retry",
-                "evidence": {"failures": failures[:8]},
-            }
-        return {
-            "grade": AgentRuntimeGrade.HUMAN_REVIEW.value,
-            "reason_code": "preflight_hard_failure",
-            "next_action": "escalate",
-            "evidence": {"failures": failures[:8]},
-        }
-
-    if safety_violations:
-        return {
-            "grade": AgentRuntimeGrade.HUMAN_REVIEW.value,
-            "reason_code": "safety_violation",
-            "next_action": "escalate",
-            "evidence": {
-                "violations": safety_violations[:8],
-            },
-        }
-
-    requires_test_evidence = run_state in {
-        RunState.IMPLEMENTING,
-        RunState.LOCAL_VALIDATING,
-        RunState.ITERATING,
-    }
-    if result.exit_code == 0:
-        if requires_test_evidence and not test_signals:
-            return {
-                "grade": AgentRuntimeGrade.HUMAN_REVIEW.value,
-                "reason_code": "missing_test_evidence",
-                "next_action": "escalate",
-                "evidence": {"expected_state": run_state.value},
-            }
-        return {
-            "grade": AgentRuntimeGrade.PASS.value,
-            "reason_code": "runtime_success",
-            "next_action": "advance",
-            "evidence": {
-                "exit_code": result.exit_code,
-                "test_commands": test_signals[:12],
-            },
-        }
-
-    error_text = f"{result.stderr}\n{result.stdout}"
-    if contains_any_pattern(error_text, HARD_FAILURE_PATTERNS):
-        return {
-            "grade": AgentRuntimeGrade.HUMAN_REVIEW.value,
-            "reason_code": "runtime_hard_failure",
-            "next_action": "escalate",
-            "evidence": {"exit_code": result.exit_code},
-        }
-
-    if contains_any_pattern(error_text, RETRYABLE_FAILURE_PATTERNS):
-        return {
-            "grade": AgentRuntimeGrade.RETRYABLE.value,
-            "reason_code": "runtime_transient_failure",
-            "next_action": "retry",
-            "evidence": {"exit_code": result.exit_code},
-        }
-
-    return {
-        "grade": AgentRuntimeGrade.RETRYABLE.value,
-        "reason_code": "runtime_unknown_failure",
-        "next_action": "retry",
-        "evidence": {"exit_code": result.exit_code},
-    }
-
-
-def contains_any_pattern(text: str, patterns: tuple[str, ...]) -> bool:
-    return any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in patterns)
-
-
-HARD_FAILURE_PATTERNS: tuple[str, ...] = (
-    r"\bpermission denied\b",
-    r"\boperation not permitted\b",
-    r"\bread-only file system\b",
-    r"\bauthentication failed\b",
-    r"\bunauthorized\b",
-    r"\bforbidden\b",
-    r"\bnot a git repository\b",
-    r"\brepository not found\b",
-    r"\bcommand not found\b",
-    r"\bno such file or directory\b",
-    r"\bindex\.lock\b",
-)
-
-
-RETRYABLE_FAILURE_PATTERNS: tuple[str, ...] = (
-    r"\btimed out\b",
-    r"\btimeout\b",
-    r"\btemporary failure\b",
-    r"\btemporarily unavailable\b",
-    r"\bconnection reset\b",
-    r"\bconnection aborted\b",
-    r"\bconnection refused\b",
-    r"\bcould not resolve host\b",
-    r"\bnetwork is unreachable\b",
-    r"\brate limit\b",
-    r"\btoo many requests\b",
-    r"\bhttp 429\b",
-    r"\bhttp 5\d\d\b",
-    r"\bservice unavailable\b",
-)
-
-
-def extract_shell_commands(text: str) -> list[str]:
-    commands: list[str] = []
-    patterns = [
-        r"/bin/zsh -lc '([^']+)'",
-        r'/bin/zsh -lc "([^"]+)"',
-    ]
-    for pattern in patterns:
-        commands.extend(re.findall(pattern, text))
-    deduped: list[str] = []
-    seen: set[str] = set()
-    for command in commands:
-        stripped = command.strip()
-        if not stripped or stripped in seen:
-            continue
-        seen.add(stripped)
-        deduped.append(stripped)
-    return deduped
-
-
-def write_agent_runtime_report(run_id: str, payload: dict[str, Any]) -> Path:
-    reports_dir = PROJECT_ROOT / "orchestrator" / "data" / "reports"
-    reports_dir.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-    report_path = reports_dir / f"{run_id}_agent_runtime_{stamp}.json"
-    report_path.write_text(
+def write_task_packet(run_id: str, payload: dict[str, Any]) -> Path:
+    packets_dir = PROJECT_ROOT / "orchestrator" / "data" / "task_packets"
+    packets_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    packet_path = packets_dir / f"{run_id}_task_packet_{stamp}.json"
+    packet_path.write_text(
         json.dumps(payload, ensure_ascii=True, sort_keys=True, indent=2),
         encoding="utf-8",
     )
-    return report_path
+    return packet_path
+
+
+def prepare_worker_contract_artifact(
+    *,
+    repo_dir: Path,
+    contract_source_uri: str | None,
+    max_chars: int = 20000,
+) -> tuple[str | None, str | None]:
+    source = str(contract_source_uri or "").strip()
+    if not source:
+        return None, None
+    source_path = Path(source)
+    if not source_path.exists() or not source_path.is_file():
+        return None, None
+
+    try:
+        text = source_path.read_text(encoding="utf-8")
+    except OSError:
+        text = ""
+    normalized_text = text[: max(int(max_chars), 0)] if text else None
+
+    dest_dir = repo_dir / ".agentpr_runtime" / "contracts"
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest_path = dest_dir / source_path.name
+    try:
+        dest_path.write_text(text, encoding="utf-8")
+    except OSError:
+        return None, normalized_text
+    return str(dest_path), normalized_text
+
+
+def collect_repo_diff_summary(*, repo_dir: Path) -> dict[str, Any]:
+    diff_names = run_git_text(repo_dir, ["diff", "--name-only", "HEAD"])
+    diff_numstat = run_git_text(repo_dir, ["diff", "--numstat", "HEAD"])
+    untracked = run_git_text(repo_dir, ["ls-files", "--others", "--exclude-standard"])
+
+    changed_files: set[str] = set()
+    ignored_files: set[str] = set()
+    for line in diff_names.splitlines():
+        stripped = line.strip()
+        if stripped:
+            normalized = _normalize_repo_relpath(stripped)
+            if _is_ignored_runtime_path(normalized):
+                ignored_files.add(normalized)
+                continue
+            changed_files.add(normalized)
+
+    untracked_files: list[str] = []
+    for line in untracked.splitlines():
+        stripped = line.strip()
+        if stripped:
+            normalized = _normalize_repo_relpath(stripped)
+            if _is_ignored_runtime_path(normalized):
+                ignored_files.add(normalized)
+                continue
+            untracked_files.append(normalized)
+            changed_files.add(normalized)
+
+    added_lines = 0
+    deleted_lines = 0
+    for line in diff_numstat.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 3:
+            continue
+        add_raw, del_raw, path_raw = (
+            parts[0].strip(),
+            parts[1].strip(),
+            parts[2].strip(),
+        )
+        if _is_ignored_runtime_path(path_raw):
+            ignored_files.add(_normalize_repo_relpath(path_raw))
+            continue
+        if add_raw.isdigit():
+            added_lines += int(add_raw)
+        if del_raw.isdigit():
+            deleted_lines += int(del_raw)
+
+    return {
+        "changed_files": sorted(changed_files),
+        "changed_files_count": len(changed_files),
+        "untracked_files": sorted(untracked_files),
+        "untracked_files_count": len(untracked_files),
+        "ignored_files": sorted(ignored_files),
+        "ignored_files_count": len(ignored_files),
+        "added_lines": added_lines,
+        "deleted_lines": deleted_lines,
+    }
+
+
+def run_git_text(repo_dir: Path, args: list[str]) -> str:
+    completed = subprocess.run(  # noqa: S603
+        ["git", *args],
+        cwd=repo_dir,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        return ""
+    return completed.stdout
 
 
 def converge_agent_success_state(
     service: OrchestratorService,
     args: argparse.Namespace,
+    *,
+    success_state: str | None = None,
 ) -> str:
-    success_state = args.success_state
-    if success_state is None:
+    resolved_success_state = success_state if success_state is not None else args.success_state
+    if resolved_success_state is None:
+        return service.get_run_snapshot(args.run_id)["state"]
+    if str(resolved_success_state).strip().upper() == "UNCHANGED":
         return service.get_run_snapshot(args.run_id)["state"]
 
-    target = RunState(success_state)
+    target = RunState(str(resolved_success_state))
     if target == RunState.LOCAL_VALIDATING:
         result = service.mark_local_validation_passed(args.run_id)
         return str(result["state"])
@@ -1770,7 +3353,25 @@ def converge_agent_success_state(
             target_state=RunState.NEEDS_HUMAN_REVIEW,
         )
         return str(result["state"])
-    raise ValueError(f"Unsupported success-state target: {success_state}")
+    raise ValueError(f"Unsupported success-state target: {resolved_success_state}")
+
+
+def apply_nonpass_verdict_state(
+    service: OrchestratorService,
+    *,
+    run_id: str,
+    target_state: str | None,
+) -> dict[str, Any]:
+    if target_state is None:
+        return service.get_run_snapshot(run_id)
+    normalized = str(target_state).strip().upper()
+    if normalized == "UNCHANGED":
+        return service.get_run_snapshot(run_id)
+    target = RunState(normalized)
+    return service.retry_run(
+        run_id,
+        target_state=target,
+    )
 
 
 if __name__ == "__main__":

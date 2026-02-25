@@ -11,6 +11,7 @@ This package provides a minimal Phase A implementation:
 5. Non-interactive agent execution hook (`codex exec`)
 6. Environment preflight checks before worker execution
 7. Startup doctor gate for manager/worker prerequisite validation
+8. Skills-mode prompt envelope + task packet artifacts for worker-stage execution
 
 ## Core Modules
 
@@ -21,15 +22,21 @@ This package provides a minimal Phase A implementation:
 5. `executor.py`: shell script execution wrapper
 6. `preflight.py`: repo preflight checks + startup doctor checks
 7. `cli.py`: operator-facing command interface
-8. Worker runtime isolation: local cache/data dirs under `<repo>/.agentpr_runtime`
-9. Runtime env override file: `runtime_env_overrides.json` (toolchain extensibility without code changes)
-10. Runtime verdict classification: `PASS` / `RETRYABLE` / `HUMAN_REVIEW`
-11. PR gate commands: `request-open-pr` -> `approve-open-pr --confirm` (double confirmation)
-12. `github_sync.py`: gh PR payload -> check/review sync decisions
-13. `telegram_bot.py`: Telegram long-poll command loop for manager actions
-14. `github_webhook.py`: webhook signature verification + event ingestion server
-15. Webhook delivery dedup ledger (`webhook_deliveries`) + cleanup command
-16. Automatic startup doctor gate on mutable CLI commands (`--skip-doctor` override)
+8. `skills.py`: codex skill installation/discovery + stage skill plan + task packet builder
+9. `runtime_analysis.py`: runtime verdicting, event-stream parsing, digest/insight rendering, PR DoD gate checks
+10. Worker runtime isolation: local cache/data dirs under `<repo>/.agentpr_runtime`
+11. Runtime env override file: `runtime_env_overrides.json` (toolchain extensibility without code changes)
+12. Runtime verdict classification: `PASS` / `RETRYABLE` / `HUMAN_REVIEW` with retry-cap escalation
+13. Manager policy file: `manager_policy.json` (sandbox/skills-mode/diff budget/retry cap/test-evidence defaults + repo overrides)
+14. PR gate commands: `request-open-pr` -> `approve-open-pr --confirm` (double confirmation + DoD gate)
+15. `github_sync.py`: gh PR payload -> check/review sync decisions
+16. `telegram_bot.py`: Telegram long-poll command loop for manager actions
+17. `github_webhook.py`: webhook signature verification + event ingestion server
+18. Webhook delivery dedup ledger (`webhook_deliveries`) + cleanup command
+19. Automatic startup doctor gate on mutable CLI commands (`--skip-doctor` override)
+20. `manager_policy.py`: central defaults for agent/bot/webhook runtime behavior
+21. Run analysis artifacts: `run_digest` (JSON) + `manager_insight` (Markdown) per agent attempt
+22. Stage-level observability is persisted in `run_digest.stages` (step totals/attempt timeline/top step)
 
 Operational commands added:
 
@@ -38,6 +45,12 @@ Operational commands added:
 3. `run-github-webhook`
 4. `cleanup-webhook-deliveries`
 5. `doctor`
+6. `skills-status`
+7. `install-skills`
+8. `skills-metrics`
+9. `inspect-run`
+10. `run-bottlenecks`
+11. `webhook-audit-summary`
 
 ## Design Constraints
 
@@ -55,3 +68,15 @@ Operational commands added:
 12. On webhook processing failure, release delivery reservation and return retryable status.
 13. Keep Telegram control plane default-deny (allowlist required unless explicitly overridden).
 14. Fail fast on startup prerequisites before mutating state or invoking worker actions.
+15. Diff budget checks exclude runtime artifact paths (`.agentpr_runtime`, `.venv`, `node_modules`, test/lint caches).
+16. Manager-facing diagnostics should be structured JSON first (timeline, bottlenecks, next actions), then optional LLM interpretation.
+17. Telegram bot enforces command-tier permissions (`read`/`write`/`admin`) plus rate limits and JSONL audit logging.
+18. GitHub webhook enforces payload-size guard and persists request outcomes for monitor-friendly summaries.
+19. `run-agent-step` captures codex JSONL event stream (`--json`) and last agent message for black-box observability (including derived command durations from local stream timestamps).
+20. Keep manager decisions grounded in deterministic artifacts (`run_digest`) and use LLM text summaries (`manager_insight`) only as advisory context.
+21. Tune runtime thresholds by repo using `run_agent_step.repo_overrides` before changing prompt complexity.
+22. Classify failed test/typecheck commands as `HUMAN_REVIEW` (`reason_code=test_command_failed`) even if worker process exits 0.
+23. In skills-mode, materialize contract artifact under repo runtime path (`.agentpr_runtime/contracts`) for worker-readability.
+24. PR creation is blocked unless latest `run_digest` satisfies DoD (PASS/runtime_success + policy thresholds + contract evidence), unless explicitly bypassed.
+25. Event stream persistence is tiered: always keep `run_digest`, keep raw `agent_event_stream` for non-pass runs and deterministic sampled pass runs.
+26. Runtime verdict/report logic is centralized in `runtime_analysis.py` instead of `cli.py` to reduce coupling and behavior drift.

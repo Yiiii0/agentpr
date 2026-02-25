@@ -359,6 +359,50 @@ class OrchestratorService:
                 duration_ms=duration_ms,
             )
 
+    def count_step_attempts(
+        self,
+        run_id: str,
+        *,
+        step: StepName,
+    ) -> int:
+        with self.db.transaction() as conn:
+            self._require_run(conn, run_id)
+            return self.db.count_step_attempts(
+                conn,
+                run_id=run_id,
+                step=step.value,
+            )
+
+    def list_step_attempts(
+        self,
+        run_id: str,
+        *,
+        step: StepName | None = None,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        with self.db.transaction() as conn:
+            self._require_run(conn, run_id)
+            return self.db.list_step_attempts(
+                conn,
+                run_id=run_id,
+                step=step.value if step is not None else None,
+                limit=limit,
+            )
+
+    def list_events(
+        self,
+        run_id: str,
+        *,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        with self.db.transaction() as conn:
+            self._require_run(conn, run_id)
+            return self.db.list_events(
+                conn,
+                run_id=run_id,
+                limit=limit,
+            )
+
     def add_artifact(
         self, run_id: str, *, artifact_type: str, uri: str, metadata: dict[str, Any] | None = None
     ) -> None:
@@ -370,6 +414,19 @@ class OrchestratorService:
                 artifact_type=artifact_type,
                 uri=uri,
                 metadata=metadata,
+            )
+
+    def list_artifacts_global(
+        self,
+        *,
+        artifact_type: str | None = None,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        with self.db.transaction() as conn:
+            return self.db.list_artifacts_global(
+                conn,
+                artifact_type=artifact_type,
+                limit=limit,
             )
 
     def _apply_event(self, event: EventInput) -> dict[str, Any]:

@@ -3,8 +3,10 @@ from __future__ import annotations
 import hmac
 import json
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from hashlib import sha256
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
@@ -37,6 +39,21 @@ class WebhookOutcome:
         }
 
 
+class WebhookAuditLogger:
+    def __init__(self, path: Path | None) -> None:
+        self.path = path
+        if self.path is not None:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+
+    def append(self, payload: dict[str, Any]) -> None:
+        if self.path is None:
+            return
+        line = json.dumps(payload, ensure_ascii=True, sort_keys=True)
+        with self.path.open("a", encoding="utf-8") as fh:
+            fh.write(line)
+            fh.write("\n")
+
+
 def run_github_webhook_server(
     *,
     service: OrchestratorService,
@@ -45,13 +62,18 @@ def run_github_webhook_server(
     path: str,
     secret: str | None,
     require_signature: bool,
+    max_payload_bytes: int,
+    audit_log_file: Path | None,
 ) -> None:
     normalized_path = normalize_path(path)
+    audit = WebhookAuditLogger(audit_log_file)
     server = ThreadingHTTPServer((host, port), _build_handler_class(
         service=service,
         path=normalized_path,
         secret=secret,
         require_signature=require_signature,
+        max_payload_bytes=max_payload_bytes,
+        audit=audit,
     ))
     server.serve_forever()
 
@@ -62,21 +84,90 @@ def _build_handler_class(
     path: str,
     secret: str | None,
     require_signature: bool,
+    max_payload_bytes: int,
+    audit: WebhookAuditLogger,
 ) -> type[BaseHTTPRequestHandler]:
     class GitHubWebhookHandler(BaseHTTPRequestHandler):
         def do_POST(self) -> None:  # noqa: N802
-            if normalize_path(self.path) != path:
-                self._send(404, {"ok": False, "error": "not found"})
-                return
-
-            length = int(self.headers.get("Content-Length", "0"))
-            body = self.rfile.read(length)
             event = self.headers.get("X-GitHub-Event", "").strip()
             delivery = self.headers.get("X-GitHub-Delivery", "").strip() or uuid4().hex
+
+            def respond(status_code: int, payload: dict[str, Any], outcome: str) -> None:
+                self._send(status_code, payload)
+                audit.append(
+                    {
+                        "ts": datetime.now(UTC).isoformat(),
+                        "method": "POST",
+                        "path": normalize_path(self.path),
+                        "event": event,
+                        "delivery": delivery,
+                        "status_code": int(status_code),
+                        "outcome": outcome,
+                        "processed": int(payload.get("processed", 0)),
+                        "ignored": int(payload.get("ignored", 0)),
+                        "retryable_failures": int(payload.get("retryable_failures", 0)),
+                        "error": str(payload.get("error", "")),
+                    }
+                )
+
+            if normalize_path(self.path) != path:
+                respond(404, {"ok": False, "error": "not found"}, "not_found")
+                return
+
+            raw_length = self.headers.get("Content-Length", "0")
+            try:
+                length = int(raw_length)
+            except ValueError:
+                respond(
+                    400,
+                    {
+                        "ok": False,
+                        "event": event,
+                        "delivery": delivery,
+                        "error": f"invalid Content-Length: {raw_length}",
+                    },
+                    "invalid_content_length",
+                )
+                return
+            if length > max_payload_bytes:
+                respond(
+                    413,
+                    {
+                        "ok": False,
+                        "event": event,
+                        "delivery": delivery,
+                        "error": (
+                            f"payload too large: {length} bytes "
+                            f"(max={max_payload_bytes})"
+                        ),
+                    },
+                    "payload_too_large",
+                )
+                return
+            body = self.rfile.read(length)
+            if len(body) > max_payload_bytes:
+                respond(
+                    413,
+                    {
+                        "ok": False,
+                        "event": event,
+                        "delivery": delivery,
+                        "error": (
+                            f"payload too large after read: {len(body)} bytes "
+                            f"(max={max_payload_bytes})"
+                        ),
+                    },
+                    "payload_too_large",
+                )
+                return
             signature = self.headers.get("X-Hub-Signature-256")
 
             if not event:
-                self._send(400, {"ok": False, "error": "missing X-GitHub-Event header"})
+                respond(
+                    400,
+                    {"ok": False, "error": "missing X-GitHub-Event header"},
+                    "missing_event",
+                )
                 return
             if not verify_signature(
                 body=body,
@@ -84,7 +175,11 @@ def _build_handler_class(
                 signature_header=signature,
                 require_signature=require_signature,
             ):
-                self._send(401, {"ok": False, "error": "invalid webhook signature"})
+                respond(
+                    401,
+                    {"ok": False, "error": "invalid webhook signature"},
+                    "invalid_signature",
+                )
                 return
             payload_sha256 = sha256(body).hexdigest()
             accepted = service.reserve_webhook_delivery(
@@ -94,7 +189,7 @@ def _build_handler_class(
                 payload_sha256=payload_sha256,
             )
             if not accepted:
-                self._send(
+                respond(
                     200,
                     {
                         "ok": True,
@@ -102,6 +197,7 @@ def _build_handler_class(
                         "delivery": delivery,
                         "duplicate_delivery": True,
                     },
+                    "duplicate_delivery",
                 )
                 return
             try:
@@ -111,7 +207,11 @@ def _build_handler_class(
                     source="github",
                     delivery_id=delivery,
                 )
-                self._send(400, {"ok": False, "error": "invalid JSON payload"})
+                respond(
+                    400,
+                    {"ok": False, "error": "invalid JSON payload"},
+                    "invalid_json",
+                )
                 return
 
             try:
@@ -126,7 +226,7 @@ def _build_handler_class(
                     source="github",
                     delivery_id=delivery,
                 )
-                self._send(
+                respond(
                     500,
                     {
                         "ok": False,
@@ -134,6 +234,7 @@ def _build_handler_class(
                         "delivery": delivery,
                         "error": f"unhandled webhook error: {exc}",
                     },
+                    "unhandled_error",
                 )
                 return
             if outcome.retryable_failures > 0:
@@ -141,9 +242,9 @@ def _build_handler_class(
                     source="github",
                     delivery_id=delivery,
                 )
-                self._send(500, outcome.to_dict())
+                respond(500, outcome.to_dict(), "retryable_failure")
                 return
-            self._send(200, outcome.to_dict())
+            respond(200, outcome.to_dict(), "processed")
 
         def do_GET(self) -> None:  # noqa: N802
             if normalize_path(self.path) == path:

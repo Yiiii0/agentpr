@@ -53,6 +53,7 @@
 6. 预算护栏：MVP 启用，且全部可配置。
 
 7. baseline 仓库：固定 `mem0` 与 `dexter`。
+8. repo 级执行策略：`mem0`/`dexter` 默认走 `skills_mode=agentpr`（通过 `manager_policy.repo_overrides`）。
 
 默认阈值（可调）：
 1. `max_run_minutes = 90`
@@ -253,10 +254,13 @@
 - `--codex-model`: 透传给 codex CLI，默认沿用本地 profile
 - `--no-codex-full-auto`: 关闭 full-auto（默认开启）
 4.2 命令映射（当前实现）：
-- 默认：`codex exec --sandbox danger-full-access --ask-for-approval on-request "<prompt>"`
-- 非 `workspace-write` 但保持自动执行：`codex exec --sandbox <mode> --ask-for-approval on-request "<prompt>"`
+- 默认：`codex exec --sandbox danger-full-access "<prompt>"`
+- `workspace-write` + full-auto：`codex exec --sandbox workspace-write --full-auto "<prompt>"`
 - 设定模型：`codex exec --sandbox <mode> ... --model <model> "<prompt>"`
 - 关闭 full-auto：`codex exec --sandbox <mode> [--model <model>] "<prompt>"`
+4.2.1 重试上限：
+- `max_retryable_attempts` 可配置（默认来自 `orchestrator/manager_policy.json`）。
+- 当 `RETRYABLE` 连续超过阈值，自动升级为 `HUMAN_REVIEW`（`reason_code=retryable_limit_exceeded`）。
 4.3 preflight 参数：
 - `run-preflight` 与 `run-agent-step` 都支持 `--codex-sandbox`
 - 当 `--codex-sandbox read-only` 时，preflight 直接失败（阻断建环境/测试）
@@ -264,14 +268,15 @@
 - 仅允许在 `DISCOVERY/IMPLEMENTING/LOCAL_VALIDATING/ITERATING`
 - `QUEUED` 调用时自动推进到 `DISCOVERY`
 6. 当前形态说明：
-- 目前是“单次大 prompt”执行，不是 skills 分段执行
+- 支持两种模式：`skills-mode=off`（单体 prompt）和 `skills-mode=agentpr`（技能链包装）
+- skills-mode 下 manager 负责注入 task packet 与阶段技能要求，worker 负责实际执行技能与代码任务
 - `run-agent-step` 已带自动分级与状态分流（失败或证据不足会自动收敛到 `FAILED_RETRYABLE` / `NEEDS_HUMAN_REVIEW`）
 
 ---
 
-## 10. Skills 设计（当前认知）
+## 10. Skills 设计（已落地）
 
-当前采用 3-skill 切片：
+当前采用 3-skill 切片（目录：`agentpr/skills/`）：
 
 1. `repo-preflight-contract`
 - 覆盖 discovery、贡献规则读取、PR checklist、风险标记、最小改动计划
@@ -285,8 +290,13 @@
 
 说明：
 1. 3-skill 是最小可运营切片。
-2. 后续可按复杂度再拆。
-3. 当前代码尚未接入 skills 执行链；baseline 仍是单体 prompt 模式。
+2. `run-agent-step --skills-mode agentpr` 已接入执行链（单次 codex 调用内阶段化 skill 执行）。
+3. manager 不执行技能内容，只执行阶段调度、skill 缺失门禁、task packet 落盘与状态收敛。
+4. 可选复用技能已接入安装入口：`gh-fix-ci`、`gh-address-comments`（`install-skills --install-curated-ci`）。
+5. 技术参考：
+- https://developers.openai.com/codex/advanced#tools-skills
+- https://developers.openai.com/codex/cli/#custom-skills
+- https://github.com/openai/skills/tree/main/skills/.curated
 
 ---
 
@@ -327,6 +337,10 @@
 1. 所有状态变化必须有事件记录
 2. 所有脚本执行必须有 attempt 记录
 3. 关键产物（contract/branch/log）必须可追踪
+4. manager 观察循环默认“低频无 token”：
+- `AGENT` 执行中：基于 DB/产物每 30-60s inspect（不调用 LLM）
+- `CI_WAIT`：webhook 驱动 + 120s 轮询兜底
+- 仅在状态变化/异常分流时调用 LLM 做决策与总结
 
 ---
 
@@ -422,6 +436,8 @@ python3.11 -m orchestrator.cli run-preflight --run-id <run_id>
 python3.11 -m orchestrator.cli run-agent-step --run-id <run_id> --prompt-file <prompt.md>
 # 或
 python3.11 -m orchestrator.cli run-agent-step --run-id <run_id> --prompt "<prompt>"
+# skills-mode（worker 执行技能，manager 注入 task packet）
+python3.11 -m orchestrator.cli run-agent-step --run-id <run_id> --prompt-file <prompt.md> --skills-mode agentpr
 ```
 
 5. 运维命令
@@ -429,14 +445,19 @@ python3.11 -m orchestrator.cli run-agent-step --run-id <run_id> --prompt "<promp
 python3.11 -m orchestrator.cli list-runs
 python3.11 -m orchestrator.cli show-run --run-id <run_id>
 python3.11 -m orchestrator.cli doctor
+python3.11 -m orchestrator.cli skills-status
+python3.11 -m orchestrator.cli install-skills --install-curated-ci
+python3.11 -m orchestrator.cli skills-metrics --limit 200
 python3.11 -m orchestrator.cli pause --run-id <run_id>
 python3.11 -m orchestrator.cli resume --run-id <run_id> --target-state DISCOVERY
 python3.11 -m orchestrator.cli retry --run-id <run_id> --target-state IMPLEMENTING
 python3.11 -m orchestrator.cli sync-github --dry-run
 python3.11 -m orchestrator.cli sync-github --loop --interval-sec 120
 python3.11 -m orchestrator.cli run-telegram-bot --allow-chat-id <chat_id>
-python3.11 -m orchestrator.cli run-github-webhook --host 0.0.0.0 --port 8787
+python3.11 -m orchestrator.cli run-telegram-bot --allow-chat-id <read_chat> --write-chat-id <write_chat> --admin-chat-id <admin_chat>
+python3.11 -m orchestrator.cli run-github-webhook --host 0.0.0.0 --port 8787 --max-payload-bytes 1048576
 python3.11 -m orchestrator.cli cleanup-webhook-deliveries --keep-days 30
+python3.11 -m orchestrator.cli webhook-audit-summary --since-minutes 60 --max-lines 5000
 ```
 说明：可变命令默认启用 startup doctor gate；仅在调试时使用全局 `--skip-doctor` 跳过。
 
@@ -465,60 +486,100 @@ python3.11 -m orchestrator.cli cleanup-webhook-deliveries --keep-days 30
 21. startup doctor 已实现：`doctor` 命令支持 auth/network/tooling/secrets 可配置检查
 22. mutable 命令默认启用 doctor gate，失败将快速阻断并给出修复入口（`doctor`）
 23. deploy 模板已接入启动前 gate：systemd `ExecStartPre` / supervisord `doctor && main process`
+24. codex 解析已增强：支持 `AGENTPR_CODEX_BIN`，并可自动发现 Cursor 扩展路径
+25. `run-agent-step` 已新增质量护栏：默认 no-push、diff 预算阈值、脏工作区拦截（可参数放行）
+26. skills 链已接入：`run-agent-step --skills-mode agentpr` 会注入阶段技能计划并生成 task packet artifact
+27. skills 运维命令已实现：`skills-status`、`install-skills`（支持 `--install-curated-ci`）
+28. 3 个 AgentPR skills 已按官方脚手架创建并通过结构校验（`quick_validate`）
+29. 运行策略已配置化：`orchestrator/manager_policy.json`（sandbox/skills_mode/diff budget/retry cap/test threshold + repo overrides）
+30. `skills-metrics` 已实现：可汇总 skills-mode 质量指标（mode/grade/reason/stage）
+31. `inspect-run` 已实现：输出单 run 的 manager 诊断快照（step 耗时时间线、事件时间线、runtime 分类、建议下一步动作）
+32. `run-bottlenecks` 已实现：聚合最近 runs 的耗时分布，快速定位慢阶段
+33. runtime report 已补充命令类别统计（依赖安装/测试/lint/git/读仓库），便于分析 `run-agent-step` 内部耗时来源
+34. Telegram bot 生产加固已实现：命令级 ACL（read/write/admin）、限流（per-chat/global）、审计日志（JSONL）
+35. `run-agent-step` 状态收敛策略已配置化：`success_state` / `on_retryable_state` / `on_human_review_state`，支持 `UNCHANGED`
+36. skills 深度质量度量已实现：`skills-metrics` 输出 `per_skill`、`missing_required_counts`、阶段分布与原因码聚合
+37. GitHub webhook 生产加固已实现：payload 大小门禁、审计日志（JSONL）、可执行健康摘要（`webhook-audit-summary` + 阈值退出）
+38. manager policy 已扩展到 bot/webhook：`orchestrator/manager_policy.json` 统一管理关键默认参数
+39. Agent 黑盒观测已增强：`run-agent-step` 接入 `codex exec --json` 事件流与 `--output-last-message`
+40. `inspect-run` 已可直接展示 agent 内部事件摘要（event types、command events sample、raw event stream path）
+41. 黑盒内部命令相对耗时已可见：基于本地流式时间戳推导 `top_commands_by_duration`
+42. 每次 `run-agent-step` 已自动生成 `run_digest`（结构化 JSON）与 `manager_insight`（Markdown 建议），并被 `inspect-run` 直接消费
+43. `run_digest` 已新增阶段级观测：`stages`（step totals / attempts_recent / top_step）与命令类别占比 `commands.category_share_pct`
+44. 判定阈值已支持 repo 级策略覆盖：`manager_policy.run_agent_step.repo_overrides`（含 `max_changed_files`/`max_added_lines`/`max_retryable_attempts`/`min_test_commands`）
+45. skills-mode 合同可读性已修复：contract 会被物化到 repo 内 `.agentpr_runtime/contracts/*`，避免跨目录路径不可达导致的假阻塞
+46. 运行时分级已修复“假 PASS”漏洞：测试/类型检查命令失败会归类为 `HUMAN_REVIEW`（`reason_code=test_command_failed`）
+47. startup doctor 并发探针冲突已修复：workspace 写探针改为进程唯一文件名
+48. PR gate 已升级 DoD 校验：`approve-open-pr` 在创建 PR 前强制检查最新 `run_digest`、策略阈值与 contract 证据（支持显式应急绕过 `--allow-dod-bypass`）
+49. 运行时产物分层已落地：`run_digest/manager_insight` 全量保留，`agent_event_stream` 对 PASS 结果按确定性采样保留（非 PASS 全保留）
+50. runtime 分类/报告逻辑已从 `cli.py` 抽离到 `orchestrator/runtime_analysis.py`，降低耦合与漂移风险
+51. `manager_policy` 已支持 repo 级 `skills_mode` 覆盖与 `success_event_stream_sample_pct` 采样策略
+52. `cli.py` 时间解析命名冲突已修复（`parse_iso_datetime` 与 optional 版本拆分）
 
 ### 14.4 当前未实现项
 
-1. Telegram bot 生产加固（审计日志、限流与命令级权限）
-2. GitHub webhook 生产加固（公网入口、监控告警、持久化可观测性）
-3. skills 执行链接入（repo-preflight-contract / implement-and-validate / ci-review-fix）
-4. agent 自动状态收敛的可配置策略（当前已实现默认分级分流，待补可调阈值）
+1. webhook 告警外联与公网暴露仍需部署侧落地（例如 Cloudflare Tunnel/Nginx + 外部告警通道）
+2. skills 质量度量仍需闭环到 prompt 版本自动回归（当前已有指标，尚未自动调参）
 
-### 14.5 Baseline 结果（`mem0` + `dexter`）
+### 14.5 Baseline / Fresh Rerun 结果（`mem0` + `dexter`）
 
-1. 结论：2/2 均完成非交互执行并产出改动，结果分类均为 `NEEDS REVIEW`。
-2. `mem0`：
-- agent 第 1 次失败（连接/环境），第 2 次成功
-- 成功耗时约 6m20s
-- 产出 4 个改动文件（代码 + 测试 + 文档）
-- 明确读取了 `CONTRIBUTING.md`、`PULL_REQUEST_TEMPLATE.md`、CI workflow 并尝试执行 `make lint` / `make test`
-3. `dexter`：
-- agent 第 1 次成功
-- 成功耗时约 4m59s
-- 产出 6 个改动文件
-- 明确读取了 `AGENTS.md`、CI workflow 并尝试执行 `bun run typecheck` / `bun test`
-4. 共性阻塞：
-- 当前运行环境对 `.git` 写入受限，`finish.sh` 无法完成 commit/push
-- 部分仓库依赖安装受网络/权限限制，导致无法完整跑 lint/test
+1. 结论：2/2 均完成 fresh rerun 非交互执行并产出改动，均已 commit + push，run 状态为 `PUSHED`（push_only + 人工 PR gate 模式）。
+2. 最新 fresh rerun：
+- `rerun_mem0_20260224_clean1`：branch `feature/forge-20260224-172250`，commit `c05a3bc1`，runtime `PASS`，改动 `3 files (+64/-9)`
+- `rerun_dexter_20260224_clean1`：branch `feature/forge-20260224-173213`，commit `22730e9`，runtime `PASS`，改动 `4 files (+19/-1)`
+3. `mem0`：
+- fresh run：`baseline_mem0_20260224_033111`
+- runtime classification：`PASS`
+- 产出并推送：
+  - branch: `feature/forge-20260224-033112`
+  - commits: `d2a98da2`, `9b161184`
+- 测试证据：`make lint` 通过；`make test`/`make test-py-3.11` 受仓库既有可选依赖/配置问题影响；聚焦用例通过（forge/openai/deepseek 相关测试）
+4. `dexter`：
+ - fresh run：`baseline_dexter_20260224_033111`
+ - runtime classification：`PASS`
+ - 产出并推送：
+   - branch: `feature/forge-20260224-033115`
+   - commit: `4a30006`
+ - 测试证据：`bun run typecheck` 通过；`bun test` 有 1 个失败用例（`~/.dexter/gateway-debug.log` 路径缺失，非 Forge 改动）
+4. 当前共性阻塞（更新后）：
+- 不是“外网/.git 权限”阻塞，而是“目标仓库自身测试基线与可选依赖矩阵”阻塞最终全绿。
+ - 另一个关键风险是“过度改动”，现已用 diff budget + no-push 默认策略控制。
 5. 工程修正：
 - `finish.sh` 的 `COMMIT_TITLE` 单行校验已修复（避免误报）
 6. 状态修正：
-- 两个 baseline run 已手动收敛到 `NEEDS_HUMAN_REVIEW`
+- 两个 fresh baseline run 自动收敛到 `NEEDS_HUMAN_REVIEW`（符合 push_only + human gate）。
+7. 2026-02-25 校准回合（不创建 PR）：
+- `calib_mem0_20260225_r2`：`IMPLEMENTING -> LOCAL_VALIDATING`，`PASS/runtime_success`，测试证据充分（9 条）。
+- `calib_dexter_20260225_r2`：`LOCAL_VALIDATING -> NEEDS_HUMAN_REVIEW`，`HUMAN_REVIEW/test_command_failed`（`bun run typecheck`、`bun test` 失败被正确拦截）。
 
 ### 14.6 环境可执行性结论（基于 baseline）
 
-1. “能改代码”已验证，但“能完整建环境+跑测试+提交”未完全验证。
-2. 主阻塞来自运行环境而非代码逻辑：
-- 依赖源网络不可达时，安装失败，测试只能部分执行或无法执行
-- worker 运行时的 sandbox 策略会影响可执行能力
-3. preflight 已经接入，可在 worker 启动前识别这些阻塞并快速失败。
-4. 仍需在目标运行环境中验证：
-- 依赖安装成功率
-- repo 规定测试命令完整通过率
-- commit/push 通过 manager gate 的稳定性
+1. “能改代码 + 能建环境 + 能提交推送”已在当前主机验证通过。
+2. 当前主要不确定性转为仓库级质量条件：
+- 目标仓库是否依赖大量可选组件（导致完整 test suite 在基线环境天然不全绿）
+- 目标仓库是否存在本地路径/fixture 假设（如 dexter 的 `~/.dexter` 文件）
+3. `doctor + preflight` 已验证可作为硬门禁，能把环境失败前置并机器化识别。
+4. 接下来重点不是“环境能否跑”，而是“如何标准化 NEEDS_REVIEW 判定阈值（哪些失败可接受、哪些必须修复）”。
 
 ### 14.7 当前主要问题（实事求是）
 
-1. 执行环境问题仍是第一阻塞：
-- 外网依赖源不可达会直接导致“无法证明测试通过”
-- `.git` 写权限受限会导致“无法提交/推送”
-- 现已通过 startup doctor + repo preflight 双门禁将失败前置，但仍依赖真实运行环境可达性
- - 实测样例：`doctor --require-codex` 失败于 `gh.auth + net.*`，`run-preflight` 在 mem0 上 `git.write` 为通过
-2. 当前仍是“单次大 prompt”：
-- skills 边界已定义，但未接入自动执行链
+1. 执行环境门禁已打通，不再是第一阻塞：
+- `doctor --require-codex` 已全绿（auth/network/codex/tooling）
+- repo preflight 已验证 `.git` 可写与工具链可用
+- 现阶段第一阻塞转为仓库级测试基线与可选依赖复杂度
+2. skills 已接入，但质量尚需持续收敛：
+- 重点从“是否接入”转为“每阶段成功率与失败模式是否可量化优化”
 3. manager 能力还未闭环：
-- CLI/bot/轮询/webhook 已接通，且守护模板已提供；但生产部署与监控告警尚未落地
-4. 质量证据结构化仍不足：
-- 结构化 report + 自动分级已上线，但判定阈值仍需参数化（如 test 证据阈值、重试上限联动）
+- CLI/bot/轮询/webhook 已接通，且守护模板已提供；当前剩余主要是公网接入与外部告警通道接入
+4. 质量证据结构化能力已增强：
+- 结构化 report + 自动分级 + 阶段级 digest 已上线；当前工作重点转为按仓库持续校准阈值（而非补观测字段）
+5. manager 决策边界需保持稳定：
+- `run_digest` 作为机器真值层（可程序化判断/告警/统计）
+- `manager_insight` 作为解释层（帮助人或上层 LLM 快速定位问题）
+5. 执行策略层仍需持续收敛：
+- Prompt 约束与运行时约束必须一致（例如 manager-mode no-push、最小 diff 预算），否则会出现“能跑但改太多”的质量回归。
+6. 质量判定核心已更新：
+- “跑了测试命令”不等于“通过测试”；失败测试命令必须阻断自动前进并收敛到人工判断。
 
 ---
 
@@ -548,12 +609,11 @@ python3.11 -m orchestrator.cli cleanup-webhook-deliveries --keep-days 30
 ## 16. 下一步执行清单（从现在开始）
 
 1. 固化 startup doctor 作为 manager 启动前置 gate（将 CI/守护进程启动脚本统一接入 `doctor`）。
-2. 在“可访问依赖源 + `.git` 可写”的环境重跑 `mem0`、`dexter`，先拿到真实非交互成功率基线。
-3. 将自动分级判定参数化（阈值、模式、白名单规则），并与重试策略联动。
-4. 为 Telegram bot 增加部署与安全配置（强制 allowlist、systemd/pm2/supervisord）。
-5. 为 webhook 增加公网接入方案与监控告警（保留 `sync-github` 作为 fallback）。
-6. 增加配置文件（预算、超时、重试、并发）并将 bot/sync/webhook 参数集中化。
-7. 视基线结果再决定是否引入 skills 分段执行（当前不作为阻塞项）。
+2. 已完成 fresh rerun baseline（`mem0`/`dexter`）与 2026-02-25 校准回合；下一步持续校准 repo_overrides 与复跑策略（而非继续手工重复跑）。
+3. 用 `webhook-audit-summary` 接入外部告警（cron/systemd timer/监控系统），形成自动告警闭环。
+4. 完成 webhook 公网接入（Cloudflare Tunnel/Nginx），并验证签名/重放/大 payload 门禁。
+5. 沉淀 run 判定策略白名单（仓库级测试已知失败豁免）并与 `min_test_commands` / `test_command_failed` / retry cap 协同。
+6. 继续迭代 skills 链：将 `skills-metrics` 结果回灌到 prompt/skill 版本治理。
 
 ---
 

@@ -132,8 +132,11 @@ def is_terminal(state: RunState) -> bool:
     return state in _TERMINAL_STATES
 
 
+def allowed_targets(state: RunState) -> list[RunState]:
+    return sorted(_ALLOWED_TRANSITIONS[state], key=lambda s: s.value)
+
+
 @dataclass(frozen=True)
 class Transition:
     source: RunState
     target: RunState
-

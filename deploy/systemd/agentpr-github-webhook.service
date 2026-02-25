@@ -10,8 +10,9 @@ Group=CHANGE_ME
 WorkingDirectory=/ABSOLUTE/PATH/TO/TensorBlcok/agentpr
 Environment=PYTHONUNBUFFERED=1
 Environment=AGENTPR_GITHUB_WEBHOOK_SECRET=CHANGE_ME
+Environment=AGENTPR_CODEX_BIN=/ABSOLUTE/PATH/TO/codex
 ExecStartPre=/opt/homebrew/bin/python3.11 -m orchestrator.cli doctor --skip-network-check --no-require-gh-auth --require-webhook-secret
-ExecStart=/opt/homebrew/bin/python3.11 -m orchestrator.cli run-github-webhook --host 0.0.0.0 --port 8787
+ExecStart=/opt/homebrew/bin/python3.11 -m orchestrator.cli run-github-webhook --host 0.0.0.0 --port 8787 --max-payload-bytes 1048576
 Restart=always
 RestartSec=5
 NoNewPrivileges=true

@@ -3,11 +3,13 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .codex_bin import resolve_codex_binary
 
 @dataclass(frozen=True)
 class CommandResult:
@@ -15,6 +17,7 @@ class CommandResult:
     stdout: str
     stderr: str
     duration_ms: int
+    metadata: dict[str, Any] | None = None
 
 
 DEFAULT_RUNTIME_ENV_TEMPLATES: dict[str, str] = {
@@ -86,6 +89,7 @@ class ScriptExecutor:
         self.runtime_env_overrides_path = (
             integration_root.parent / "orchestrator" / "runtime_env_overrides.json"
         )
+        self.codex_bin, self.codex_bin_source = resolve_codex_binary()
 
     def run_prepare(
         self,
@@ -192,29 +196,74 @@ class ScriptExecutor:
         codex_sandbox: str = "workspace-write",
         codex_full_auto: bool = True,
         codex_model: str | None = None,
+        allow_git_push: bool = False,
         extra_args: list[str] | None = None,
     ) -> CommandResult:
+        if not self.codex_bin:
+            return CommandResult(
+                exit_code=127,
+                stdout="",
+                stderr=(
+                    "codex executable not found. "
+                    "Set AGENTPR_CODEX_BIN or add codex to PATH."
+                ),
+                duration_ms=0,
+            )
         runtime_policy = self._build_runtime_policy(repo_dir=repo_dir)
         guarded_prompt = self._with_safety_contract(
             prompt=prompt,
             repo_dir=repo_dir,
             runtime_dir=runtime_policy["runtime_dir"],
+            allow_git_push=allow_git_push,
         )
-        cmd = ["codex", "exec", "--sandbox", codex_sandbox]
+        last_message_path = runtime_policy["runtime_dir"] / "codex_last_message.txt"
+        cmd = [self.codex_bin, "exec", "--sandbox", codex_sandbox]
         if codex_full_auto and codex_sandbox == "workspace-write":
             cmd.append("--full-auto")
-        elif codex_full_auto:
-            # --full-auto implies workspace-write; for other sandbox modes keep
-            # equivalent no-prompt behavior by setting approval policy directly.
-            cmd.extend(["--ask-for-approval", "on-request"])
         if codex_model:
             cmd.extend(["--model", codex_model])
+        cmd.extend(
+            [
+                "--json",
+                "--output-last-message",
+                str(last_message_path),
+            ]
+        )
         cmd.append(guarded_prompt)
         cmd.extend(extra_args or [])
-        return self._run(cmd, cwd=repo_dir, env=runtime_policy["env"])
+        result = self._run_with_stdout_timeline(cmd, cwd=repo_dir, env=runtime_policy["env"])
+        metadata = {
+            "codex_jsonl": True,
+            "last_message_path": str(last_message_path),
+            "runtime_dir": str(runtime_policy["runtime_dir"]),
+        }
+        if isinstance(result.metadata, dict):
+            metadata.update(result.metadata)
+        return CommandResult(
+            exit_code=result.exit_code,
+            stdout=result.stdout,
+            stderr=result.stderr,
+            duration_ms=result.duration_ms,
+            metadata=metadata,
+        )
 
     @staticmethod
-    def _with_safety_contract(*, prompt: str, repo_dir: Path, runtime_dir: Path) -> str:
+    def _with_safety_contract(
+        *,
+        prompt: str,
+        repo_dir: Path,
+        runtime_dir: Path,
+        allow_git_push: bool,
+    ) -> str:
+        push_rule = (
+            "- Do NOT run git commit/git push/finish.sh. "
+            "Manager owns commit+push gate for this run.\n"
+        )
+        if allow_git_push:
+            push_rule = (
+                "- git commit/push is allowed only after all required tests/lint pass, "
+                "and only with minimal intended diff.\n"
+            )
         contract = (
             "Execution safety contract (mandatory):\n"
             f"- Operate only inside repository: {repo_dir}\n"
@@ -223,6 +272,7 @@ class ScriptExecutor:
             "- Do NOT run sudo.\n"
             "- Do NOT install global packages (brew install, npm -g, pip --user/global, uv tool install, poetry self).\n"
             "- Use only project-local environments and dependencies (.venv/node_modules/.agentpr_runtime).\n"
+            f"{push_rule}"
             "- If any required step needs out-of-repo writes or global changes, stop and report NEEDS REVIEW.\n"
         )
         return f"{contract}\n---\n\n{prompt}"
@@ -234,6 +284,8 @@ class ScriptExecutor:
             "policy_file": str(self.runtime_env_overrides_path),
             "policy_file_loaded": policy["policy_file_loaded"],
             "env_keys": sorted(policy["env_overrides"].keys()),
+            "codex_bin": self.codex_bin,
+            "codex_bin_source": self.codex_bin_source,
         }
 
     def _build_runtime_policy(self, *, repo_dir: Path) -> dict[str, Any]:
@@ -329,4 +381,64 @@ class ScriptExecutor:
             stdout=stdout,
             stderr=stderr,
             duration_ms=duration_ms,
+        )
+
+    @staticmethod
+    def _run_with_stdout_timeline(
+        cmd: list[str],
+        cwd: Path,
+        env: dict[str, str] | None = None,
+    ) -> CommandResult:
+        start = time.monotonic()
+        try:
+            process = subprocess.Popen(  # noqa: S603
+                cmd,
+                cwd=cwd,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+            )
+        except OSError as exc:
+            return CommandResult(
+                exit_code=127,
+                stdout="",
+                stderr=str(exc),
+                duration_ms=0,
+                metadata={"stdout_line_offsets_ms": []},
+            )
+
+        stdout_lines: list[str] = []
+        stderr_lines: list[str] = []
+        stdout_line_offsets_ms: list[int] = []
+
+        def read_stdout() -> None:
+            if process.stdout is None:
+                return
+            for line in process.stdout:
+                stdout_lines.append(line)
+                stdout_line_offsets_ms.append(int((time.monotonic() - start) * 1000))
+
+        def read_stderr() -> None:
+            if process.stderr is None:
+                return
+            for line in process.stderr:
+                stderr_lines.append(line)
+
+        stdout_thread = threading.Thread(target=read_stdout, daemon=True)
+        stderr_thread = threading.Thread(target=read_stderr, daemon=True)
+        stdout_thread.start()
+        stderr_thread.start()
+        exit_code = process.wait()
+        stdout_thread.join()
+        stderr_thread.join()
+
+        duration_ms = int((time.monotonic() - start) * 1000)
+        return CommandResult(
+            exit_code=exit_code,
+            stdout="".join(stdout_lines),
+            stderr="".join(stderr_lines),
+            duration_ms=duration_ms,
+            metadata={"stdout_line_offsets_ms": stdout_line_offsets_ms},
         )
