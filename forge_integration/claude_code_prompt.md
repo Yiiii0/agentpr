@@ -1,8 +1,12 @@
-# Claude Code Prompt: Forge Integration
+# Worker Base Prompt: Forge Integration
 
-## 使用方式
+## 用途
 
-打开 Claude Code，粘贴以下 prompt，替换 `REPO_LIST` 部分即可。
+这是 AgentPR `worker` 的基础提示词文件。
+
+- 生产模式：由 manager 自动调用 `run-agent-step --prompt-file <this file>`，不需要手动粘贴。
+- 运行上下文（目标仓库、run_id、contract、约束）由 AgentPR 在 task packet 中注入。
+- 只有 Legacy 手动批量模式才需要手工替换 `Repo List`。
 
 ---
 
@@ -11,7 +15,7 @@
 ```
 你的任务是将 Forge LLM provider 集成到以下 GitHub 仓库中。
 
-## Repo List
+## Repo List（仅 Legacy 手动批量模式使用；AgentPR worker 模式忽略）
 https://github.com/OWNER/REPO1
 https://github.com/OWNER/REPO2
 
@@ -73,7 +77,7 @@ bash /Users/yi/Documents/Career/TensorBlcok/agentpr/forge_integration/scripts/pr
 
 ## 注意事项
 
-1. **Repo 数量**：建议每次 3-5 个，避免超出用量限制
-2. **失败处理**：AI 会自动跳过 FAIL/SKIP 的 repo
-3. **结果查看**：汇总表 + GitHub review
-4. **创建 PR**：人工在 GitHub 网页端创建
+1. **自动模式优先**：默认由 manager 自动推进，不手工填 `Repo List`
+2. **失败处理**：worker 失败后交给 manager 判定重试/升级人工
+3. **结果查看**：优先看 `inspect-run`、runtime report、Telegram 状态消息
+4. **创建 PR**：按当前 gate 策略执行（目前默认人工确认后再建 PR）

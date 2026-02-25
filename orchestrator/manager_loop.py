@@ -163,6 +163,7 @@ class ManagerLoopRunner:
             return rules_action, "rules"
 
         allowed = [item.value for item in allowed_action_kinds(facts)]
+        digest_context = self._load_digest_context(facts.run_id)
         if self._llm_client is None:
             if mode == "llm":
                 return (
@@ -185,6 +186,7 @@ class ManagerLoopRunner:
                     "has_contract": facts.has_contract,
                     "has_prompt": facts.has_prompt,
                     "pr_number": facts.pr_number,
+                    "run_digest": digest_context,
                 },
                 allowed_actions=allowed,
             )
@@ -193,6 +195,12 @@ class ManagerLoopRunner:
                 raise ManagerLLMError(
                     f"selected action not allowed in current state: {kind.value}"
                 )
+            # Guardrail: avoid stalling in executable states when LLM is overly conservative.
+            if (
+                kind == ManagerActionKind.WAIT_HUMAN
+                and rules_action.kind not in {ManagerActionKind.WAIT_HUMAN, ManagerActionKind.NOOP}
+            ):
+                return rules_action, "llm_wait_human_overridden_by_rules"
             metadata: dict[str, Any] = {}
             if kind == ManagerActionKind.RETRY and selection.target_state:
                 metadata["target_state"] = selection.target_state
@@ -210,6 +218,100 @@ class ManagerLoopRunner:
                     "llm_error",
                 )
             return rules_action, "rules_fallback_llm_error"
+
+    def _load_digest_context(self, run_id: str) -> dict[str, Any]:
+        artifact = self.service.latest_artifact(run_id, artifact_type="run_digest")
+        if artifact is None:
+            return {"available": False, "reason": "missing_artifact"}
+        path_raw = str(artifact.get("uri") or "").strip()
+        if not path_raw:
+            return {"available": False, "reason": "empty_artifact_uri"}
+        path = Path(path_raw)
+        if not path.exists():
+            return {
+                "available": False,
+                "reason": "artifact_not_found",
+                "path": str(path),
+            }
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {
+                "available": False,
+                "reason": "artifact_unreadable",
+                "path": str(path),
+            }
+        if not isinstance(payload, dict):
+            return {
+                "available": False,
+                "reason": "artifact_invalid_payload",
+                "path": str(path),
+            }
+
+        classification = payload.get("classification")
+        classification = classification if isinstance(classification, dict) else {}
+        validation = payload.get("validation")
+        validation = validation if isinstance(validation, dict) else {}
+        changes = payload.get("changes")
+        changes = changes if isinstance(changes, dict) else {}
+        attempt = payload.get("attempt")
+        attempt = attempt if isinstance(attempt, dict) else {}
+        recommendation = payload.get("manager_recommendation")
+        recommendation = recommendation if isinstance(recommendation, dict) else {}
+        skills = payload.get("skills")
+        skills = skills if isinstance(skills, dict) else {}
+        state = payload.get("state")
+        state = state if isinstance(state, dict) else {}
+
+        evidence_fields = [
+            "classification.grade",
+            "classification.reason_code",
+            "validation.test_command_count",
+            "validation.failed_test_command_count",
+            "changes.changed_files_count",
+            "changes.added_lines",
+            "attempt.exit_code",
+            "attempt.duration_ms",
+            "skills.mode",
+            "manager_recommendation.action",
+        ]
+        return {
+            "available": True,
+            "path": str(path),
+            "generated_at": str(payload.get("generated_at") or ""),
+            "state_after": str(state.get("after") or ""),
+            "classification": {
+                "grade": str(classification.get("grade") or ""),
+                "reason_code": str(classification.get("reason_code") or ""),
+                "next_action": str(classification.get("next_action") or ""),
+            },
+            "validation": {
+                "test_command_count": int(validation.get("test_command_count") or 0),
+                "failed_test_command_count": int(
+                    validation.get("failed_test_command_count") or 0
+                ),
+            },
+            "changes": {
+                "changed_files_count": int(changes.get("changed_files_count") or 0),
+                "added_lines": int(changes.get("added_lines") or 0),
+                "deleted_lines": int(changes.get("deleted_lines") or 0),
+            },
+            "attempt": {
+                "attempt_no": attempt.get("attempt_no"),
+                "exit_code": int(attempt.get("exit_code") or 0),
+                "duration_ms": int(attempt.get("duration_ms") or 0),
+            },
+            "skills": {
+                "mode": str(skills.get("mode") or ""),
+                "missing_required_count": len(list(skills.get("missing_required") or [])),
+            },
+            "manager_recommendation": {
+                "action": str(recommendation.get("action") or ""),
+                "priority": str(recommendation.get("priority") or ""),
+                "why": str(recommendation.get("why") or ""),
+            },
+            "evidence_fields": evidence_fields,
+        }
 
     def _build_run_facts(self, run_id: str) -> ManagerRunFacts:
         snapshot = self.service.get_run_snapshot(run_id)
@@ -392,7 +494,11 @@ class ManagerLoopRunner:
         payload = self._try_parse_json(output)
 
         if payload is not None:
-            output = json.dumps(payload, ensure_ascii=True, sort_keys=True)
+            output = json.dumps(
+                self._compact_payload_for_output(payload),
+                ensure_ascii=True,
+                sort_keys=True,
+            )
 
         ok = completed.returncode == 0
         err = ""
@@ -418,3 +524,35 @@ class ManagerLoopRunner:
         except json.JSONDecodeError:
             return None
         return parsed if isinstance(parsed, dict) else None
+
+    @staticmethod
+    def _compact_payload_for_output(
+        value: Any,
+        *,
+        list_limit: int = 10,
+        str_limit: int = 1200,
+    ) -> Any:
+        if isinstance(value, dict):
+            return {
+                str(key): ManagerLoopRunner._compact_payload_for_output(
+                    item,
+                    list_limit=list_limit,
+                    str_limit=str_limit,
+                )
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            items = [
+                ManagerLoopRunner._compact_payload_for_output(
+                    item,
+                    list_limit=list_limit,
+                    str_limit=str_limit,
+                )
+                for item in value[:list_limit]
+            ]
+            if len(value) > list_limit:
+                items.append(f"...({len(value) - list_limit} more)")
+            return items
+        if isinstance(value, str) and len(value) > str_limit:
+            return f"{value[:str_limit]}...(truncated {len(value) - str_limit} chars)"
+        return value

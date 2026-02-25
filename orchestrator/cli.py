@@ -75,6 +75,19 @@ DEFAULT_WORKSPACE_ROOT = Path(
 DEFAULT_INTEGRATION_ROOT = PROJECT_ROOT / "forge_integration"
 DEFAULT_SKILLS_SOURCE_ROOT = PROJECT_ROOT / "skills"
 DEFAULT_POLICY_PATH = PROJECT_ROOT / "orchestrator" / "manager_policy.json"
+
+
+def resolve_default_worker_prompt_file() -> Path:
+    raw = str(os.environ.get("AGENTPR_WORKER_PROMPT_FILE") or "").strip()
+    if raw:
+        candidate = Path(raw).expanduser()
+        if not candidate.is_absolute():
+            candidate = PROJECT_ROOT / candidate
+        return candidate.resolve()
+    return (DEFAULT_INTEGRATION_ROOT / "claude_code_prompt.md").resolve()
+
+
+DEFAULT_WORKER_PROMPT_FILE = resolve_default_worker_prompt_file()
 DIFF_IGNORE_RUNTIME_PREFIXES: tuple[str, ...] = (
     ".agentpr_runtime/",
     ".venv/",
@@ -132,7 +145,12 @@ def add_manager_common_args(command_parser: argparse.ArgumentParser) -> None:
     command_parser.add_argument(
         "--prompt-file",
         type=Path,
-        help="Prompt file used by run-agent-step actions.",
+        default=DEFAULT_WORKER_PROMPT_FILE,
+        help=(
+            "Prompt file used by run-agent-step actions "
+            f"(default: {DEFAULT_WORKER_PROMPT_FILE}; "
+            "env override: AGENTPR_WORKER_PROMPT_FILE)."
+        ),
     )
     command_parser.add_argument(
         "--contract-template-file",
@@ -1472,6 +1490,7 @@ def main() -> int:
             ):
                 preexisting_diff = collect_repo_diff_summary(repo_dir=repo_dir)
                 if int(preexisting_diff.get("changed_files_count", 0)) > 0:
+                    compact_diff = compact_diff_summary(preexisting_diff)
                     service.record_step_failure(
                         args.run_id,
                         step=StepName.AGENT,
@@ -1487,7 +1506,7 @@ def main() -> int:
                             "ok": False,
                             "error": "workspace has pre-existing local changes",
                             "state": state_result["state"],
-                            "diff": preexisting_diff,
+                            "diff": compact_diff,
                         }
                     )
                     return 1
@@ -3968,6 +3987,46 @@ def collect_repo_diff_summary(*, repo_dir: Path) -> dict[str, Any]:
         "ignored_files_count": len(ignored_files),
         "added_lines": added_lines,
         "deleted_lines": deleted_lines,
+    }
+
+
+def compact_diff_summary(
+    summary: dict[str, Any],
+    *,
+    sample_limit: int = 8,
+) -> dict[str, Any]:
+    limit = max(int(sample_limit), 1)
+
+    def _sample(name: str) -> list[str]:
+        raw = summary.get(name)
+        if not isinstance(raw, list):
+            return []
+        out: list[str] = []
+        for item in raw[:limit]:
+            text = str(item).strip()
+            if text:
+                out.append(text)
+        return out
+
+    changed_sample = _sample("changed_files")
+    untracked_sample = _sample("untracked_files")
+    ignored_sample = _sample("ignored_files")
+    changed_total = int(summary.get("changed_files_count") or 0)
+    untracked_total = int(summary.get("untracked_files_count") or 0)
+    ignored_total = int(summary.get("ignored_files_count") or 0)
+
+    return {
+        "changed_files_count": changed_total,
+        "changed_files_sample": changed_sample,
+        "changed_files_sample_truncated": max(changed_total - len(changed_sample), 0),
+        "untracked_files_count": untracked_total,
+        "untracked_files_sample": untracked_sample,
+        "untracked_files_sample_truncated": max(untracked_total - len(untracked_sample), 0),
+        "ignored_files_count": ignored_total,
+        "ignored_files_sample": ignored_sample,
+        "ignored_files_sample_truncated": max(ignored_total - len(ignored_sample), 0),
+        "added_lines": int(summary.get("added_lines") or 0),
+        "deleted_lines": int(summary.get("deleted_lines") or 0),
     }
 
 

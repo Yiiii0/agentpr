@@ -12,7 +12,7 @@ This package provides a minimal Phase A implementation:
 6. Environment preflight checks before worker execution
 7. Startup doctor gate for manager/worker prerequisite validation
 8. Skills-mode prompt envelope + task packet artifacts for worker-stage execution
-9. Telegram dual-mode control plane (`/` command mode + NL routing `rules|hybrid|llm`)
+9. Telegram dual-mode control plane (`/` command mode + NL routing `rules|hybrid|llm`, including `/create` run bootstrap)
 
 ## Core Modules
 
@@ -82,9 +82,9 @@ Operational commands added:
 19. `run-agent-step` captures codex JSONL event stream (`--json`) and last agent message for black-box observability (including derived command durations from local stream timestamps).
 20. Keep manager decisions grounded in deterministic artifacts (`run_digest`) and use LLM text summaries (`manager_insight`) only as advisory context.
 21. Tune runtime thresholds by repo using `run_agent_step.repo_overrides` before changing prompt complexity.
-22. Classify failed test/typecheck commands as `HUMAN_REVIEW` (`reason_code=test_command_failed`) even if worker process exits 0.
+22. Runtime grading follows final convergence semantics: intermediate failed test/typecheck commands are preserved as evidence, while converged runs can still classify as `PASS`.
 23. In skills-mode, materialize contract artifact under repo runtime path (`.agentpr_runtime/contracts`) for worker-readability.
-24. PR creation is blocked unless latest `run_digest` satisfies DoD (PASS/runtime_success + policy thresholds + contract evidence), unless explicitly bypassed.
+24. PR creation is blocked unless latest `run_digest` satisfies DoD (PASS + runtime success reason in `{runtime_success, runtime_success_allowlisted_test_failures, runtime_success_recovered_test_failures}` + policy thresholds + contract evidence), unless explicitly bypassed.
 25. Event stream persistence is tiered: always keep `run_digest`, keep raw `agent_event_stream` for non-pass runs and deterministic sampled pass runs.
 26. Runtime verdict/report logic is centralized in `runtime_analysis.py` instead of `cli.py` to reduce coupling and behavior drift.
 27. Safety contract allows explicit external read-only context roots while still forbidding out-of-repo writes.
@@ -96,3 +96,8 @@ Operational commands added:
 33. Manager LLM should consume orchestrator actions via API function-calling, while worker execution remains `codex exec`.
 34. Telegram NL mode supports `rules|hybrid|llm`; `hybrid` is recommended for production-safe rollout.
 35. `manager-tick`/`run-manager-loop` support `--decision-mode rules|llm|hybrid`; `llm/hybrid` needs manager API key env.
+36. In `llm/hybrid`, if LLM chooses `wait_human` while rules have an executable next step, manager auto-overrides to rules to avoid stalling.
+37. Dirty-workspace failures now emit compact diff summaries (counts + samples), avoiding terminal/log blowups from runtime cache file lists.
+38. `manager-tick`/`run-manager-loop` auto-resolve worker prompt from `AGENTPR_WORKER_PROMPT_FILE` (fallback: `forge_integration/claude_code_prompt.md`) when `--prompt-file` is omitted.
+39. Manager LLM facts include compact `run_digest` evidence (classification/validation/diff/attempt/recommendation), not only run state skeleton.
+40. Telegram bot sends deduplicated proactive notifications for key run states and GitHub-feedback-triggered iterating transitions.

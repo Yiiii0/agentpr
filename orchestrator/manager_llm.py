@@ -33,6 +33,9 @@ class BotLLMSelection:
     action: str
     reason: str
     run_id: str | None
+    repo_ref: str | None
+    repo_refs: list[str] | None
+    prompt_version: str | None
     target_state: str | None
     limit: int | None
     raw: dict[str, Any]
@@ -109,7 +112,9 @@ class ManagerLLMClient:
                 "role": "system",
                 "content": (
                     "You are AgentPR manager. Pick exactly one next action. "
-                    "Be conservative. Prefer WAIT_HUMAN when uncertain."
+                    "Use deterministic run_digest evidence when available. "
+                    "Prefer progressing the workflow when an executable action is allowed. "
+                    "Choose WAIT_HUMAN only for explicit blockers that require human input."
                 ),
             },
             {
@@ -135,36 +140,27 @@ class ManagerLLMClient:
                 "function": {"name": "select_action"},
             },
         }
-        data = self._request_chat_completion(payload)
-
-        choices = data.get("choices")
-        if not isinstance(choices, list) or not choices:
-            raise ManagerLLMError("manager llm missing choices")
-        message = (choices[0] or {}).get("message")
-        if not isinstance(message, dict):
-            raise ManagerLLMError("manager llm missing message")
-
-        tool_calls = message.get("tool_calls")
-        if isinstance(tool_calls, list) and tool_calls:
-            first_call = tool_calls[0] if isinstance(tool_calls[0], dict) else {}
-            fn_payload = first_call.get("function") if isinstance(first_call.get("function"), dict) else {}
-            arguments = str(fn_payload.get("arguments") or "{}").strip()
-            try:
-                parsed = json.loads(arguments)
-            except json.JSONDecodeError as exc:
-                raise ManagerLLMError(f"manager llm invalid tool arguments: {arguments[:400]}") from exc
-            return self._selection_from_payload(parsed, data)
-
-        # Fallback: some gateways may return JSON content directly.
-        content = message.get("content")
-        if isinstance(content, str) and content.strip():
-            try:
-                parsed = json.loads(content)
-            except json.JSONDecodeError as exc:
-                raise ManagerLLMError(f"manager llm content is not json: {content[:400]}") from exc
-            return self._selection_from_payload(parsed, data)
-
-        raise ManagerLLMError("manager llm returned no tool calls/content")
+        try:
+            data = self._request_chat_completion(payload)
+            return self._parse_manager_selection_from_response(data)
+        except ManagerLLMError as exc:
+            if not self._should_try_json_fallback(exc):
+                raise
+            parsed = self._request_json_fallback(
+                messages=messages,
+                schema_instruction=(
+                    "Return ONLY one compact JSON object with fields: "
+                    "action (enum), reason (string), target_state (optional string). "
+                    f"Allowed action values: {allowed_actions}."
+                ),
+            )
+            return self._selection_from_payload(
+                parsed,
+                {
+                    "fallback_mode": "json_no_tools",
+                    "fallback_reason": str(exc),
+                },
+            )
 
     def decide_bot_action(
         self,
@@ -195,6 +191,19 @@ class ManagerLLMClient:
                         "run_id": {
                             "type": "string",
                             "description": "Target run id when action needs a run.",
+                        },
+                        "repo_ref": {
+                            "type": "string",
+                            "description": "Repo ref for create_run action: owner/repo or github URL.",
+                        },
+                        "repo_refs": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Repo refs for create_runs action: owner/repo or github URL.",
+                        },
+                        "prompt_version": {
+                            "type": "string",
+                            "description": "Optional prompt version for create_run.",
                         },
                         "target_state": {
                             "type": "string",
@@ -243,8 +252,138 @@ class ManagerLLMClient:
                 "function": {"name": "select_bot_action"},
             },
         }
+        try:
+            data = self._request_chat_completion(payload)
+            return self._parse_bot_selection_from_response(data)
+        except ManagerLLMError as exc:
+            if not self._should_try_json_fallback(exc):
+                raise
+            parsed = self._request_json_fallback(
+                messages=messages,
+                schema_instruction=(
+                    "Return ONLY one compact JSON object with fields: "
+                    "action (enum), reason (string), run_id (optional string), "
+                    "repo_ref (optional string), repo_refs (optional string array), "
+                    "prompt_version (optional string), "
+                    "target_state (optional string), limit (optional integer). "
+                    f"Allowed action values: {allowed_actions}."
+                ),
+            )
+            return self._bot_selection_from_payload(
+                parsed,
+                {
+                    "fallback_mode": "json_no_tools",
+                    "fallback_reason": str(exc),
+                },
+            )
+
+    def _request_chat_completion(self, payload: dict[str, Any]) -> dict[str, Any]:
+        body = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            url=f"{self.config.api_base}/chat/completions",
+            data=body,
+            headers={
+                "Authorization": f"Bearer {self.config.api_key}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=self.config.timeout_sec) as resp:
+                raw = resp.read().decode("utf-8")
+        except urllib.error.HTTPError as exc:
+            raw_error = ""
+            try:
+                raw_error = exc.read().decode("utf-8", errors="replace")
+            except Exception:  # noqa: BLE001
+                raw_error = ""
+            detail = f" | response: {raw_error[:600]}" if raw_error else ""
+            raise ManagerLLMError(
+                f"manager llm request failed: HTTP {exc.code} {exc.reason}{detail}"
+            ) from exc
+        except urllib.error.URLError as exc:
+            raise ManagerLLMError(f"manager llm request failed: {exc}") from exc
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ManagerLLMError(
+                f"manager llm invalid response: {raw[:400]}"
+            ) from exc
+        return data
+
+    def _request_json_fallback(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        schema_instruction: str,
+    ) -> dict[str, Any]:
+        fallback_messages = [
+            *messages,
+            {
+                "role": "system",
+                "content": schema_instruction,
+            },
+        ]
+        payload = {
+            "model": self.config.model,
+            "temperature": 0,
+            "messages": fallback_messages,
+        }
         data = self._request_chat_completion(payload)
-        choices = data.get("choices")
+        return self._parse_json_content_payload(data)
+
+    def _parse_json_content_payload(self, raw: dict[str, Any]) -> dict[str, Any]:
+        choices = raw.get("choices")
+        if not isinstance(choices, list) or not choices:
+            raise ManagerLLMError("manager llm missing choices")
+        message = (choices[0] or {}).get("message")
+        if not isinstance(message, dict):
+            raise ManagerLLMError("manager llm missing message")
+        content = self._extract_text_content(message.get("content"))
+        if not content:
+            raise ManagerLLMError("manager llm content is empty")
+        try:
+            parsed = json.loads(content)
+        except json.JSONDecodeError as exc:
+            raise ManagerLLMError(
+                f"manager llm content is not json: {content[:400]}"
+            ) from exc
+        if not isinstance(parsed, dict):
+            raise ManagerLLMError("manager llm content json must be object")
+        return parsed
+
+    def _parse_manager_selection_from_response(
+        self, raw: dict[str, Any]
+    ) -> ManagerLLMSelection:
+        choices = raw.get("choices")
+        if not isinstance(choices, list) or not choices:
+            raise ManagerLLMError("manager llm missing choices")
+        message = (choices[0] or {}).get("message")
+        if not isinstance(message, dict):
+            raise ManagerLLMError("manager llm missing message")
+
+        tool_calls = message.get("tool_calls")
+        if isinstance(tool_calls, list) and tool_calls:
+            first_call = tool_calls[0] if isinstance(tool_calls[0], dict) else {}
+            fn_payload = (
+                first_call.get("function")
+                if isinstance(first_call.get("function"), dict)
+                else {}
+            )
+            arguments = str(fn_payload.get("arguments") or "{}").strip()
+            try:
+                parsed = json.loads(arguments)
+            except json.JSONDecodeError as exc:
+                raise ManagerLLMError(
+                    f"manager llm invalid tool arguments: {arguments[:400]}"
+                ) from exc
+            return self._selection_from_payload(parsed, raw)
+
+        parsed = self._parse_json_content_payload(raw)
+        return self._selection_from_payload(parsed, raw)
+
+    def _parse_bot_selection_from_response(self, raw: dict[str, Any]) -> BotLLMSelection:
+        choices = raw.get("choices")
         if not isinstance(choices, list) or not choices:
             raise ManagerLLMError("manager llm missing choices")
         message = (choices[0] or {}).get("message")
@@ -266,43 +405,30 @@ class ManagerLLMClient:
                 raise ManagerLLMError(
                     f"manager llm invalid bot tool arguments: {arguments[:400]}"
                 ) from exc
-            return self._bot_selection_from_payload(parsed, data)
+            return self._bot_selection_from_payload(parsed, raw)
 
-        content = message.get("content")
-        if isinstance(content, str) and content.strip():
-            try:
-                parsed = json.loads(content)
-            except json.JSONDecodeError as exc:
-                raise ManagerLLMError(
-                    f"manager llm bot content is not json: {content[:400]}"
-                ) from exc
-            return self._bot_selection_from_payload(parsed, data)
+        parsed = self._parse_json_content_payload(raw)
+        return self._bot_selection_from_payload(parsed, raw)
 
-        raise ManagerLLMError("manager llm returned no bot tool calls/content")
+    @staticmethod
+    def _extract_text_content(content: Any) -> str:
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, list):
+            out: list[str] = []
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                text = item.get("text")
+                if isinstance(text, str) and text.strip():
+                    out.append(text.strip())
+            return "\n".join(out).strip()
+        return ""
 
-    def _request_chat_completion(self, payload: dict[str, Any]) -> dict[str, Any]:
-        body = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(
-            url=f"{self.config.api_base}/chat/completions",
-            data=body,
-            headers={
-                "Authorization": f"Bearer {self.config.api_key}",
-                "Content-Type": "application/json",
-            },
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=self.config.timeout_sec) as resp:
-                raw = resp.read().decode("utf-8")
-        except urllib.error.URLError as exc:
-            raise ManagerLLMError(f"manager llm request failed: {exc}") from exc
-        try:
-            data = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            raise ManagerLLMError(
-                f"manager llm invalid response: {raw[:400]}"
-            ) from exc
-        return data
+    @staticmethod
+    def _should_try_json_fallback(exc: ManagerLLMError) -> bool:
+        text = str(exc).lower()
+        return "http 400" in text or "bad request" in text
 
     @staticmethod
     def _selection_from_payload(payload: Any, raw: dict[str, Any]) -> ManagerLLMSelection:
@@ -330,11 +456,33 @@ class ManagerLLMClient:
         action = str(payload.get("action") or "").strip()
         reason = str(payload.get("reason") or "").strip()
         run_id_raw = payload.get("run_id")
+        repo_ref_raw = payload.get("repo_ref")
+        repo_refs_raw = payload.get("repo_refs")
+        prompt_version_raw = payload.get("prompt_version")
         target_state_raw = payload.get("target_state")
         limit_raw = payload.get("limit")
         run_id = (
             str(run_id_raw).strip()
             if isinstance(run_id_raw, str) and run_id_raw.strip()
+            else None
+        )
+        repo_ref = (
+            str(repo_ref_raw).strip()
+            if isinstance(repo_ref_raw, str) and repo_ref_raw.strip()
+            else None
+        )
+        repo_refs: list[str] | None = None
+        if isinstance(repo_refs_raw, list):
+            parsed_refs = [
+                str(item).strip()
+                for item in repo_refs_raw
+                if isinstance(item, str) and str(item).strip()
+            ]
+            if parsed_refs:
+                repo_refs = parsed_refs
+        prompt_version = (
+            str(prompt_version_raw).strip()
+            if isinstance(prompt_version_raw, str) and prompt_version_raw.strip()
             else None
         )
         target_state = (
@@ -355,6 +503,9 @@ class ManagerLLMClient:
             action=action,
             reason=reason,
             run_id=run_id,
+            repo_ref=repo_ref,
+            repo_refs=repo_refs,
+            prompt_version=prompt_version,
             target_state=target_state,
             limit=limit,
             raw=raw,

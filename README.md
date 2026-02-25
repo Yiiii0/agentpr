@@ -156,10 +156,26 @@ python3.11 -m orchestrator.cli manager-tick \
   --skills-mode agentpr
 ```
 
+`manager-tick` / `run-manager-loop` will use a default worker prompt when `--prompt-file` is omitted:
+- env override: `AGENTPR_WORKER_PROMPT_FILE`
+- fallback: `forge_integration/claude_code_prompt.md`
+
 Manager LLM envs for `--decision-mode llm|hybrid`:
 - `AGENTPR_MANAGER_API_KEY` (required)
 - `AGENTPR_MANAGER_MODEL` (optional, default `gpt-4o-mini`)
 - `AGENTPR_MANAGER_API_BASE` (optional, default `https://api.openai.com/v1`, can point to Forge/OpenAI-compatible gateway)
+- `AGENTPR_WORKER_PROMPT_FILE` (optional, default worker base prompt for manager-tick/loop)
+- `AGENTPR_DEFAULT_PROMPT_VERSION` (optional, default prompt version used by bot `/create`, default `v1`)
+- `AGENTPR_CREATE_AUTOKICK` (optional, `1/0`, default `1`; after `/create`, auto-run one lightweight manager tick per new run)
+
+Whole-system runtime (not just one command):
+- process 1: `run-telegram-bot` (human interaction / NL ingress)
+- process 2: `run-manager-loop` (queue progression / manager decisions)
+- process 3: `run-github-webhook` (preferred) or `sync-github --loop` fallback (CI/review feedback ingestion)
+- optional process 4: alert loop (`webhook-audit-summary` timer/systemd)
+
+If only bot is running and manager loop is not running, runs will not continuously advance.
+If only manager loop is running and webhook/sync is not running, CI/review feedback will not close the loop.
 
 Telegram NL router envs:
 - `AGENTPR_TELEGRAM_NL_MODE` (`rules` | `hybrid` | `llm`, default `rules`)
@@ -167,6 +183,9 @@ Telegram NL router envs:
 - `AGENTPR_TELEGRAM_NL_API_BASE` (optional; fallback to `AGENTPR_MANAGER_API_BASE`)
 - `AGENTPR_TELEGRAM_NL_API_KEY_ENV` (optional; default `AGENTPR_MANAGER_API_KEY`)
 - `AGENTPR_TELEGRAM_NL_TIMEOUT_SEC` (optional; default `20`)
+- `AGENTPR_TELEGRAM_NOTIFY_ENABLED` (optional; `1/0`, default `1`)
+- `AGENTPR_TELEGRAM_NOTIFY_SCAN_SEC` (optional; default `30`)
+- `AGENTPR_TELEGRAM_NOTIFY_SCAN_LIMIT` (optional; default `200`)
 
 `inspect-run` now exposes agent black-box internals from codex JSONL events:
 - `latest_agent_runtime.agent_event_summary.event_type_counts`
@@ -178,6 +197,8 @@ Telegram NL router envs:
 - `latest_manager_insight` (manager-facing markdown insight generated from run digest)
 
 Telegram commands:
+- `/create <owner/repo|github_url>... [--prompt-version vX]`
+- `/overview`
 - `/list [N]`
 - `/show <run_id>`
 - `/status <run_id>`
@@ -187,9 +208,15 @@ Telegram commands:
 - `/resume <run_id> <target_state>`
 - `/retry <run_id> <target_state>`
 
+`/show` and `/status` now include a detailed Decision Card:
+- manager decision (`action/priority/why`)
+- runtime classification (`grade/reason_code/next_action`)
+- evidence snapshot (attempt exit/duration, test evidence, diff scope, top runtime stage)
+- human decision hints (`/retry`, `/resume`, `/approve_pr`)
+
 Telegram command tiers:
-- `read`: `/start` `/help` `/list` `/show` `/status` `/pending_pr`
-- `write`: `/pause` `/resume` `/retry`
+- `read`: `/start` `/help` `/overview` `/list` `/show` `/status` `/pending_pr`
+- `write`: `/create` `/pause` `/resume` `/retry`
 - `admin`: `/approve_pr`
 
 Manager interaction mode:
@@ -203,6 +230,19 @@ Manager interaction mode:
 - Architecture: Telegram -> manager LLM (API function-calling) -> orchestrator actions -> worker (`codex exec`).
 - Manager does not directly run arbitrary shell; it calls whitelisted orchestration actions.
 - Bot now appends a fixed rules footer in every reply so users always see available actions and safety gates.
+- `推进一次` maps to one deterministic `manager-tick` (single-cycle). For continuous auto orchestration, use `run-manager-loop`.
+- runtime grading uses final convergence semantics: intermediate failed test commands are kept as evidence and warnings, not automatic hard blocks when the final run converges.
+- `/create` supports batching multiple repos in one message (command or NL): e.g. `create https://github.com/a/b https://github.com/c/d`.
+- Telegram bot includes proactive state notifications (deduplicated markers) for key states:
+  - `PUSHED`
+  - `NEEDS_HUMAN_REVIEW`
+  - `DONE`
+  - `ITERATING` when triggered by GitHub review/check feedback
+
+LLM boundary (system-level):
+- use LLM for: NL intent parsing, action selection within allowed catalog, manager-facing summaries/iteration proposals
+- do not use LLM for: state transition enforcement, PR gate checks, token confirmation, ACL/rate-limit, idempotency/audit writes
+- Decision Card is machine-facts first; optional LLM explanation should be additive only
 
 Notes:
 - mutable commands now run a startup doctor gate by default (workspace write/tooling/auth/network profile checks).

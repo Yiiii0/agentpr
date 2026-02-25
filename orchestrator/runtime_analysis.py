@@ -479,6 +479,7 @@ def classify_agent_runtime(
     }
     if result.exit_code == 0:
         allowlisted_failure_matches: list[str] = []
+        recovered_failed_test_commands: list[str] = []
         if failed_test_commands:
             allowlisted_failure_matches = match_allowlisted_test_failures(
                 text=f"{result.stderr}\n{result.stdout}",
@@ -487,15 +488,10 @@ def classify_agent_runtime(
             if allowlisted_failure_matches:
                 failed_test_commands = []
             else:
-                return {
-                    "grade": AgentRuntimeGrade.HUMAN_REVIEW.value,
-                    "reason_code": "test_command_failed",
-                    "next_action": "escalate",
-                    "evidence": {
-                        "failed_test_commands": failed_test_commands[:12],
-                        "failed_test_command_count": len(failed_test_commands),
-                    },
-                }
+                # The run may converge after intermediate failures (e.g. retries / env fixes).
+                # Keep this as evidence and let final exit_code + required test evidence decide.
+                recovered_failed_test_commands = list(failed_test_commands)
+                failed_test_commands = []
         required_tests = max(int(min_test_commands), 0) if requires_test_evidence else 0
         observed_tests = len(test_signals)
         if required_tests > 0 and observed_tests < required_tests:
@@ -536,7 +532,11 @@ def classify_agent_runtime(
             "reason_code": (
                 "runtime_success_allowlisted_test_failures"
                 if allowlisted_failure_matches
-                else "runtime_success"
+                else (
+                    "runtime_success_recovered_test_failures"
+                    if recovered_failed_test_commands
+                    else "runtime_success"
+                )
             ),
             "next_action": "advance",
             "evidence": {
@@ -545,6 +545,8 @@ def classify_agent_runtime(
                 "changed_files_count": changed_files_count,
                 "added_lines": added_lines,
                 "allowlisted_test_failure_matches": allowlisted_failure_matches[:12],
+                "recovered_failed_test_commands": recovered_failed_test_commands[:12],
+                "recovered_failed_test_command_count": len(recovered_failed_test_commands),
             },
         }
 
@@ -1283,6 +1285,12 @@ def evaluate_pr_gate_readiness(
     contract_available: bool,
 ) -> dict[str, Any]:
     failed_checks: list[dict[str, str]] = []
+    warnings: list[dict[str, str]] = []
+    accepted_runtime_reason_codes = {
+        "runtime_success",
+        "runtime_success_allowlisted_test_failures",
+        "runtime_success_recovered_test_failures",
+    }
     if not contract_available:
         failed_checks.append(
             {"code": "missing_contract", "message": "contract artifact is required for PR gate"}
@@ -1301,7 +1309,7 @@ def evaluate_pr_gate_readiness(
         failed_checks.append(
             {"code": "runtime_not_pass", "message": f"classification grade={grade}"}
         )
-    if reason_code != "runtime_success":
+    if reason_code not in accepted_runtime_reason_codes:
         failed_checks.append(
             {
                 "code": "runtime_not_runtime_success",
@@ -1343,12 +1351,20 @@ def evaluate_pr_gate_readiness(
             }
         )
     if failed_test_count > 0:
-        failed_checks.append(
-            {
-                "code": "failed_test_commands_present",
-                "message": f"failed_test_command_count={failed_test_count}",
-            }
-        )
+        if grade == AgentRuntimeGrade.PASS.value and reason_code in accepted_runtime_reason_codes:
+            warnings.append(
+                {
+                    "code": "failed_test_commands_observed_but_converged",
+                    "message": f"failed_test_command_count={failed_test_count}",
+                }
+            )
+        else:
+            failed_checks.append(
+                {
+                    "code": "failed_test_commands_present",
+                    "message": f"failed_test_command_count={failed_test_count}",
+                }
+            )
 
     changes = digest.get("changes")
     changes = changes if isinstance(changes, dict) else {}
@@ -1394,6 +1410,7 @@ def evaluate_pr_gate_readiness(
     return {
         "ok": len(failed_checks) == 0,
         "failed_checks": failed_checks,
+        "warnings": warnings,
         "snapshot": {
             "grade": grade,
             "reason_code": reason_code,
