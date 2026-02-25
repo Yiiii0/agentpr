@@ -114,12 +114,35 @@ python3.11 -m orchestrator.cli skills-metrics --limit 200
 python3.11 -m orchestrator.cli skills-metrics --run-id <run_id>
 ```
 
+Build manager iteration feedback from metrics:
+
+```bash
+python3.11 -m orchestrator.cli skills-feedback --limit 300
+# scope to one run:
+python3.11 -m orchestrator.cli skills-feedback --run-id <run_id> --limit 200
+```
+
 Manager-facing run diagnostics:
 
 ```bash
 python3.11 -m orchestrator.cli inspect-run --run-id <run_id>
 python3.11 -m orchestrator.cli inspect-run --run-id <run_id> --include-log-tails
 python3.11 -m orchestrator.cli run-bottlenecks --limit 20
+```
+
+Rule-based manager automation (Phase B1):
+
+```bash
+# single orchestration tick
+python3.11 -m orchestrator.cli manager-tick \
+  --prompt-file orchestrator/data/prompts/baseline_mem0_20260224.md \
+  --skills-mode agentpr
+
+# continuous manager loop (5 min interval)
+python3.11 -m orchestrator.cli run-manager-loop \
+  --prompt-file orchestrator/data/prompts/baseline_mem0_20260224.md \
+  --skills-mode agentpr \
+  --interval-sec 300
 ```
 
 `inspect-run` now exposes agent black-box internals from codex JSONL events:
@@ -145,6 +168,12 @@ Telegram command tiers:
 - `read`: `/start` `/help` `/list` `/show` `/status` `/pending_pr`
 - `write`: `/pause` `/resume` `/retry`
 - `admin`: `/approve_pr`
+
+Manager interaction mode (current vs target):
+- Current: Telegram is command-first (deterministic control actions).
+- Target: command + natural-language dual mode.
+- Planned architecture: Telegram -> manager LLM (API function-calling) -> orchestrator actions -> worker (`codex exec`).
+- Manager does not directly run arbitrary shell; it calls whitelisted orchestration actions.
 
 Notes:
 - mutable commands now run a startup doctor gate by default (workspace write/tooling/auth/network profile checks).
@@ -175,6 +204,8 @@ Notes:
 - webhook processing failures return `500` and release dedup lock so GitHub retries can re-process.
 - `webhook-audit-summary` can be used by cron/systemd timers to emit non-zero exit code on alert thresholds.
 - Deployment templates are in `agentpr/deploy/systemd/` and `agentpr/deploy/supervisord/`.
+- Public ingress templates are in `agentpr/deploy/nginx/` and `agentpr/deploy/cloudflare/`.
+- Webhook ingress probe is `agentpr/deploy/scripts/webhook_probe.py`.
 - Deployment templates already include startup doctor gate (`ExecStartPre` / `doctor && process`) for Telegram/webhook manager processes.
 - To confirm "real readiness" before automation:
   - global: `python3.11 -m orchestrator.cli doctor --require-codex`
@@ -203,13 +234,22 @@ Notes:
 - `--no-codex-full-auto`
   - Disable `--full-auto`.
   - Default behavior keeps no-prompt automation behavior enabled.
+- `--max-agent-seconds`
+  - Hard timeout for one `run-agent-step` codex execution.
+  - If omitted, uses manager policy default (`run_agent_step.max_agent_seconds`, currently `900`).
+  - Set `0` to disable timeout.
 - `--allow-agent-push`
   - Allow worker to run commit/push directly during `run-agent-step`.
   - Default is disabled; manager should run commit/push gate separately.
+- `--allow-read-path`
+  - Add external read-only context path for worker (repeatable).
+  - Useful when manager prompt/task packet references files outside target repo.
 - `--max-changed-files`
-  - Diff budget upper bound for changed files (default: `8`).
+  - Diff budget upper bound for changed files.
+  - If omitted, uses manager policy default (`run_agent_step.max_changed_files`).
 - `--max-added-lines`
-  - Diff budget upper bound for added lines (default: `150`).
+  - Diff budget upper bound for added lines.
+  - If omitted, uses manager policy default (`run_agent_step.max_added_lines`).
 - `--allow-dirty-worktree`
   - Allow agent execution with pre-existing workspace changes.
   - Default blocks dirty worktree in `DISCOVERY/IMPLEMENTING`.
@@ -252,13 +292,20 @@ No-sandbox (danger-full-access) guardrails now implemented by orchestrator:
    - Python global installs are blocked via `PIP_REQUIRE_VIRTUALENV=true`
    - npm/bun global install prefixes are redirected to repo-local dirs
 2. Prompt safety contract:
-   - Worker is explicitly instructed to avoid out-of-repo file operations and global installs
+   - Worker is explicitly instructed to forbid out-of-repo writes and global installs
+   - External paths can be read only when explicitly allowlisted (integration/forge/skills roots + optional `--allow-read-path`)
    - `sudo` is explicitly disallowed
 3. Workspace boundary check:
    - preflight fails if run workspace is outside configured `--workspace-root`
 4. Extensible runtime policy:
    - `orchestrator/runtime_env_overrides.json` controls environment overrides without code changes
    - use placeholders: `{repo_dir}`, `{runtime_dir}`, `{cache_dir}`, `{data_dir}`, `{tmp_dir}`
+
+Manager/worker boundary:
+
+- Worker owns code execution, environment setup, and runtime evidence generation.
+- Manager owns prompt/skill/policy evolution and approval gates.
+- Worker should not rewrite manager prompt assets (`forge_integration/*`) during run; it can consume them as read-only context.
 
 Important:
 - This is a practical safety layer, not a formal security sandbox.
@@ -276,7 +323,7 @@ Recommended presets:
 Manager policy defaults:
 
 - Global `--policy-file` (default `orchestrator/manager_policy.json`) controls defaults for:
-  - `run_agent_step`: sandbox / skills mode / diff budgets / retry cap / test evidence threshold / verdict convergence targets / repo-level overrides
+  - `run_agent_step`: sandbox / skills mode / timeout / diff budgets / retry cap / test evidence threshold / known baseline-test allowlist / verdict convergence targets / repo-level overrides
   - `telegram_bot`: polling defaults / list limit / rate limits / audit log path
   - `github_webhook`: payload limit / audit log path
 - CLI flags still override policy values per command.
@@ -288,10 +335,12 @@ Policy file example:
   "run_agent_step": {
     "codex_sandbox": "danger-full-access",
     "skills_mode": "off",
-    "max_changed_files": 8,
-    "max_added_lines": 150,
+    "max_agent_seconds": 900,
+    "max_changed_files": 6,
+    "max_added_lines": 120,
     "max_retryable_attempts": 3,
     "min_test_commands": 1,
+    "known_test_failure_allowlist": [],
     "success_event_stream_sample_pct": 15,
     "success_state": "LOCAL_VALIDATING",
     "on_retryable_state": "FAILED_RETRYABLE",
@@ -299,17 +348,25 @@ Policy file example:
     "repo_overrides": {
       "mem0ai/mem0": {
         "skills_mode": "agentpr",
-        "max_changed_files": 5,
-        "max_added_lines": 90,
+        "max_agent_seconds": 780,
+        "max_changed_files": 3,
+        "max_added_lines": 45,
+        "max_retryable_attempts": 2,
         "min_test_commands": 2,
-        "success_event_stream_sample_pct": 10
+        "success_event_stream_sample_pct": 8
       },
       "virattt/dexter": {
         "skills_mode": "agentpr",
-        "max_changed_files": 5,
-        "max_added_lines": 80,
+        "max_agent_seconds": 780,
+        "max_changed_files": 4,
+        "max_added_lines": 70,
+        "max_retryable_attempts": 2,
         "min_test_commands": 2,
-        "success_event_stream_sample_pct": 10
+        "known_test_failure_allowlist": [
+          "\\.dexter/gateway-debug\\.log",
+          "No such file or directory.*gateway-debug\\.log"
+        ],
+        "success_event_stream_sample_pct": 8
       }
     }
   },
@@ -396,6 +453,10 @@ Classification behavior:
 3. `HUMAN_REVIEW`
    - safety violations, hard permission/auth/tooling failures, or missing test evidence
    - test/lint/typecheck commands executed but failed (`reason_code=test_command_failed`)
+4. `PASS` (allowlisted baseline test failure)
+   - when failed test commands are detected but stdout/stderr matches
+     `known_test_failure_allowlist`
+   - reason code becomes `runtime_success_allowlisted_test_failures`
 
 `run-agent-step` state behavior with classification:
 
@@ -404,7 +465,7 @@ Classification behavior:
 3. zero exit + non-`PASS` -> command returns non-zero and converges by the same configurable verdict mapping
 4. zero exit + `PASS` -> applies `--success-state` (or policy default)
 
-## Current Status (2026-02-24)
+## Current Status (2026-02-25)
 
 1. Baseline runs (`mem0`, `dexter`) confirm codex can read rules/docs and produce minimal code changes.
 2. Environment gates are now green in real host execution (`doctor --require-codex` + repo preflight pass).
@@ -435,6 +496,14 @@ Classification behavior:
 27. `approve-open-pr` now includes DoD gate checks (digest pass + policy thresholds + contract evidence) with explicit emergency bypass.
 28. Runtime analysis code was split from `cli.py` into `orchestrator/runtime_analysis.py` to reduce coupling and drift risk.
 29. Manager policy now supports repo-level `skills_mode` override and event-stream sampling (`success_event_stream_sample_pct`).
+30. Safety contract now supports explicit external read-only context allowlist while still forbidding out-of-repo writes.
+31. `run-agent-step` timeout is now policy-driven (`run_agent_step.max_agent_seconds`) and supports repo-level overrides.
+32. `mem0` and `dexter` repo overrides were tightened for minimal-diff behavior (diff budget + retry cap + timeout).
+33. Deployment templates now include webhook audit alert timer (`deploy/systemd/agentpr-webhook-audit-alert.*`).
+34. Public ingress templates and guard probe are added (`deploy/nginx/agentpr-webhook.conf`, `deploy/cloudflare/agentpr-webhook-tunnel.yml`, `deploy/scripts/webhook_probe.py`).
+35. Legacy fresh-baseline branches were cleaned up (local + remote): `feature/forge-20260224-172250`, `feature/forge-20260224-173213`.
+36. Policy-level known baseline test failure allowlist is now supported globally and per-repo (`known_test_failure_allowlist`).
+37. `skills-feedback` is now available to generate deterministic prompt/skill/policy iteration actions from runtime metrics.
 
 ## Insights (Conversation)
 

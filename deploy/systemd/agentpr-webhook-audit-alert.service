@@ -1,0 +1,13 @@
+[Unit]
+Description=AgentPR webhook audit alert check
+After=network-online.target agentpr-github-webhook.service
+Wants=network-online.target agentpr-github-webhook.service
+
+[Service]
+Type=oneshot
+User=CHANGE_ME
+Group=CHANGE_ME
+WorkingDirectory=/ABSOLUTE/PATH/TO/TensorBlcok/agentpr
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/homebrew/bin/python3.11 -m orchestrator.cli webhook-audit-summary --since-minutes 30 --max-lines 5000 --fail-on-retryable-failures 0 --fail-on-http5xx-rate 5
+

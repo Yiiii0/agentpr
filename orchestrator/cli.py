@@ -18,6 +18,7 @@ from .db import Database
 from .executor import ScriptExecutor
 from .github_webhook import run_github_webhook_server
 from .github_sync import build_sync_decision
+from .manager_loop import ManagerLoopConfig, ManagerLoopRunner
 from .models import AgentRuntimeGrade, RunCreateInput, RunMode, RunState, StepName
 from .manager_policy import load_manager_policy, resolve_run_agent_effective_policy
 from .preflight import PreflightChecker, RuntimeDoctor
@@ -84,6 +85,67 @@ def add_idempotency_arg(command_parser: argparse.ArgumentParser) -> None:
     command_parser.add_argument(
         "--idempotency-key",
         help="Optional idempotency key. Provide this for retriable command callers.",
+    )
+
+
+def add_manager_common_args(command_parser: argparse.ArgumentParser) -> None:
+    command_parser.add_argument("--run-id", help="Optional single run id target.")
+    command_parser.add_argument(
+        "--limit",
+        type=int,
+        default=20,
+        help="Max runs scanned when --run-id is omitted (default: 20).",
+    )
+    command_parser.add_argument(
+        "--max-actions-per-run",
+        type=int,
+        default=4,
+        help="Max manager actions executed per run in one tick (default: 4).",
+    )
+    command_parser.add_argument(
+        "--prompt-file",
+        type=Path,
+        help="Prompt file used by run-agent-step actions.",
+    )
+    command_parser.add_argument(
+        "--contract-template-file",
+        type=Path,
+        help="Optional template copied into auto-generated contract files.",
+    )
+    command_parser.add_argument(
+        "--disable-auto-contract",
+        action="store_true",
+        help="Disable automatic contract materialization when contract artifact is missing.",
+    )
+    command_parser.add_argument(
+        "--changes",
+        default="Automated integration updates from manager loop.",
+        help="Default --changes value for run-finish.",
+    )
+    command_parser.add_argument(
+        "--commit-title",
+        help="Optional default commit title for run-finish.",
+    )
+    command_parser.add_argument(
+        "--skills-mode",
+        choices=["off", "agentpr"],
+        help="Optional skills mode override passed to run-agent-step.",
+    )
+    command_parser.add_argument(
+        "--codex-sandbox",
+        choices=["read-only", "workspace-write", "danger-full-access"],
+        help="Optional codex sandbox override passed to run-agent-step.",
+    )
+    command_parser.add_argument(
+        "--agent-arg",
+        action="append",
+        default=[],
+        help="Extra argument forwarded to run-agent-step (repeatable).",
+    )
+    command_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Plan actions without executing them.",
     )
 
 
@@ -305,9 +367,27 @@ def build_parser() -> argparse.ArgumentParser:
         help="Disable codex --full-auto.",
     )
     ag.add_argument(
+        "--max-agent-seconds",
+        type=int,
+        default=None,
+        help=(
+            "Hard timeout for a single codex run-agent-step execution. "
+            "Set 0 to disable timeout. If omitted, uses manager policy default."
+        ),
+    )
+    ag.add_argument(
         "--allow-agent-push",
         action="store_true",
         help="Allow agent to run commit/push during run-agent-step (default: disabled).",
+    )
+    ag.add_argument(
+        "--allow-read-path",
+        action="append",
+        default=[],
+        help=(
+            "Additional external read-only path available to worker during run-agent-step. "
+            "Can be repeated."
+        ),
     )
     ag.add_argument(
         "--max-changed-files",
@@ -692,6 +772,27 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum runtime reports to scan (default: 200).",
     )
 
+    sf = sub.add_parser(
+        "skills-feedback",
+        help="Build manager-facing prompt/skill iteration actions from skills metrics",
+    )
+    sf.add_argument(
+        "--run-id",
+        help="Optional run id to scope feedback to one run.",
+    )
+    sf.add_argument(
+        "--limit",
+        type=int,
+        default=300,
+        help="Maximum runtime reports to scan (default: 300).",
+    )
+    sf.add_argument(
+        "--min-samples",
+        type=int,
+        default=3,
+        help="Minimum per-skill samples before skill-specific actions are emitted (default: 3).",
+    )
+
     ir = sub.add_parser(
         "inspect-run",
         help="Build manager-facing diagnostic snapshot for one run",
@@ -738,6 +839,29 @@ def build_parser() -> argparse.ArgumentParser:
         help="Step-attempt rows loaded per run (default: 200).",
     )
 
+    mt = sub.add_parser(
+        "manager-tick",
+        help="Run one manager orchestration tick (rule-based actions)",
+    )
+    add_manager_common_args(mt)
+
+    ml = sub.add_parser(
+        "run-manager-loop",
+        help="Run manager orchestration loop continuously",
+    )
+    add_manager_common_args(ml)
+    ml.add_argument(
+        "--interval-sec",
+        type=int,
+        default=300,
+        help="Loop interval in seconds (default: 300).",
+    )
+    ml.add_argument(
+        "--max-loops",
+        type=int,
+        help="Optional max loop count for testing.",
+    )
+
     return parser
 
 
@@ -778,6 +902,15 @@ def resolve_startup_doctor_profile(args: argparse.Namespace) -> dict[str, Any] |
         return {
             "profile": "agent",
             "check_network": not bool(getattr(args, "skip_network_check", False)),
+            "require_gh_auth": True,
+            "require_codex": True,
+            "require_telegram_token": False,
+            "require_webhook_secret": False,
+        }
+    if command in {"manager-tick", "run-manager-loop"}:
+        return {
+            "profile": "manager",
+            "check_network": True,
             "require_gh_auth": True,
             "require_codex": True,
             "require_telegram_token": False,
@@ -827,6 +960,40 @@ def run_startup_doctor(
         require_webhook_secret=require_webhook_secret,
     ).run()
     return report.to_dict()
+
+
+def build_manager_loop_config_from_args(args: argparse.Namespace) -> ManagerLoopConfig:
+    prompt_file = (
+        Path(args.prompt_file).expanduser().resolve()
+        if args.prompt_file is not None
+        else None
+    )
+    contract_template_file = (
+        Path(args.contract_template_file).expanduser().resolve()
+        if args.contract_template_file is not None
+        else None
+    )
+    return ManagerLoopConfig(
+        project_root=PROJECT_ROOT,
+        db_path=Path(args.db),
+        workspace_root=Path(args.workspace_root),
+        integration_root=Path(args.integration_root),
+        policy_file=Path(args.policy_file),
+        run_id=str(args.run_id).strip() if args.run_id else None,
+        limit=max(int(args.limit), 1),
+        max_actions_per_run=max(int(args.max_actions_per_run), 1),
+        prompt_file=prompt_file,
+        contract_template_file=contract_template_file,
+        auto_contract=not bool(args.disable_auto_contract),
+        default_changes=str(args.changes),
+        default_commit_title=(str(args.commit_title).strip() if args.commit_title else None),
+        codex_sandbox=(
+            str(args.codex_sandbox).strip() if args.codex_sandbox is not None else None
+        ),
+        skills_mode=str(args.skills_mode).strip() if args.skills_mode is not None else None,
+        agent_args=tuple(str(item) for item in (args.agent_arg or [])),
+        dry_run=bool(args.dry_run),
+    )
 
 
 def enforce_startup_doctor_gate(args: argparse.Namespace) -> None:
@@ -968,6 +1135,23 @@ def main() -> int:
             print_json(report)
             return 0
 
+        if args.command == "skills-feedback":
+            metrics = gather_skills_metrics(
+                service=service,
+                run_id=args.run_id,
+                limit=max(int(args.limit), 1),
+            )
+            feedback = build_skills_feedback_report(
+                metrics=metrics,
+                min_samples=max(int(args.min_samples), 1),
+            )
+            json_path = write_skills_feedback_json(feedback)
+            md_path = write_skills_feedback_markdown(feedback)
+            feedback["report_path"] = str(json_path)
+            feedback["markdown_path"] = str(md_path)
+            print_json(feedback)
+            return 0
+
         if args.command == "inspect-run":
             report = gather_run_inspect(
                 service=service,
@@ -990,6 +1174,32 @@ def main() -> int:
             return 0
 
         enforce_startup_doctor_gate(args)
+
+        if args.command == "manager-tick":
+            config = build_manager_loop_config_from_args(args)
+            runner = ManagerLoopRunner(service=service, config=config)
+            report = runner.tick()
+            print_json(report)
+            return 0 if report["ok"] else 1
+
+        if args.command == "run-manager-loop":
+            config = build_manager_loop_config_from_args(args)
+            runner = ManagerLoopRunner(service=service, config=config)
+            loops = 0
+            fail_count = 0
+            try:
+                while True:
+                    report = runner.tick()
+                    print_json(report)
+                    if not bool(report.get("ok", False)):
+                        fail_count += 1
+                    loops += 1
+                    if args.max_loops is not None and loops >= max(int(args.max_loops), 1):
+                        break
+                    time.sleep(max(int(args.interval_sec), 1))
+            except KeyboardInterrupt:
+                return 130
+            return 0 if fail_count == 0 else 1
 
         if args.command == "create-run":
             budget = json.loads(args.budget_json)
@@ -1142,6 +1352,11 @@ def main() -> int:
                 if args.min_test_commands is not None
                 else int(effective_policy["min_test_commands"])
             )
+            resolved_known_test_failure_allowlist = [
+                str(item).strip()
+                for item in list(effective_policy.get("known_test_failure_allowlist") or [])
+                if str(item).strip()
+            ]
             resolved_success_event_stream_sample_pct = int(
                 effective_policy["success_event_stream_sample_pct"]
             )
@@ -1161,6 +1376,14 @@ def main() -> int:
                 else str(effective_policy["on_human_review_state"])
             )
             current_state = RunState(snapshot["state"])
+            if (
+                args.success_state is None
+                and current_state == RunState.DISCOVERY
+                and resolved_success_state == RunState.LOCAL_VALIDATING.value
+            ):
+                resolved_success_state = "UNCHANGED"
+            if current_state == RunState.LOCAL_VALIDATING and resolved_success_state == RunState.LOCAL_VALIDATING.value:
+                resolved_success_state = "UNCHANGED"
             preflight_report: dict[str, Any] | None = None
             if current_state == RunState.QUEUED:
                 service.start_discovery(args.run_id)
@@ -1234,6 +1457,16 @@ def main() -> int:
                     )
                     return 1
             runtime_policy = executor.runtime_policy_summary(repo_dir)
+            resolved_max_agent_seconds = (
+                max(int(args.max_agent_seconds), 0)
+                if args.max_agent_seconds is not None
+                else max(int(effective_policy.get("max_agent_seconds", 900)), 0)
+            )
+            external_read_only_paths = resolve_external_read_only_paths(
+                integration_root=Path(args.integration_root),
+                include_skills_root=(resolved_skills_mode == "agentpr"),
+                user_paths=[str(item) for item in (args.allow_read_path or [])],
+            )
             prompt = load_prompt(args)
             skill_plan_payload: dict[str, Any] | None = None
             task_packet_path: Path | None = None
@@ -1329,6 +1562,8 @@ def main() -> int:
                 codex_model=args.codex_model,
                 allow_git_push=bool(args.allow_agent_push),
                 extra_args=args.agent_arg,
+                read_only_paths=external_read_only_paths,
+                max_duration_sec=resolved_max_agent_seconds if resolved_max_agent_seconds > 0 else None,
             )
             metadata = result.metadata if isinstance(result.metadata, dict) else {}
             raw_offsets = metadata.get("stdout_line_offsets_ms")
@@ -1385,6 +1620,7 @@ def main() -> int:
                 max_added_lines=resolved_max_added_lines,
                 max_retryable_attempts=resolved_max_retryable_attempts,
                 min_test_commands=resolved_min_test_commands,
+                known_test_failure_allowlist=resolved_known_test_failure_allowlist,
                 attempt_no=agent_attempt_no,
                 skills_mode=resolved_skills_mode,
                 skill_plan=skill_plan_payload,
@@ -1398,10 +1634,12 @@ def main() -> int:
                     "run_agent_step": {
                         "codex_sandbox": policy_agent.codex_sandbox,
                         "skills_mode": policy_agent.skills_mode,
+                        "max_agent_seconds": policy_agent.max_agent_seconds,
                         "max_changed_files": policy_agent.max_changed_files,
                         "max_added_lines": policy_agent.max_added_lines,
                         "max_retryable_attempts": policy_agent.max_retryable_attempts,
                         "min_test_commands": policy_agent.min_test_commands,
+                        "known_test_failure_allowlist": list(policy_agent.known_test_failure_allowlist),
                         "success_event_stream_sample_pct": policy_agent.success_event_stream_sample_pct,
                         "success_state": policy_agent.success_state,
                         "on_retryable_state": policy_agent.on_retryable_state,
@@ -1411,6 +1649,11 @@ def main() -> int:
                         "resolved_on_retryable_state": resolved_on_retryable_state,
                         "resolved_on_human_review_state": resolved_on_human_review_state,
                         "resolved_success_event_stream_sample_pct": resolved_success_event_stream_sample_pct,
+                        "resolved_max_agent_seconds": resolved_max_agent_seconds,
+                        "resolved_known_test_failure_allowlist": resolved_known_test_failure_allowlist,
+                        "resolved_external_read_only_paths": [
+                            str(item) for item in external_read_only_paths
+                        ],
                     },
                 },
             )
@@ -2126,7 +2369,7 @@ def main() -> int:
     except json.JSONDecodeError as exc:
         print_json({"ok": False, "error": f"invalid JSON: {exc}"})
         return 2
-    except (RunNotFoundError, InvalidTransitionError, ValueError) as exc:
+    except (RunNotFoundError, InvalidTransitionError, ValueError, KeyError) as exc:
         print_json({"ok": False, "error": str(exc)})
         return 1
 
@@ -2164,6 +2407,44 @@ def load_optional_text(inline: str | None, file_path: Path | None, *, arg_name: 
         return file_path.read_text(encoding="utf-8")
     except OSError as exc:
         raise ValueError(f"Failed to read {arg_name} file {file_path}: {exc}") from exc
+
+
+def resolve_external_read_only_paths(
+    *,
+    integration_root: Path,
+    include_skills_root: bool,
+    user_paths: list[str] | None = None,
+) -> list[Path]:
+    candidates: list[Path] = []
+    resolved_integration_root = integration_root.expanduser().resolve()
+    candidates.append(resolved_integration_root)
+
+    forge_root = resolved_integration_root.parent.parent / "forge"
+    if forge_root.exists():
+        candidates.append(forge_root.resolve())
+
+    if include_skills_root:
+        skills_root = resolve_codex_skills_root(codex_home=resolve_codex_home())
+        if skills_root.exists():
+            candidates.append(skills_root.resolve())
+
+    for raw in user_paths or []:
+        value = str(raw).strip()
+        if not value:
+            continue
+        path = Path(value).expanduser()
+        if path.exists():
+            candidates.append(path.resolve())
+
+    out: list[Path] = []
+    seen: set[str] = set()
+    for path in candidates:
+        value = str(path)
+        if value in seen:
+            continue
+        seen.add(value)
+        out.append(path)
+    return out
 
 
 def write_pr_open_request(run_id: str, payload: dict[str, Any]) -> Path:
@@ -2599,6 +2880,313 @@ def gather_skills_metrics(
         "latest": rows[:20],
         "failures": failures[:20],
     }
+
+
+def build_skills_feedback_report(
+    *,
+    metrics: dict[str, Any],
+    min_samples: int,
+) -> dict[str, Any]:
+    parsed_reports = int(metrics.get("parsed_reports") or 0)
+    grade_counts_raw = metrics.get("grade_counts")
+    grade_counts = grade_counts_raw if isinstance(grade_counts_raw, dict) else {}
+    reason_counts_raw = metrics.get("reason_code_counts")
+    reason_counts = reason_counts_raw if isinstance(reason_counts_raw, dict) else {}
+    per_skill_raw = metrics.get("per_skill")
+    per_skill = per_skill_raw if isinstance(per_skill_raw, list) else []
+    missing_required_raw = metrics.get("missing_required_counts")
+    missing_required_counts = (
+        missing_required_raw if isinstance(missing_required_raw, dict) else {}
+    )
+
+    pass_count = int(grade_counts.get("PASS") or 0)
+    retryable_count = int(grade_counts.get("RETRYABLE") or 0)
+    human_review_count = int(grade_counts.get("HUMAN_REVIEW") or 0)
+    total = max(parsed_reports, 0)
+
+    def pct(value: int) -> float:
+        if total <= 0:
+            return 0.0
+        return round(100.0 * float(value) / float(total), 2)
+
+    top_reasons = sorted(
+        (
+            {"reason_code": str(key), "count": int(value)}
+            for key, value in reason_counts.items()
+        ),
+        key=lambda row: int(row["count"]),
+        reverse=True,
+    )[:10]
+
+    actions: list[dict[str, Any]] = []
+
+    def add_action(
+        *,
+        action_id: str,
+        priority: str,
+        target: str,
+        trigger: str,
+        recommendation: str,
+        acceptance: str,
+    ) -> None:
+        actions.append(
+            {
+                "id": action_id,
+                "priority": priority,
+                "target": target,
+                "trigger": trigger,
+                "recommendation": recommendation,
+                "acceptance_check": acceptance,
+            }
+        )
+
+    evidence_gap_count = int(reason_counts.get("missing_test_evidence") or 0) + int(
+        reason_counts.get("insufficient_test_evidence") or 0
+    )
+    if evidence_gap_count > 0:
+        add_action(
+            action_id="prompt-impl-test-evidence",
+            priority="high",
+            target="agentpr-implement-and-validate + prompt_template",
+            trigger=f"evidence_gap_count={evidence_gap_count}",
+            recommendation=(
+                "Strengthen implement/validate stage to require CI-aligned test commands "
+                "with explicit command outputs in final report."
+            ),
+            acceptance=(
+                "reason_code missing/insufficient_test_evidence decreases over next 10 runs."
+            ),
+        )
+
+    failed_test_count = int(reason_counts.get("test_command_failed") or 0)
+    if failed_test_count > 0:
+        add_action(
+            action_id="policy-known-baseline-failures",
+            priority="high",
+            target="manager_policy.run_agent_step.known_test_failure_allowlist",
+            trigger=f"test_command_failed={failed_test_count}",
+            recommendation=(
+                "Split baseline failures from integration failures; add only verified baseline "
+                "signatures to allowlist per repo, keep unknown failures as HUMAN_REVIEW."
+            ),
+            acceptance=(
+                "reason_code test_command_failed decreases without increasing post-review regressions."
+            ),
+        )
+
+    diff_budget_count = int(reason_counts.get("diff_budget_exceeded") or 0)
+    if diff_budget_count > 0:
+        add_action(
+            action_id="policy-minimal-diff-tighten",
+            priority="medium",
+            target="manager_policy.run_agent_step.repo_overrides",
+            trigger=f"diff_budget_exceeded={diff_budget_count}",
+            recommendation=(
+                "Tighten max_changed_files/max_added_lines for affected repos and reinforce "
+                "minimal patch instructions in implement skill."
+            ),
+            acceptance=(
+                "median changed_files_count and added_lines decrease while PASS rate stays stable."
+            ),
+        )
+
+    transient_count = int(reason_counts.get("runtime_transient_failure") or 0) + int(
+        reason_counts.get("runtime_unknown_failure") or 0
+    )
+    if transient_count > 0:
+        add_action(
+            action_id="policy-retry-and-timeout-calibration",
+            priority="medium",
+            target="manager_policy.run_agent_step.max_agent_seconds/retry caps",
+            trigger=f"transient_like_failures={transient_count}",
+            recommendation=(
+                "Calibrate timeout and retry caps per repo; separate network/tooling failures "
+                "from code-quality failures before re-dispatch."
+            ),
+            acceptance=(
+                "RETRYABLE share decreases and retryable_limit_exceeded remains low."
+            ),
+        )
+
+    if missing_required_counts:
+        missing_names = ", ".join(sorted(str(key) for key in missing_required_counts.keys()))
+        add_action(
+            action_id="skills-install-integrity",
+            priority="high",
+            target="skills installation + bootstrap checks",
+            trigger=f"missing_required_counts={missing_names}",
+            recommendation=(
+                "Enforce required skill presence in manager startup and fail fast before dispatch."
+            ),
+            acceptance=(
+                "missing_required_counts remains empty for all new runs."
+            ),
+        )
+
+    low_pass_skills: list[dict[str, Any]] = []
+    for row in per_skill:
+        if not isinstance(row, dict):
+            continue
+        skill_name = str(row.get("skill") or "").strip()
+        if not skill_name:
+            continue
+        samples = max(int(row.get("samples") or 0), 0)
+        if samples < max(int(min_samples), 1):
+            continue
+        grades_raw = row.get("grades")
+        grades = grades_raw if isinstance(grades_raw, dict) else {}
+        pass_samples = int(grades.get("PASS") or 0)
+        pass_rate_pct = round(100.0 * pass_samples / max(samples, 1), 2)
+        if pass_rate_pct >= 60.0:
+            continue
+        reasons_raw = row.get("reasons")
+        reasons = reasons_raw if isinstance(reasons_raw, dict) else {}
+        dominant_reason = ""
+        dominant_count = 0
+        for key, value in reasons.items():
+            count = int(value or 0)
+            if count > dominant_count:
+                dominant_reason = str(key)
+                dominant_count = count
+        low_pass_skills.append(
+            {
+                "skill": skill_name,
+                "samples": samples,
+                "pass_rate_pct": pass_rate_pct,
+                "dominant_reason": dominant_reason,
+                "dominant_reason_count": dominant_count,
+            }
+        )
+    low_pass_skills.sort(key=lambda row: float(row["pass_rate_pct"]))
+    for row in low_pass_skills[:5]:
+        add_action(
+            action_id=f"skill-tune-{str(row['skill']).replace('/', '-')}",
+            priority="medium",
+            target=str(row["skill"]),
+            trigger=(
+                f"samples={row['samples']},pass_rate_pct={row['pass_rate_pct']},"
+                f"dominant_reason={row['dominant_reason']}"
+            ),
+            recommendation=(
+                "Update skill checklist/exit criteria for dominant failure mode and "
+                "re-run A/B on at least 3 repos."
+            ),
+            acceptance=(
+                f"{row['skill']} pass_rate_pct reaches >= 70 over next {max(int(min_samples), 1)}+ samples."
+            ),
+        )
+
+    stamp = datetime.now(UTC).strftime("%Y%m%d")
+    return {
+        "ok": True,
+        "generated_at": datetime.now(UTC).isoformat(),
+        "scope_run_id": metrics.get("scope_run_id"),
+        "input_summary": {
+            "parsed_reports": parsed_reports,
+            "pass_count": pass_count,
+            "retryable_count": retryable_count,
+            "human_review_count": human_review_count,
+            "pass_rate_pct": pct(pass_count),
+            "retryable_rate_pct": pct(retryable_count),
+            "human_review_rate_pct": pct(human_review_count),
+        },
+        "top_reasons": top_reasons,
+        "low_pass_skills": low_pass_skills[:10],
+        "actions": actions,
+        "suggested_versions": {
+            "prompt_version": f"auto-prompt-{stamp}",
+            "skills_bundle_version": f"auto-skills-{stamp}",
+        },
+        "metrics_snapshot": {
+            "grade_counts": grade_counts,
+            "reason_code_counts": reason_counts,
+            "missing_required_counts": missing_required_counts,
+        },
+    }
+
+
+def write_skills_feedback_json(payload: dict[str, Any]) -> Path:
+    reports_dir = PROJECT_ROOT / "orchestrator" / "data" / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    out_path = reports_dir / f"skills_feedback_{stamp}.json"
+    out_path.write_text(
+        json.dumps(payload, ensure_ascii=True, sort_keys=True, indent=2),
+        encoding="utf-8",
+    )
+    return out_path
+
+
+def render_skills_feedback_markdown(payload: dict[str, Any]) -> str:
+    summary_raw = payload.get("input_summary")
+    summary = summary_raw if isinstance(summary_raw, dict) else {}
+    top_reasons_raw = payload.get("top_reasons")
+    top_reasons = top_reasons_raw if isinstance(top_reasons_raw, list) else []
+    actions_raw = payload.get("actions")
+    actions = actions_raw if isinstance(actions_raw, list) else []
+    suggested_versions_raw = payload.get("suggested_versions")
+    suggested_versions = (
+        suggested_versions_raw if isinstance(suggested_versions_raw, dict) else {}
+    )
+
+    lines = [
+        "# Skills Feedback",
+        "",
+        f"- Generated at: {payload.get('generated_at', '')}",
+        f"- Scope run_id: {payload.get('scope_run_id', '') or 'global'}",
+        "",
+        "## Summary",
+        f"- Parsed reports: {summary.get('parsed_reports', 0)}",
+        f"- PASS rate: {summary.get('pass_rate_pct', 0)}%",
+        f"- RETRYABLE rate: {summary.get('retryable_rate_pct', 0)}%",
+        f"- HUMAN_REVIEW rate: {summary.get('human_review_rate_pct', 0)}%",
+        "",
+        "## Top Reasons",
+    ]
+    if top_reasons:
+        for row in top_reasons[:10]:
+            if not isinstance(row, dict):
+                continue
+            lines.append(f"- {row.get('reason_code', '')}: {row.get('count', 0)}")
+    else:
+        lines.append("- No reason-code data.")
+
+    lines.extend(["", "## Actions"])
+    if actions:
+        for idx, row in enumerate(actions, start=1):
+            if not isinstance(row, dict):
+                continue
+            lines.append(
+                f"{idx}. [{row.get('priority', 'normal')}] {row.get('id', '')} -> {row.get('target', '')}"
+            )
+            lines.append(f"   Trigger: {row.get('trigger', '')}")
+            lines.append(f"   Change: {row.get('recommendation', '')}")
+            lines.append(f"   Accept: {row.get('acceptance_check', '')}")
+    else:
+        lines.append("1. No actions generated; keep current policy/prompt and continue sampling.")
+
+    lines.extend(
+        [
+            "",
+            "## Suggested Versions",
+            f"- prompt_version: {suggested_versions.get('prompt_version', '')}",
+            f"- skills_bundle_version: {suggested_versions.get('skills_bundle_version', '')}",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def write_skills_feedback_markdown(payload: dict[str, Any]) -> Path:
+    reports_dir = PROJECT_ROOT / "orchestrator" / "data" / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    out_path = reports_dir / f"skills_feedback_{stamp}.md"
+    out_path.write_text(
+        render_skills_feedback_markdown(payload),
+        encoding="utf-8",
+    )
+    return out_path
 
 
 def summarize_webhook_audit_log(
@@ -3345,6 +3933,9 @@ def converge_agent_success_state(
 
     target = RunState(str(resolved_success_state))
     if target == RunState.LOCAL_VALIDATING:
+        current_state = RunState(service.get_run_snapshot(args.run_id)["state"])
+        if current_state in {RunState.LOCAL_VALIDATING, RunState.DISCOVERY, RunState.PLAN_READY}:
+            return current_state.value
         result = service.mark_local_validation_passed(args.run_id)
         return str(result["state"])
     if target == RunState.NEEDS_HUMAN_REVIEW:

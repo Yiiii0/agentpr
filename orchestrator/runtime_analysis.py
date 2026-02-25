@@ -397,6 +397,26 @@ def extract_failed_test_commands(event_summary: dict[str, Any]) -> list[str]:
     return dedupe_strings(failed, limit=40)
 
 
+def match_allowlisted_test_failures(
+    *,
+    text: str,
+    patterns: list[str],
+) -> list[str]:
+    matched: list[str] = []
+    haystack = str(text or "")
+    for pattern in patterns:
+        token = str(pattern).strip()
+        if not token:
+            continue
+        try:
+            ok = re.search(token, haystack, flags=re.IGNORECASE) is not None
+        except re.error:
+            ok = token.lower() in haystack.lower()
+        if ok:
+            matched.append(token)
+    return dedupe_strings(matched, limit=20)
+
+
 def classify_agent_runtime(
     *,
     run_state: RunState,
@@ -412,6 +432,7 @@ def classify_agent_runtime(
     max_added_lines: int,
     max_retryable_attempts: int,
     min_test_commands: int,
+    known_test_failure_allowlist: list[str],
     attempt_no: int,
 ) -> dict[str, Any]:
     if preflight_report is not None and not preflight_report.get("ok", True):
@@ -457,16 +478,24 @@ def classify_agent_runtime(
         RunState.ITERATING,
     }
     if result.exit_code == 0:
+        allowlisted_failure_matches: list[str] = []
         if failed_test_commands:
-            return {
-                "grade": AgentRuntimeGrade.HUMAN_REVIEW.value,
-                "reason_code": "test_command_failed",
-                "next_action": "escalate",
-                "evidence": {
-                    "failed_test_commands": failed_test_commands[:12],
-                    "failed_test_command_count": len(failed_test_commands),
-                },
-            }
+            allowlisted_failure_matches = match_allowlisted_test_failures(
+                text=f"{result.stderr}\n{result.stdout}",
+                patterns=known_test_failure_allowlist,
+            )
+            if allowlisted_failure_matches:
+                failed_test_commands = []
+            else:
+                return {
+                    "grade": AgentRuntimeGrade.HUMAN_REVIEW.value,
+                    "reason_code": "test_command_failed",
+                    "next_action": "escalate",
+                    "evidence": {
+                        "failed_test_commands": failed_test_commands[:12],
+                        "failed_test_command_count": len(failed_test_commands),
+                    },
+                }
         required_tests = max(int(min_test_commands), 0) if requires_test_evidence else 0
         observed_tests = len(test_signals)
         if required_tests > 0 and observed_tests < required_tests:
@@ -504,13 +533,18 @@ def classify_agent_runtime(
             }
         return {
             "grade": AgentRuntimeGrade.PASS.value,
-            "reason_code": "runtime_success",
+            "reason_code": (
+                "runtime_success_allowlisted_test_failures"
+                if allowlisted_failure_matches
+                else "runtime_success"
+            ),
             "next_action": "advance",
             "evidence": {
                 "exit_code": result.exit_code,
                 "test_commands": test_signals[:12],
                 "changed_files_count": changed_files_count,
                 "added_lines": added_lines,
+                "allowlisted_test_failure_matches": allowlisted_failure_matches[:12],
             },
         }
 
@@ -592,6 +626,7 @@ def build_agent_runtime_report(
     max_added_lines: int,
     max_retryable_attempts: int,
     min_test_commands: int,
+    known_test_failure_allowlist: list[str],
     attempt_no: int,
     skills_mode: str,
     skill_plan: dict[str, Any] | None,
@@ -680,6 +715,7 @@ def build_agent_runtime_report(
         max_added_lines=max_added_lines,
         max_retryable_attempts=max_retryable_attempts,
         min_test_commands=min_test_commands,
+        known_test_failure_allowlist=known_test_failure_allowlist,
         attempt_no=attempt_no,
     )
 
@@ -699,6 +735,7 @@ def build_agent_runtime_report(
             "attempt_no": attempt_no,
             "max_retryable_attempts": max_retryable_attempts,
             "min_test_commands": min_test_commands,
+            "known_test_failure_allowlist": list(known_test_failure_allowlist),
             "skills_mode": skills_mode,
             "skill_plan": skill_plan,
             "task_packet_path": task_packet_path,

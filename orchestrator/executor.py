@@ -198,6 +198,8 @@ class ScriptExecutor:
         codex_model: str | None = None,
         allow_git_push: bool = False,
         extra_args: list[str] | None = None,
+        read_only_paths: list[Path] | None = None,
+        max_duration_sec: int | None = None,
     ) -> CommandResult:
         if not self.codex_bin:
             return CommandResult(
@@ -215,6 +217,7 @@ class ScriptExecutor:
             repo_dir=repo_dir,
             runtime_dir=runtime_policy["runtime_dir"],
             allow_git_push=allow_git_push,
+            read_only_paths=read_only_paths or [],
         )
         last_message_path = runtime_policy["runtime_dir"] / "codex_last_message.txt"
         cmd = [self.codex_bin, "exec", "--sandbox", codex_sandbox]
@@ -231,11 +234,17 @@ class ScriptExecutor:
         )
         cmd.append(guarded_prompt)
         cmd.extend(extra_args or [])
-        result = self._run_with_stdout_timeline(cmd, cwd=repo_dir, env=runtime_policy["env"])
+        result = self._run_with_stdout_timeline(
+            cmd,
+            cwd=repo_dir,
+            env=runtime_policy["env"],
+            max_duration_sec=max_duration_sec,
+        )
         metadata = {
             "codex_jsonl": True,
             "last_message_path": str(last_message_path),
             "runtime_dir": str(runtime_policy["runtime_dir"]),
+            "max_duration_sec": max_duration_sec,
         }
         if isinstance(result.metadata, dict):
             metadata.update(result.metadata)
@@ -254,6 +263,7 @@ class ScriptExecutor:
         repo_dir: Path,
         runtime_dir: Path,
         allow_git_push: bool,
+        read_only_paths: list[Path],
     ) -> str:
         push_rule = (
             "- Do NOT run git commit/git push/finish.sh. "
@@ -264,11 +274,29 @@ class ScriptExecutor:
                 "- git commit/push is allowed only after all required tests/lint pass, "
                 "and only with minimal intended diff.\n"
             )
+        read_only_lines: list[str] = []
+        seen: set[str] = set()
+        for item in read_only_paths:
+            resolved = item.expanduser().resolve()
+            value = str(resolved)
+            if value in seen:
+                continue
+            seen.add(value)
+            read_only_lines.append(f"  - {value}")
+        read_only_block = ""
+        if read_only_lines:
+            read_only_block = (
+                "External read-only context paths allowed:\n"
+                + "\n".join(read_only_lines)
+                + "\n"
+            )
         contract = (
             "Execution safety contract (mandatory):\n"
             f"- Operate only inside repository: {repo_dir}\n"
             f"- Runtime writable scratch/cache area: {runtime_dir}\n"
-            "- Do NOT edit/read files outside this repository, except /tmp for scratch files.\n"
+            "- Do NOT write outside repository, runtime scratch/cache area, or /tmp.\n"
+            "- Do NOT read paths outside repository unless listed in External read-only context paths.\n"
+            f"{read_only_block}"
             "- Do NOT run sudo.\n"
             "- Do NOT install global packages (brew install, npm -g, pip --user/global, uv tool install, poetry self).\n"
             "- Use only project-local environments and dependencies (.venv/node_modules/.agentpr_runtime).\n"
@@ -388,6 +416,7 @@ class ScriptExecutor:
         cmd: list[str],
         cwd: Path,
         env: dict[str, str] | None = None,
+        max_duration_sec: int | None = None,
     ) -> CommandResult:
         start = time.monotonic()
         try:
@@ -430,7 +459,19 @@ class ScriptExecutor:
         stderr_thread = threading.Thread(target=read_stderr, daemon=True)
         stdout_thread.start()
         stderr_thread.start()
-        exit_code = process.wait()
+        timed_out = False
+        try:
+            if max_duration_sec is not None and max_duration_sec > 0:
+                exit_code = process.wait(timeout=max_duration_sec)
+            else:
+                exit_code = process.wait()
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            process.kill()
+            exit_code = 124
+            stderr_lines.append(
+                f"agent_execution_timeout: exceeded max_duration_sec={max_duration_sec}\n"
+            )
         stdout_thread.join()
         stderr_thread.join()
 
@@ -440,5 +481,8 @@ class ScriptExecutor:
             stdout="".join(stdout_lines),
             stderr="".join(stderr_lines),
             duration_ms=duration_ms,
-            metadata={"stdout_line_offsets_ms": stdout_line_offsets_ms},
+            metadata={
+                "stdout_line_offsets_ms": stdout_line_offsets_ms,
+                "timed_out": timed_out,
+            },
         )

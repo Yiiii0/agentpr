@@ -1,0 +1,8 @@
+tunnel: CHANGE_ME_TUNNEL_NAME_OR_ID
+credentials-file: /etc/cloudflared/CHANGE_ME_TUNNEL.json
+
+ingress:
+  - hostname: CHANGE_ME_WEBHOOK_HOST
+    service: http://127.0.0.1:8787
+  - service: http_status:404
+

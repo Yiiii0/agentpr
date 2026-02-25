@@ -9,10 +9,12 @@ DEFAULT_MANAGER_POLICY: dict[str, Any] = {
     "run_agent_step": {
         "codex_sandbox": "danger-full-access",
         "skills_mode": "off",
+        "max_agent_seconds": 900,
         "max_changed_files": 8,
         "max_added_lines": 150,
         "max_retryable_attempts": 3,
         "min_test_commands": 1,
+        "known_test_failure_allowlist": [],
         "success_event_stream_sample_pct": 15,
         "success_state": "LOCAL_VALIDATING",
         "on_retryable_state": "FAILED_RETRYABLE",
@@ -39,10 +41,12 @@ DEFAULT_MANAGER_POLICY: dict[str, Any] = {
 class RunAgentPolicy:
     codex_sandbox: str
     skills_mode: str
+    max_agent_seconds: int
     max_changed_files: int
     max_added_lines: int
     max_retryable_attempts: int
     min_test_commands: int
+    known_test_failure_allowlist: list[str]
     success_event_stream_sample_pct: int
     success_state: str
     on_retryable_state: str
@@ -106,8 +110,13 @@ def load_manager_policy(path: Path) -> ManagerPolicy:
 
     max_changed_files = max(int(run_agent.get("max_changed_files", 8)), 0)
     max_added_lines = max(int(run_agent.get("max_added_lines", 150)), 0)
+    max_agent_seconds = max(int(run_agent.get("max_agent_seconds", 900)), 0)
     max_retryable_attempts = max(int(run_agent.get("max_retryable_attempts", 3)), 0)
     min_test_commands = max(int(run_agent.get("min_test_commands", 1)), 0)
+    known_test_failure_allowlist = parse_string_list(
+        run_agent.get("known_test_failure_allowlist", []),
+        field_name="run_agent_step.known_test_failure_allowlist",
+    )
     success_event_stream_sample_pct = min(
         max(int(run_agent.get("success_event_stream_sample_pct", 15)), 0),
         100,
@@ -153,10 +162,12 @@ def load_manager_policy(path: Path) -> ManagerPolicy:
         run_agent_step=RunAgentPolicy(
             codex_sandbox=codex_sandbox,
             skills_mode=skills_mode,
+            max_agent_seconds=max_agent_seconds,
             max_changed_files=max_changed_files,
             max_added_lines=max_added_lines,
             max_retryable_attempts=max_retryable_attempts,
             min_test_commands=min_test_commands,
+            known_test_failure_allowlist=known_test_failure_allowlist,
             success_event_stream_sample_pct=success_event_stream_sample_pct,
             success_state=success_state,
             on_retryable_state=on_retryable_state,
@@ -196,12 +207,14 @@ def parse_repo_overrides(value: Any) -> dict[str, dict[str, Any]]:
         raise ValueError("Invalid manager policy run_agent_step.repo_overrides: expected object")
 
     allowed_int_fields = {
+        "max_agent_seconds",
         "max_changed_files",
         "max_added_lines",
         "max_retryable_attempts",
         "min_test_commands",
         "success_event_stream_sample_pct",
     }
+    allowed_list_fields = {"known_test_failure_allowlist"}
     allowed_str_fields = {"skills_mode"}
     out: dict[str, dict[str, Any]] = {}
     for raw_key, raw_override in value.items():
@@ -214,8 +227,14 @@ def parse_repo_overrides(value: Any) -> dict[str, dict[str, Any]]:
         parsed: dict[str, Any] = {}
         for field, raw_field_value in raw_override.items():
             field_name = str(field).strip()
-            if field_name not in allowed_int_fields and field_name not in allowed_str_fields:
-                allowed_text = ", ".join(sorted(allowed_int_fields | allowed_str_fields))
+            if (
+                field_name not in allowed_int_fields
+                and field_name not in allowed_str_fields
+                and field_name not in allowed_list_fields
+            ):
+                allowed_text = ", ".join(
+                    sorted(allowed_int_fields | allowed_str_fields | allowed_list_fields)
+                )
                 raise ValueError(
                     "Invalid manager policy run_agent_step.repo_overrides."
                     f"{raw_key}.{field_name} (allowed: {allowed_text})"
@@ -225,6 +244,15 @@ def parse_repo_overrides(value: Any) -> dict[str, dict[str, Any]]:
                 if field_name == "success_event_stream_sample_pct":
                     value_int = min(value_int, 100)
                 parsed[field_name] = value_int
+                continue
+            if field_name in allowed_list_fields:
+                parsed[field_name] = parse_string_list(
+                    raw_field_value,
+                    field_name=(
+                        "run_agent_step.repo_overrides."
+                        f"{raw_key}.{field_name}"
+                    ),
+                )
                 continue
             skills_mode = str(raw_field_value).strip()
             if skills_mode not in {"off", "agentpr"}:
@@ -253,10 +281,12 @@ def resolve_run_agent_effective_policy(
     effective: dict[str, Any] = {
         "codex_sandbox": policy.codex_sandbox,
         "skills_mode": policy.skills_mode,
+        "max_agent_seconds": policy.max_agent_seconds,
         "max_changed_files": policy.max_changed_files,
         "max_added_lines": policy.max_added_lines,
         "max_retryable_attempts": policy.max_retryable_attempts,
         "min_test_commands": policy.min_test_commands,
+        "known_test_failure_allowlist": list(policy.known_test_failure_allowlist),
         "success_event_stream_sample_pct": policy.success_event_stream_sample_pct,
         "success_state": policy.success_state,
         "on_retryable_state": policy.on_retryable_state,
@@ -271,6 +301,7 @@ def resolve_run_agent_effective_policy(
         if not isinstance(override, dict):
             continue
         for field in (
+            "max_agent_seconds",
             "max_changed_files",
             "max_added_lines",
             "max_retryable_attempts",
@@ -279,6 +310,12 @@ def resolve_run_agent_effective_policy(
         ):
             if field in override:
                 effective[field] = max(int(override[field]), 0)
+        if "known_test_failure_allowlist" in override:
+            merged = [
+                *list(effective.get("known_test_failure_allowlist") or []),
+                *list(override["known_test_failure_allowlist"] or []),
+            ]
+            effective["known_test_failure_allowlist"] = dedupe_string_list(merged)
         if "skills_mode" in override:
             value = str(override["skills_mode"]).strip()
             if value in {"off", "agentpr"}:
@@ -294,4 +331,30 @@ def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]
             out[key] = deep_merge(base_value, value)
             continue
         out[key] = value
+    return out
+
+
+def parse_string_list(value: Any, *, field_name: str) -> list[str]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValueError(f"Invalid manager policy {field_name}: expected array")
+    out: list[str] = []
+    for item in value:
+        text = str(item).strip()
+        if not text:
+            continue
+        out.append(text)
+    return dedupe_string_list(out)
+
+
+def dedupe_string_list(values: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in values:
+        text = str(item).strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        out.append(text)
     return out

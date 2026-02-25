@@ -1,0 +1,13 @@
+[Unit]
+Description=Run AgentPR webhook audit alert check every 10 minutes
+
+[Timer]
+OnBootSec=3m
+OnUnitActiveSec=10m
+AccuracySec=30s
+Persistent=true
+Unit=agentpr-webhook-audit-alert.service
+
+[Install]
+WantedBy=timers.target
+
