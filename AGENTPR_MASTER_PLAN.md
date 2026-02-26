@@ -1,7 +1,7 @@
 # AgentPR Master Plan (Manager-Worker Final Target)
 
-> 更新时间：2026-02-25（含架构审计）
-> 状态：Phase B1-B3 已落地，架构审计发现"复杂度分配错位"，需重心转向 LLM 智能层
+> 更新时间：2026-02-26（C1 测试完成 + 混合分级策略确认 + 文档一致性修复）
+> 状态：Phase C1 首次测试完成（HKUDS/DeepCode），进入 C1 迭代 + C2 准备。
 > 目标：人只通过 bot 与系统交互，manager 持续编排 worker 完成 OSS 小改动 PR 流程（默认 `push_only` + 人工 PR gate）
 
 ---
@@ -50,40 +50,132 @@
 2. 先做 swarm 并发（会放大环境/依赖/成本问题）。
 3. 过早追求 Web 控制台（当前 Telegram 足够）。
 
-### 3.3 OpenClaw 的客观位置
+### 3.3 OpenClaw 的架构启示（深入分析后更新）
 
-1. OpenClaw 更像“聊天入口网关 + 个人助理控制面”。
-2. 其文档明确是 one-user trusted operator 模型，不是默认多租户安全边界。
-3. 可借鉴其“对话入口”体验，但 PR 生命周期编排核心仍应由我们现有 orchestrator 负责。
+**OpenClaw 核心架构原则**：”The hard problem in personal AI agents is not the agent loop itself, but everything around it.”
+
+**对 AgentPR 的关键启示：**
+
+| 设计点 | OpenClaw 做法 | AgentPR 当前 | AgentPR 应借鉴 |
+|--------|-------------|-------------|---------------|
+| 谁是大脑 | LLM agent（Pi runtime） | Rules engine + LLM 橡皮章 | Manager 应是真正的 LLM agent with tools |
+| Gateway 角色 | 薄层：消息路由 + 会话管理 | 厚层：状态机 + 规则决策 + regex 分析 | Orchestrator 应退化为薄层：持久化 + gate |
+| Skills | Markdown 文件，agent 自己决定何时调用 | Orchestrator 按状态注入 skill prompt | Worker 自主调用 skill（保护上下文窗口） |
+| 主动性 | Heartbeat 模式：定时检查 checklist | 被动（用户查询为主） | Manager 定时巡检 + 主动通知 |
+| 状态 | append-only 事件日志 + 自动压缩 | SQLite + 13 状态机 | 保留 SQLite，简化状态 |
+
+**不照搬的部分**：OpenClaw 是”个人助理”，不是 PR 生命周期编排器。状态持久化、CI 反馈闭环、安全 gate 等能力 OpenClaw 不提供，仍由我们自建。
+
+**核心转变**：从 `Rules (大脑) → LLM (橡皮章) → Worker (手脚)` 转为 `LLM (大脑) → Rules (安全护栏) → Worker (自主执行)`。
 
 ---
 
-## 4. 目标架构（最终形态）
+## 4. 目标架构（最终形态，基于 OpenClaw 启发修订）
 
 ```
 Human (Telegram NL + /commands)
         |
         v
-Bot Adapter (command parser + NL router)
+Bot Gateway (薄层：消息路由 + 认证 + 频率限制)
         |
         v
-Manager LLM (API function-calling)
+Manager Agent (LLM with tools — 系统大脑)
+  |-- tool: create_run(repo, task)
+  |-- tool: get_run_status(run_id)
+  |-- tool: get_global_stats()
+  |-- tool: execute_worker(run_id, instructions)
+  |-- tool: analyze_worker_output(run_id, event_stream)
+  |-- tool: triage_review_comment(run_id, comment_body)
+  |-- tool: suggest_retry_strategy(run_id, diagnosis)
+  |-- tool: notify_user(message, priority)
+  |-- tool: propose_iteration(run_id, patch_draft)
+        |
+        v (安全约束层，不是决策层)
+Orchestrator (薄层：状态持久化 + gate 执法 + 事件日志)
+  |-- 硬约束：PR 创建需人工确认
+  |-- 硬约束：merge 永远人工
+  |-- 硬约束：diff budget / retry 上限
+  |-- 硬约束：sandbox 模式
         |
         v
-Orchestrator (state machine + events + policy + gates)
-        |
-        v
-Worker Agent (codex exec + skills)
+Worker Agent (codex exec — 自主执行，内部管理阶段)
+  |-- 内部 skill-1: 分析仓库 (preflight contract)
+  |-- 内部 skill-2: 实现 + 验证
+  |-- 内部 skill-3: CI/review 修复 (可选，按需)
+  |-- Worker 自己决定阶段流转和 skill 调用顺序
         |
         v
 Repo workspace + GitHub
 ```
 
-### 4.1 角色边界（必须锁定）
+### 4.1 角色边界（修订版）
 
-1. Manager LLM：做“决策与调度”，不直接改代码。
-2. Worker：做“代码与验证”，不负责全局策略。
-3. Orchestrator：做“唯一状态真相源 + 幂等事件 + 门禁执法”。
+1. **Manager Agent**：真正的 LLM 大脑。做决策、分析、策略生成、主动通知。通过 tools 与 Orchestrator 交互，不直接改代码。
+2. **Orchestrator**：薄层基础设施。做状态持久化、gate 执法、事件日志。不做决策。
+3. **Worker**：自主执行。在一次任务中内部管理多阶段（分析→实现→验证），自行调用 skills。Orchestrator 只看最终结果。
+
+### 4.2 与旧架构的核心差异
+
+| 维度 | 旧架构 | 新架构 |
+|------|--------|--------|
+| 大脑 | Rules engine (`manager_decision.py`) | Manager LLM (带 tools 的 agent) |
+| LLM 角色 | 从 N 选 1 的橡皮章 | 真正的决策者（分析、策略、解释） |
+| 状态机 | 13 个状态，外部微管理 worker 阶段 | 7 个状态，worker 内部管理子阶段 |
+| Skills | Orchestrator 注入到 prompt | Worker 自主调用，保护上下文窗口 |
+| 失败分析 | 1,400 行 regex | 混合：Rules 提取证据 + 硬护栏，LLM 做语义诊断 + 策略 |
+| 通知 | 被动（用户查询） | 主动（Manager 判断何时通知） |
+| 硬约束 | 分散在 rules/analysis/policy 各处 | 集中在 Orchestrator 薄层 |
+
+### 4.3 目标状态机（简化版）
+
+```
+QUEUED → EXECUTING → PUSHED → CI_WAIT → REVIEW_WAIT → DONE
+                                  ↕           ↕
+                              ITERATING ← ─ ─ ┘
++ PAUSED (任何非终态可暂停)
++ NEEDS_HUMAN (升级人工)
++ FAILED (终态)
+```
+
+8 个状态（当前 13 个）。
+
+**合并依据：**
+- DISCOVERY + PLAN_READY + IMPLEMENTING + LOCAL_VALIDATING → **EXECUTING**（worker 内部管理分析→实现→验证子阶段）
+- FAILED_RETRYABLE + FAILED_TERMINAL → **FAILED**（重试决策由 Manager Agent 判断，不需要两个失败状态）
+- SKIPPED 合并到 FAILED（metadata 区分 `reason=skipped`）
+
+**保留的外部生命周期状态（不能合并）：**
+- PUSHED / CI_WAIT / REVIEW_WAIT / ITERATING — 对应不同的外部交互阶段
+- PAUSED / NEEDS_HUMAN — 人工控制点
+
+**迁移策略（旧 run 兼容）：**
+1. Phase C3 执行时，新旧状态并存期：旧 run 继续使用 13 状态，新 run 使用 8 状态。
+2. DB 层通过 `schema_version` 字段区分新旧 run。
+3. 状态映射表用于旧 run 的只读查询：`DISCOVERY|PLAN_READY|IMPLEMENTING|LOCAL_VALIDATING → EXECUTING`，`FAILED_RETRYABLE|FAILED_TERMINAL|SKIPPED → FAILED`。
+4. 不做旧 run 的批量迁移——旧 run 只读冻结，新 run 用新状态。
+
+### 4.4 Contract 的定位修订
+
+**Contract 是什么**：Skill-1（分析仓库）的输出。描述要改哪些文件、跑什么测试、遵守什么规则。
+
+**当前问题**：
+1. 实际产出大多是 `status: bootstrap` 的空壳（worker 分析阶段常遇环境问题）。
+2. PLAN_READY 作为人工审核 contract 的 gate——在新架构中没有意义。
+
+**修订后的定位**：
+1. Contract 保留为 skill-1 的内部产物（指导 skill-2 执行）。
+2. 不再作为 orchestrator 的外部 gate。
+3. Worker 在 EXECUTING 内部：skill-1 产出 contract → 如有 blocker 则停止报告 NEEDS_HUMAN → 无 blocker 则直接进 skill-2。
+4. 人不需要审核 contract，只在 worker 报告 blocker 时介入。
+
+### 4.5 Preflight 的定位确认
+
+**事实**：Preflight 检查完全是通用的（自动检测 Python/JS 项目类型和工具链），无 repo-specific 硬编码。
+
+**在新架构中的位置**：
+1. Preflight 仍在 worker 执行之前运行（环境健康检查）。
+2. 但不需要作为独立的顶层状态——它是 EXECUTING 的前置检查。
+3. Preflight 失败 → EXECUTING 状态直接报告 NEEDS_HUMAN 或 FAILED。
 
 ---
 
@@ -151,9 +243,9 @@ NL 请求流程：
 
 ---
 
-## 7. Manager Action Contract（最小集合）
+## 7. Manager Action Contract（当前 → 目标）
 
-MVP 仅开放下列 actions：
+### 7.1 当前动作集（与 13 状态机对应，Phase C1/C2 期间仍在使用）
 
 1. `list_runs(limit)`
 2. `show_run(run_id)`
@@ -171,7 +263,28 @@ MVP 仅开放下列 actions：
 14. `resume_run(run_id, target_state)`
 15. `retry_run(run_id, target_state)`
 
-约束：
+### 7.2 目标动作集（与 8 状态机对应，Phase C3 完成后切换）
+
+1. `list_runs(limit)`
+2. `show_run(run_id)`
+3. `create_run(owner, repo, task_description)`
+4. `execute_worker(run_id, instructions)` — 替代 start_discovery/run_prepare/start_implementation/run_agent_step
+5. `analyze_worker_output(run_id)` — 混合分级：rules 证据提取 + LLM 语义判断（替代纯 regex 分级）
+6. `run_finish(run_id, changes, commit_title)`
+7. `request_open_pr(run_id, title, body_file)`
+8. `approve_open_pr(run_id, request_file, confirm_token, confirm=true)`
+9. `pause_run(run_id)`
+10. `resume_run(run_id, target_state)`
+11. `retry_run(run_id, strategy)` — strategy 由 LLM 生成，不是固定重置
+12. `get_global_stats()` — 新增
+13. `notify_user(message, priority)` — 新增
+14. `suggest_retry_strategy(run_id, diagnosis)` — 新增
+
+### 7.3 迁移策略
+
+Phase C2 期间新旧动作集并行（A/B 切换）。C3 完成后旧动作集退役。
+
+约束（始终有效）：
 1. Manager 不能调用任意 shell。
 2. 只能调用白名单 action。
 3. action 参数必须通过 JSON schema 验证。
@@ -236,7 +349,7 @@ MVP 仅开放下列 actions：
 
 | 场景 | 当前做法 | 目标做法 | 价值 |
 |------|----------|----------|------|
-| **失败原因分析** | runtime_analysis.py 1,400行 regex 分类 | LLM 读 event stream 摘要 + 结构化证据，输出诊断 | 替代大量脆弱 regex，理解语义 |
+| **失败原因分析** | runtime_analysis.py 1,400行 regex 分类 | **混合**：Rules 提取客观证据 + 硬护栏；LLM 读证据包做语义诊断和策略建议 | Rules 保证可审计，LLM 提供语义理解 |
 | **重试策略生成** | 硬编码 retry→DISCOVERY 或 IMPLEMENTING | LLM 基于失败原因，生成修改后的 prompt 或建议 | 智能重试而非盲重试 |
 | **Decision Card 的 why** | 机器规则文本（`reason_code` 直译） | LLM 用 2-3 句话解释”为什么到这一步，你需要做什么” | 人可读的运营建议 |
 | **Review comment 处理** | webhook→ITERATING，盲目重跑 worker | LLM 读评论内容，判断：改代码？回复解释？忽略 nitpick？ | 智能分流 |
@@ -259,7 +372,7 @@ MVP 仅开放下列 actions：
 
 | 场景 | 处理方式 |
 |------|----------|
-| runtime grading（PASS/RETRYABLE/HUMAN_REVIEW） | LLM 基于证据判断分级，但安全违规一律 HUMAN_REVIEW 不交 LLM |
+| runtime grading（PASS/RETRYABLE/HUMAN_REVIEW） | **混合策略**：Rules 提取证据包（test_commands, diff_stats, exit_code, has_test_infra 等），LLM 基于证据包 + 固定评分标准做语义分级。硬护栏（sandbox 违规、diff 超限）由 rules 强制执行，LLM 不可覆盖 |
 | diff 合理性（语义层面） | LLM 判断改动是否符合意图，但 diff budget 上限仍硬执行 |
 | 是否需要人工介入 | LLM 建议，但 PUSHED/NEEDS_HUMAN_REVIEW gate 仍硬执行 |
 
@@ -272,47 +385,84 @@ MVP 仅开放下列 actions：
 
 ---
 
-## 11. 分阶段实施计划（直接通向最终形态）
+## 11. 分阶段实施计划（修订版：B 系列已完成，进入 C 系列）
 
-## Phase B1（先做，低风险）
+### 已完成回顾
 
-1. 新增 `manager_decision.py`：规则版 next_action 决策。
-2. 新增 `manager_loop.py`：自动推进 run 生命周期。
-3. Bot 保持命令式，先接 manager loop。
+- **Phase B1** ✅：规则版 manager loop + 自动推进。
+- **Phase B2** ✅：Manager LLM function-calling 适配层（rules/llm/hybrid）。
+- **Phase B3** ✅：Telegram NL 路由 + 会话绑定。
+- **Phase B4**：部分完成（skills-feedback 有产物，但闭环未接通）。
 
-验收：
-1. 单 run 可以自动从 `QUEUED` 推进到 `PUSHED/NEEDS_HUMAN_REVIEW`。
-2. 全程无需人工敲 CLI。
+### Phase C 系列（架构转型）
 
-## Phase B2（核心升级）
+## Phase C1：跑通第一个真实 PR（最高优先级，不改架构）
 
-1. 新增 `manager_llm.py`：API function-calling 适配层（Forge provider）。
-2. 在 `manager_decision` 增加 `mode=rules|llm|hybrid`。
-3. 所有 manager 输出必须 schema 校验。
+1. 用现有架构，选一个 baseline repo（mem0 或 dexter），完整跑通 QUEUED → PUSHED → PR 创建 → CI 通过。
+2. 记录全流程的阻塞点、手动干预点、失败模式。
+3. 基于真实数据建立基线指标：成功率、平均 attempt 数、平均耗时、常见失败 reason_code。
 
-验收：
-1. 同一条自然语言请求可稳定转为合法 action。
-2. 不合法 action 被拒绝并返回可解释错误。
+验收：至少 1 个 PR 被成功创建并通过 CI review。
 
-## Phase B3（你要的体验层）
+为什么先做这个：不用真实数据验证，所有架构调整都是猜测。
 
-1. Telegram 增加 NL 路由：命令优先，NL fallback 到 manager。
-2. 支持“连续对话上下文 + run 绑定”。
-3. 保持 `/command` 完整可用作为强控制通道。
+## Phase C2：引入 Manager Agent（LLM with tools）
 
-验收：
-1. 仅通过 Telegram 自然语言即可发起和跟踪 run。
-2. 审批动作仍需显式确认。
-
-## Phase B4（迭代闭环）
-
-1. 将 `skills-feedback` 接入 manager 的迭代提案。
-2. 自动产出 prompt/skill patch 草案。
-3. 人工审批后再应用。
+1. 新建 `manager_agent.py`：Manager 成为真正的 LLM agent，拥有结构化 tools。
+2. 保留现有 rules 作为 fallback（新旧并行，A/B 切换）。
+3. Manager Agent tools 最小集：
+   - `create_run`、`get_run_status`、`execute_worker`
+   - `analyze_worker_output`（混合分级：rules 提取证据 + LLM 做语义判断，替代纯 regex 分级）
+   - `get_global_stats`（全局运营看板）
+   - `notify_user`（主动通知）
+4. 硬约束仍在 Orchestrator 层执行，Manager Agent 无法绕过。
 
 验收：
-1. 每次 run 结束都有“可执行改进项”。
-2. 迭代建议可追踪到具体失败模式。
+1. Manager Agent 能自主推进 run 到 PUSHED，决策质量 >= rules 版。
+2. 失败时能给出比 reason_code 更有价值的诊断和建议。
+
+## Phase C3：Worker 自主 skill 调用 + 状态机简化
+
+1. 重构 worker prompt：worker 在一次 codex exec 中自主管理多阶段（分析→实现→验证）。
+2. Skills 从”orchestrator 外部注入”改为”worker 内部可调用”，每个 skill 保护独立上下文。
+3. 合并 DISCOVERY/PLAN_READY/IMPLEMENTING 为 EXECUTING 状态。
+4. 状态机从 13 → 7 个状态。
+
+验收：
+1. 单次 codex exec 调用能完成”分析+实现+测试”全流程。
+2. 状态机简化后，现有 gate/通知/GitHub 集成不受影响。
+
+## Phase C4：瘦身 + 运营闭环
+
+1. 删除被 Manager Agent 替代的 rules 逻辑（`manager_decision.py` 中的确定性映射）。
+2. 简化 runtime_analysis.py：保留证据提取 + 硬护栏，分级判断由 Manager Agent LLM 层承担（混合策略，非全替换）。
+3. 接通迭代闭环：Manager Agent 基于失败模式生成 prompt/policy 改进草案。
+4. 全局统计看板产品化。
+
+验收：
+1. orchestrator 代码量显著下降（目标 < 8K 行）。
+2. 每次 run 结束，Manager 能给出可执行的改进建议。
+
+### 11.1 Skills 设计修订
+
+**原始设计意图（恢复）：**
+Worker 在一次任务执行中，自主决定调用哪个 skill：
+```
+Worker 收到任务 “integrate Forge into mem0”
+  → Worker 调用 skill-1: 分析仓库结构 + 生成 contract
+  → 基于分析结果，Worker 调用 skill-2: 实现代码 + 跑测试
+  → 如果测试失败，Worker 可选调用 skill-3: 修复
+  → 每个 skill 是独立上下文，保护窗口
+```
+
+**当前实现偏差：**
+Orchestrator 外部控制 skill 注入（按状态映射 skill → 构建 task packet → 注入 prompt），Worker 没有选择权。
+
+**修订方向：**
+- Skill 仍作为 markdown 定义（保留可读性和可编辑性）。
+- 安装到 worker 可访问的路径（保持）。
+- 但调用决策权还给 worker：worker prompt 中列出可用 skills + 使用条件，worker 自主判断何时调用。
+- Orchestrator 不再按状态注入 skill，只传递任务描述 + 安全约束。
 
 ---
 
@@ -338,7 +488,7 @@ MVP 仅开放下列 actions：
 
 未完成（按架构审计优先级重排）：
 1. **LLM 在正确位置发挥智能**（最高优先级）：
-   - runtime grading 引入 LLM 判断层（替代 ~800 行 regex 分类）。
+   - runtime grading 引入 LLM 判断层（混合策略：rules 提取证据 + 硬护栏，LLM 做语义分级，替代纯 regex 分类）。
    - Decision Card `why_llm` 增强层（可操作解释 + 具体建议）。
    - review comment 智能分流（读评论内容，判断改代码/回复/忽略）。
    - 重试策略 LLM 化（基于失败诊断生成修改过的 prompt）。
@@ -396,45 +546,133 @@ MVP 仅开放下列 actions：
 
 ---
 
-## 14. 对话沉淀 Insights（保留）
+## 14. 对话沉淀 Insights（持续更新）
 
+**早期实践（保留）：**
 1. 先解决主矛盾：闭环决策，不是堆框架。
 2. “控制面稳定 > 执行面花哨”。
 3. 最小改动能力来自：prompt + policy + gate 的协同，而不是单次模型能力。
-4. 运行成功率的核心是环境与规则证据，不是“更强模型名”。
+4. 运行成功率的核心是环境与规则证据，不是”更强模型名”。
 5. 可观测要分层：日常看 digest，失败看 event stream。
 
----
-
-## 15. 下一步（基于架构审计重新排序）
-
-### 优先级 1：让 LLM 做真正的决策（当前最大短板）
-
-1. **runtime grading 引入 LLM 判断层**：保留结构化证据提取（event stream 解析、test 命令计数、diff 统计），但分级决策（PASS/RETRYABLE/HUMAN_REVIEW）改为 LLM 基于证据输出，安全违规保持硬覆盖。目标：替换 ~800 行 regex 分类逻辑。
-2. **Decision Card 接入 `why_llm`**：LLM 基于 run_digest 证据，生成 2-3 句可操作解释和具体建议选项（不是泛化的 "human review"）。
-3. **Review comment 智能分流**：webhook 收到 review 后，LLM 读评论内容，输出分流建议（改代码 / 回复解释 / nitpick 忽略），通知用户确认后执行。
-
-### 优先级 2：简化控制面（降低维护成本）
-
-4. **评估状态机精简**：考虑合并 DISCOVERY/PLAN_READY/IMPLEMENTING 为更粗粒度的 EXECUTING 状态，worker 内部管理子阶段。降低状态转移复杂度。
-5. **评估 Skills 系统必要性**：如果 skills 只是预打包 prompt，考虑直接用 prompt template 版本管理替代 skill 安装/发现机制。
-
-### 优先级 3：运营体验
-
-6. 增加全局运营看板（CLI/Bot）：通过数、等待 PR 数、阻塞分布、最近 24h 失败率。
-7. 主动通知策略调优：通知优先级、静默窗口、重复提醒阈值。
-8. bot 会话上下文持久化（SQLite）。
-
-### 优先级 4：闭环迭代
-
-9. `skills-feedback` → prompt/policy patch 草案（默认人工审批）。
-10. 重试策略 LLM 化：失败后 LLM 基于诊断结果，生成调整过的 prompt 或策略建议，而非盲重试。
+**架构审计后新增（2026-02-25）：**
+6. 系统应该简单，但不应过于简单。度的把握：安全和持久化不能简化，决策逻辑应交给 LLM。
+7. “精密工厂管理聪明工人”是反模式。应该是”轻量生产线 + 自主工人 + 关键检查点”。
+8. 复杂度应该投资在”智能”上（失败分析、策略生成、运营汇报），而不是在”控制”上（每个状态的合法动作列表）。
+9. OpenClaw 的核心启示：LLM 应该是大脑（with tools），不是规则引擎的附属品。
+10. Skills 的正确用法是 worker 自主调用（保护上下文），不是 orchestrator 外部注入。
+11. 如果做的不对，再大的代价也是最小的代价。先用真实数据验证，再做架构调整。
+12. 另一个 LLM 的合理反馈：不要为改架构而改架构，先跑通第一个 PR 再说。基线数据是一切决策的基础。
+13. Contract（skill-1 产出的施工合同）概念正确，但不应作为人工审核 gate。Worker 内部产出、内部消费。有 blocker 时 worker 自己停止报告。
+14. Preflight 检查是通用的（自动检测项目类型和工具链），对任何新 repo 都适用。
+15. 状态机的复杂度来自真实问题（环境失败、异步 CI、不同失败类型），不是凭空设计。但部分状态可以内化到 worker（分析/计划/实现）或 Manager Agent（重试策略）。
+16. C1 测试验证了两个关键判断：(a) `min_test_commands` 硬性要求不适用于所有项目——DeepCode 没有测试基础设施，pre-commit 已是最佳验证；(b) skill-1 作为独立外部产物无增量价值——worker 在同一次执行中做分析+实现效果更好。
+17. 工具细节决定成败：rg 默认跳过 `.github/` 隐藏目录导致 worker 看不到 PR template。这类问题需要在 prompt 或 prepare 脚本中修复（加 `--hidden` 或用 `find`）。
+18. runtime 分级的正确策略是混合：Rules 做证据提取 + 硬护栏（不可被 LLM 覆盖），LLM 做语义判断（基于固定评分标准）。不是全替换 regex，是分层。
 
 ---
 
-## 16. 架构审计记录（2026-02-25 全量代码审查）
+## 15. 下一步（直接执行清单）
 
-### 16.1 代码量分布
+**立即执行（C1 迭代 — 修复已知问题后再跑）：**
+1. ~~选 mem0，用现有架构完整跑通一个 PR~~（已完成首次测试：HKUDS/DeepCode，结果 NEEDS_HUMAN_REVIEW/missing_test_evidence）
+2. 修复 rg 隐藏目录问题：worker prompt 或 prepare 脚本中的 `rg --files -g '.github/...'` 加 `--hidden`，或改用 `find`。
+3. 选第 2 个 repo 再跑一次，验证修复效果 + 收集跨 repo 数据。
+4. 基于 2+ 次真实数据建立基线。
+
+**C1 稳定后（Phase C2 — 混合分级优先）：**
+5. 构建 `analyze_worker_output` 混合分级：rules 提取证据包 + LLM 按固定评分标准做语义分级。
+6. 构建 Manager Agent（LLM with tools），与现有 rules 并行运行（A/B 切换）。
+7. 首批 tools：`analyze_worker_output`、`get_global_stats`、`notify_user`。
+8. Decision Card 接入 `why_llm`。
+
+**C2 验证后（Phase C3）：**
+9. Worker 自主 skill 调用改造。
+10. 状态机简化（13 → 8）+ 迁移策略。
+
+**长期（Phase C4）：**
+11. 瘦身：删除被 Manager Agent 替代的纯 regex 分级代码（保留证据提取 + 硬护栏）。
+12. 迭代闭环产品化。
+13. 全局运营看板。
+
+---
+
+## 16. C1 测试记录（2026-02-26）
+
+### 16.1 测试运行
+
+| 项 | 值 |
+|-----|-----|
+| Run ID | `run_2e642ed9c2f2` |
+| 目标 Repo | HKUDS/DeepCode |
+| 最终状态 | `NEEDS_HUMAN_REVIEW` |
+| 原因 | `missing_test_evidence` |
+| 持续时间 | 369s (~6min) |
+| Worker 退出码 | 0 |
+| 代码改动 | 4 files, +48/-10 |
+| Token 消耗 | 2.48M input, 18.7K output |
+| Skills 模式 | `off` |
+| 执行方式 | CLI (`create-run` + `run-manager-loop`) |
+
+### 16.2 Worker 实际表现
+
+**做得好的：**
+- Fork + clone + branch 创建 ✅
+- Preflight 通过 (119ms) ✅
+- 正确分析了 DeepCode 的 LLM 架构，判断走 OpenAI 兼容路径 ✅
+- Forge 集成方案合理（env fallback + base_url，不新建 provider class） ✅
+- 文档和配置示例都更新了 ✅
+- pre-commit hooks 全部通过 ✅
+
+**做得不好的：**
+- 搜索 `.github/pull_request_template.md` 时用了 `rg --files -g '.github/pull_request_template*'`，但 rg 默认跳过隐藏目录 → 没找到 PR template → 不知道 checklist 要求
+- 没有尝试运行项目测试（但 DeepCode 实际上没有测试基础设施，所以这不影响结果正确性）
+
+### 16.3 暴露的系统问题
+
+| 问题 | 严重度 | 说明 |
+|------|--------|------|
+| **rg 不搜索 `.github/`** | 高 | Worker prompt 引导用 `rg --files -g '.github/...'`，但 rg 默认排除隐藏目录。需加 `--hidden` 或改用 `find` |
+| **`min_test_commands: 1` 太刚性** | 高 | DeepCode 没有测试基础设施（无 tests/、无 pytest 依赖、CI 只跑 lint），但系统强制要求至少 1 个测试命令。正确做法：混合分级 |
+| **通知未触发** | 低 | CLI 测试模式不启动 bot 守护进程，所以停在 NEEDS_HUMAN_REVIEW 时无通知。生产模式下 bot 会触发通知（已确认代码逻辑正确） |
+
+### 16.4 Skill-1（检查阶段）对 Skill-2（实现阶段）的实际帮助评估
+
+本次 skills_mode=off，Worker 在一次执行中自主完成分析 + 实现。观察：
+
+1. **分析思路有价值**：Worker 按 prompt_template.md Phase 0.5 + Phase 1 做了分析，正确判断了 common path（OpenAI 兼容）vs special path，找到最相似 provider 模式。
+2. **但 skill-1 作为独立产物（contract）的增量价值 ≈ 0**：之前 smoke test 的 contract 输出都是 `status: bootstrap` 空壳，没有给 skill-2 提供有用的结构化信息。
+3. **上下文连续性更重要**：Worker 在同一次执行中做分析和实现，分析结果直接在上下文中被实现阶段使用，不需要外部 contract 中转。
+
+**结论**：验证了 skill-1 → skill-2 应是 worker 内部连续调用（保护上下文窗口），不是 orchestrator 外部分阶段管理。Contract 可以是 worker 内部笔记，不需要作为外部 gate。
+
+### 16.5 混合分级策略（C1 驱动的设计确认）
+
+基于 C1 测试暴露的 `min_test_commands` 问题，确认分级策略：
+
+**Rules 层（确定性，不可被 LLM 覆盖）：**
+- 证据提取：test_commands、lint_commands、exit_code、diff_stats、has_test_directory、has_test_dependencies、ci_workflows
+- 硬护栏：max_changed_files、max_added_lines、sandbox 违规、已知安全模式
+
+**LLM 层（语义判断，基于固定评分标准）：**
+
+输入：Rules 层的证据包 + worker 最终消息
+
+固定评分标准（prompt 内置，不因 worker 输出变化）：
+1. 项目是否有测试基础设施？（tests/ dir + test deps + test CI workflow）
+2. 如果有 → worker 是否执行了对应测试？
+3. 如果没有 → worker 是否做了合理替代验证？（lint, pre-commit, type check）
+4. 改动范围与风险等级是否匹配？（文档改动 vs 核心逻辑改动）
+5. PR template 要求是否满足？（需要 worker 能找到 PR template — 修复 rg 问题）
+6. Worker 自评与实际证据是否一致？
+
+输出：PASS / NEEDS_REVIEW / FAIL + 原因说明
+
+---
+
+## 17. 架构审计记录（2026-02-25 全量代码审查）
+
+### 17.1 代码量分布
 
 | 文件 | 行数 | 角色 |
 |------|------|------|
@@ -457,7 +695,7 @@ MVP 仅开放下列 actions：
 | **orchestrator 合计** | **12,385** | |
 | **全项目合计** | **~16,600** | 含 forge_integration、skills、deploy |
 
-### 16.2 核心发现
+### 17.2 核心发现
 
 **复杂度分配：**
 - 确定性控制（状态机 + 规则 + regex + policy）：~70% 代码量
@@ -467,12 +705,12 @@ MVP 仅开放下列 actions：
 **关键判断：**
 
 1. **Manager LLM 增量价值极低**：`manager_decision.py` 的 rules 已 100% 覆盖所有 state→action 映射。每个状态几乎只有 1 个合法动作 + `WAIT_HUMAN`。LLM 在此处的决策空间 ≈ 0。
-2. **runtime_analysis.py 是最大的"用规则做 LLM 的活"**：1,400 行 regex 做失败分类，但 worker 的 event stream 包含丰富语义——LLM 能更好地理解"为什么失败、怎么修复"。
+2. **runtime_analysis.py 需要混合策略**：1,400 行 regex 做失败分类过于刚性（如 `min_test_commands` 无法处理"项目没有测试基础设施"的情况）。正确做法：Rules 保留证据提取 + 硬护栏（sandbox、diff budget），LLM 层做语义分级和策略建议。不是全替换，是分层。
 3. **13 个状态过多**：DISCOVERY → PLAN_READY → IMPLEMENTING 本质是 worker 执行的子阶段，不需要顶层状态机介入。Manager 在这三个状态的决策都是"继续推进"。
 4. **Skills 是一层间接但非必要的抽象**：316 行代码的核心价值 = 在不同阶段给 worker 不同 prompt 片段，直接在 prompt template 中实现更简单。
 5. **与"直接让 codex 全接管"的对比**：codex 单独做不了状态持久化、PR 生命周期、CI 反馈闭环、安全 gate——这些是 orchestrator 的真正价值。但 orchestrator 当前过度微管理 worker 的判断（`min_test_commands`、`max_changed_files`），worker 自身比 regex 更能判断"改动是否合理"。
 
-### 16.3 与外部系统对比
+### 17.3 与外部系统对比
 
 | 系统 | 架构模式 | 对 AgentPR 的启示 |
 |------|----------|-------------------|
@@ -483,7 +721,7 @@ MVP 仅开放下列 actions：
 
 **结论**：行业趋势是"编排层做生命周期管理和安全约束，智能决策交给 LLM"。AgentPR 当前反过来了——编排层承担了太多决策逻辑。
 
-### 16.4 整体评价
+### 17.4 整体评价
 
 | 维度 | 评分 | 说明 |
 |------|------|------|
@@ -498,7 +736,7 @@ MVP 仅开放下列 actions：
 
 ---
 
-## 17. 参考资料（用于架构校准）
+## 18. 参考资料（用于架构校准）
 
 1. OpenAI Function Calling：<https://platform.openai.com/docs/guides/function-calling>
 2. OpenAI Structured Outputs：<https://platform.openai.com/docs/guides/structured-outputs>

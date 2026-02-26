@@ -11,3 +11,5 @@ orchestrator/data/task_packets/*.json
 workspaces/
 .agentpr_runtime/
 .tmp_vendor_skills/
+
+data/
