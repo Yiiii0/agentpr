@@ -14,10 +14,11 @@ DEFAULT_MANAGER_POLICY: dict[str, Any] = {
         "max_added_lines": 150,
         "max_retryable_attempts": 3,
         "min_test_commands": 1,
+        "runtime_grading_mode": "hybrid",
         "known_test_failure_allowlist": [],
         "success_event_stream_sample_pct": 15,
-        "success_state": "LOCAL_VALIDATING",
-        "on_retryable_state": "FAILED_RETRYABLE",
+        "success_state": "EXECUTING",
+        "on_retryable_state": "FAILED",
         "on_human_review_state": "NEEDS_HUMAN_REVIEW",
         "repo_overrides": {},
     },
@@ -46,6 +47,7 @@ class RunAgentPolicy:
     max_added_lines: int
     max_retryable_attempts: int
     min_test_commands: int
+    runtime_grading_mode: str
     known_test_failure_allowlist: list[str]
     success_event_stream_sample_pct: int
     success_state: str
@@ -102,7 +104,7 @@ def load_manager_policy(path: Path) -> ManagerPolicy:
         )
 
     skills_mode = str(run_agent.get("skills_mode", "off"))
-    if skills_mode not in {"off", "agentpr"}:
+    if skills_mode not in {"off", "agentpr", "agentpr_autonomous"}:
         raise ValueError(
             "Invalid manager policy run_agent_step.skills_mode: "
             f"{skills_mode}"
@@ -113,6 +115,14 @@ def load_manager_policy(path: Path) -> ManagerPolicy:
     max_agent_seconds = max(int(run_agent.get("max_agent_seconds", 900)), 0)
     max_retryable_attempts = max(int(run_agent.get("max_retryable_attempts", 3)), 0)
     min_test_commands = max(int(run_agent.get("min_test_commands", 1)), 0)
+    runtime_grading_mode = str(
+        run_agent.get("runtime_grading_mode", "hybrid")
+    ).strip()
+    if runtime_grading_mode not in {"rules", "hybrid", "hybrid_llm"}:
+        raise ValueError(
+            "Invalid manager policy run_agent_step.runtime_grading_mode: "
+            f"{runtime_grading_mode}"
+        )
     known_test_failure_allowlist = parse_string_list(
         run_agent.get("known_test_failure_allowlist", []),
         field_name="run_agent_step.known_test_failure_allowlist",
@@ -123,18 +133,18 @@ def load_manager_policy(path: Path) -> ManagerPolicy:
     )
 
     success_state = normalize_target_state(
-        run_agent.get("success_state", "LOCAL_VALIDATING"),
-        allowed={"LOCAL_VALIDATING", "NEEDS_HUMAN_REVIEW", "UNCHANGED"},
+        run_agent.get("success_state", "EXECUTING"),
+        allowed={"EXECUTING", "NEEDS_HUMAN_REVIEW", "UNCHANGED"},
         name="run_agent_step.success_state",
     )
     on_retryable_state = normalize_target_state(
-        run_agent.get("on_retryable_state", "FAILED_RETRYABLE"),
-        allowed={"FAILED_RETRYABLE", "NEEDS_HUMAN_REVIEW", "UNCHANGED"},
+        run_agent.get("on_retryable_state", "FAILED"),
+        allowed={"FAILED", "NEEDS_HUMAN_REVIEW", "UNCHANGED"},
         name="run_agent_step.on_retryable_state",
     )
     on_human_review_state = normalize_target_state(
         run_agent.get("on_human_review_state", "NEEDS_HUMAN_REVIEW"),
-        allowed={"FAILED_RETRYABLE", "NEEDS_HUMAN_REVIEW", "UNCHANGED"},
+        allowed={"FAILED", "NEEDS_HUMAN_REVIEW", "UNCHANGED"},
         name="run_agent_step.on_human_review_state",
     )
     repo_overrides = parse_repo_overrides(run_agent.get("repo_overrides", {}))
@@ -167,6 +177,7 @@ def load_manager_policy(path: Path) -> ManagerPolicy:
             max_added_lines=max_added_lines,
             max_retryable_attempts=max_retryable_attempts,
             min_test_commands=min_test_commands,
+            runtime_grading_mode=runtime_grading_mode,
             known_test_failure_allowlist=known_test_failure_allowlist,
             success_event_stream_sample_pct=success_event_stream_sample_pct,
             success_state=success_state,
@@ -215,7 +226,7 @@ def parse_repo_overrides(value: Any) -> dict[str, dict[str, Any]]:
         "success_event_stream_sample_pct",
     }
     allowed_list_fields = {"known_test_failure_allowlist"}
-    allowed_str_fields = {"skills_mode"}
+    allowed_str_fields = {"skills_mode", "runtime_grading_mode"}
     out: dict[str, dict[str, Any]] = {}
     for raw_key, raw_override in value.items():
         key = normalize_repo_override_key(raw_key)
@@ -254,13 +265,23 @@ def parse_repo_overrides(value: Any) -> dict[str, dict[str, Any]]:
                     ),
                 )
                 continue
-            skills_mode = str(raw_field_value).strip()
-            if skills_mode not in {"off", "agentpr"}:
-                raise ValueError(
-                    "Invalid manager policy run_agent_step.repo_overrides."
-                    f"{raw_key}.skills_mode: {skills_mode}"
-                )
-            parsed[field_name] = skills_mode
+            field_value = str(raw_field_value).strip()
+            if field_name == "skills_mode":
+                if field_value not in {"off", "agentpr", "agentpr_autonomous"}:
+                    raise ValueError(
+                        "Invalid manager policy run_agent_step.repo_overrides."
+                        f"{raw_key}.skills_mode: {field_value}"
+                    )
+                parsed[field_name] = field_value
+                continue
+            if field_name == "runtime_grading_mode":
+                if field_value not in {"rules", "hybrid", "hybrid_llm"}:
+                    raise ValueError(
+                        "Invalid manager policy run_agent_step.repo_overrides."
+                        f"{raw_key}.runtime_grading_mode: {field_value}"
+                    )
+                parsed[field_name] = field_value
+                continue
         out[key] = parsed
     return out
 
@@ -286,6 +307,7 @@ def resolve_run_agent_effective_policy(
         "max_added_lines": policy.max_added_lines,
         "max_retryable_attempts": policy.max_retryable_attempts,
         "min_test_commands": policy.min_test_commands,
+        "runtime_grading_mode": policy.runtime_grading_mode,
         "known_test_failure_allowlist": list(policy.known_test_failure_allowlist),
         "success_event_stream_sample_pct": policy.success_event_stream_sample_pct,
         "success_state": policy.success_state,
@@ -306,10 +328,17 @@ def resolve_run_agent_effective_policy(
             "max_added_lines",
             "max_retryable_attempts",
             "min_test_commands",
+            "runtime_grading_mode",
             "success_event_stream_sample_pct",
         ):
-            if field in override:
-                effective[field] = max(int(override[field]), 0)
+            if field not in override:
+                continue
+            if field == "runtime_grading_mode":
+                value = str(override[field]).strip()
+                if value in {"rules", "hybrid", "hybrid_llm"}:
+                    effective[field] = value
+                continue
+            effective[field] = max(int(override[field]), 0)
         if "known_test_failure_allowlist" in override:
             merged = [
                 *list(effective.get("known_test_failure_allowlist") or []),
@@ -318,7 +347,7 @@ def resolve_run_agent_effective_policy(
             effective["known_test_failure_allowlist"] = dedupe_string_list(merged)
         if "skills_mode" in override:
             value = str(override["skills_mode"]).strip()
-            if value in {"off", "agentpr"}:
+            if value in {"off", "agentpr", "agentpr_autonomous"}:
                 effective["skills_mode"] = value
     return effective
 

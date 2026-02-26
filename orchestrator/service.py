@@ -8,7 +8,13 @@ from pathlib import Path
 from typing import Any
 
 from .db import Database
-from .models import EventInput, EventType, RunCreateInput, RunState, StepName
+from .models import (
+    EventInput,
+    EventType,
+    RunCreateInput,
+    RunState,
+    StepName,
+)
 from .state_machine import InvalidTransitionError, assert_transition, is_terminal
 
 
@@ -259,13 +265,25 @@ class OrchestratorService:
 
     def list_runs(self, limit: int = 50) -> list[dict[str, Any]]:
         with self.db.transaction() as conn:
-            return self.db.list_runs(conn, limit=limit)
+            rows = self.db.list_runs(conn, limit=limit)
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["display_state"] = str(item.get("current_state") or RunState.QUEUED.value)
+            out.append(item)
+        return out
 
     def get_run_snapshot(self, run_id: str) -> dict[str, Any]:
-        return self.db.get_run_snapshot(run_id)
+        snapshot = self.db.get_run_snapshot(run_id)
+        snapshot["display_state"] = snapshot["state"]
+        return snapshot
 
     def get_run_snapshot_by_pr_number(self, pr_number: int) -> dict[str, Any] | None:
-        return self.db.get_run_snapshot_by_pr_number(pr_number)
+        snapshot = self.db.get_run_snapshot_by_pr_number(pr_number)
+        if snapshot is None:
+            return None
+        snapshot["display_state"] = snapshot["state"]
+        return snapshot
 
     def get_run_snapshot_by_repo_and_pr_number(
         self,
@@ -274,11 +292,15 @@ class OrchestratorService:
         repo: str,
         pr_number: int,
     ) -> dict[str, Any] | None:
-        return self.db.get_run_snapshot_by_repo_and_pr_number(
+        snapshot = self.db.get_run_snapshot_by_repo_and_pr_number(
             owner=owner,
             repo=repo,
             pr_number=pr_number,
         )
+        if snapshot is None:
+            return None
+        snapshot["display_state"] = snapshot["state"]
+        return snapshot
 
     def list_artifacts(
         self,
@@ -445,6 +467,7 @@ class OrchestratorService:
                     "duplicate": True,
                     "run_id": event.run_id,
                     "state": current_state.value,
+                    "display_state": current_state.value,
                     "event_type": event.event_type.value,
                 }
 
@@ -492,6 +515,7 @@ class OrchestratorService:
                 "duplicate": False,
                 "run_id": event.run_id,
                 "state": current_state.value,
+                "display_state": current_state.value,
                 "event_type": event.event_type.value,
             }
 
@@ -505,8 +529,8 @@ class OrchestratorService:
         payload = event.payload
 
         if event_type == EventType.COMMAND_START_DISCOVERY:
-            if current_state in {RunState.QUEUED, RunState.PAUSED, RunState.FAILED_RETRYABLE}:
-                return RunState.DISCOVERY, None
+            if current_state in {RunState.QUEUED, RunState.PAUSED, RunState.FAILED}:
+                return RunState.EXECUTING, None
             return None, None
 
         if event_type == EventType.WORKER_DISCOVERY_COMPLETED:
@@ -514,16 +538,22 @@ class OrchestratorService:
                 raise InvalidTransitionError(
                     "Discovery cannot complete from QUEUED; start discovery first."
                 )
-            return RunState.PLAN_READY, None
+            if current_state in {
+                RunState.EXECUTING,
+                RunState.ITERATING,
+                RunState.PAUSED,
+            }:
+                return RunState.EXECUTING, None
+            return None, None
 
         if event_type == EventType.COMMAND_START_IMPLEMENTATION:
-            if current_state in {RunState.PLAN_READY, RunState.ITERATING, RunState.PAUSED}:
-                return RunState.IMPLEMENTING, None
+            if current_state in {RunState.EXECUTING, RunState.ITERATING, RunState.PAUSED}:
+                return RunState.EXECUTING, None
             return None, None
 
         if event_type == EventType.COMMAND_LOCAL_VALIDATION_PASSED:
-            if current_state in {RunState.IMPLEMENTING, RunState.ITERATING, RunState.PAUSED}:
-                return RunState.LOCAL_VALIDATING, None
+            if current_state in {RunState.EXECUTING, RunState.ITERATING, RunState.PAUSED}:
+                return RunState.EXECUTING, None
             return None, None
 
         if event_type == EventType.WORKER_PUSH_COMPLETED:
@@ -538,7 +568,7 @@ class OrchestratorService:
             message = payload.get("error_message", "")
             if current_state == RunState.PUSHED:
                 return RunState.NEEDS_HUMAN_REVIEW, f"{step}:{reason_code}:{message}"
-            return RunState.FAILED_RETRYABLE, f"{step}:{reason_code}:{message}"
+            return RunState.FAILED, f"{step}:{reason_code}:{message}"
 
         if event_type == EventType.GITHUB_CHECK_COMPLETED:
             conclusion = str(payload.get("conclusion", "")).lower()
@@ -567,13 +597,17 @@ class OrchestratorService:
                 raise InvalidTransitionError(f"Cannot pause terminal state: {current_state}")
             return RunState.PAUSED, None
 
-        if event_type in {EventType.COMMAND_RESUME, EventType.COMMAND_RETRY}:
-            target = RunState(payload["target_state"])
+        if event_type == EventType.COMMAND_RESUME:
+            target = self._normalize_legacy_target(RunState(payload["target_state"]))
+            return target, None
+
+        if event_type == EventType.COMMAND_RETRY:
+            target = self._normalize_legacy_target(RunState(payload["target_state"]))
             return target, None
 
         if event_type == EventType.TIMER_TIMEOUT:
             step = payload.get("step", "unknown")
-            return RunState.FAILED_RETRYABLE, f"timeout:{step}"
+            return RunState.FAILED, f"timeout:{step}"
 
         return None, None
 
@@ -582,6 +616,24 @@ class OrchestratorService:
         if run is None:
             raise RunNotFoundError(f"Run not found: {run_id}")
         return run
+
+    @staticmethod
+    def _normalize_legacy_target(target: RunState) -> RunState:
+        """Map legacy V1 target states to their V2 equivalents."""
+        if target in {
+            RunState.DISCOVERY,
+            RunState.PLAN_READY,
+            RunState.IMPLEMENTING,
+            RunState.LOCAL_VALIDATING,
+        }:
+            return RunState.EXECUTING
+        if target in {
+            RunState.FAILED_RETRYABLE,
+            RunState.FAILED_TERMINAL,
+            RunState.SKIPPED,
+        }:
+            return RunState.FAILED
+        return target
 
     @staticmethod
     def _key(event_type: EventType, run_id: str, payload: dict[str, Any]) -> str:

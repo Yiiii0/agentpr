@@ -1,7 +1,7 @@
 # AgentPR Master Plan (Manager-Worker Final Target)
 
-> 更新时间：2026-02-26（C1 测试完成 + 混合分级策略确认 + 文档一致性修复）
-> 状态：Phase C1 首次测试完成（HKUDS/DeepCode），进入 C1 迭代 + C2 准备。
+> 更新时间：2026-02-26（C2 LLM 语义分级接入 + C3 V2 唯一路径 + 代码精简 + 文档全面刷新）
+> 状态：C2 + C3 核心已完成。LLM 语义分级→confidence routing→通知已接入决策循环。V2 为唯一路径。下一步：C1 第二轮真实验证 + C4 瘦身。
 > 目标：人只通过 bot 与系统交互，manager 持续编排 worker 完成 OSS 小改动 PR 流程（默认 `push_only` + 人工 PR gate）
 
 ---
@@ -29,7 +29,7 @@
 2. 不是缺”更多日志”，而是缺”可执行决策输入”到下一步动作的自动路由。
 3. 不是缺”多 agent 并发”，而是缺”单 run 高质量稳定完成率”。
 4. 当前最直接的稳定性风险是”runtime 分级误判”会把本可继续的 run 过早打到 `NEEDS_HUMAN_REVIEW`。
-5. **复杂度分配错位**：12K 行 orchestrator 代码中，~70% 是确定性控制（状态机、规则决策、regex 分析），而真正需要智能的地方（失败分析、重试策略、review 处理、运营汇报）仍是规则或空白。Manager LLM 当前仅做”从 N 选 1 选择题”，增量价值极低。
+5. **复杂度分配改善中**：14.5K 行 orchestrator 代码中，~60% 是确定性控制（状态机、规则决策、regex 分析），~12% 是 LLM 智能层（语义分级 + confidence routing + 解释）。Manager LLM 已有实质性决策参与，但失败诊断、重试策略等高阶智能仍待补齐。
 6. **抽象层过多**：worker 最终收到的就是一个 prompt string，但经过 5 层构建（prompt → skills → task packet → safety contract → executor）。
 
 结论：方向正确，不需要推翻重写；但当前优先级应从”补更多控制逻辑”转向”让 LLM 在正确的位置发挥智能”。
@@ -147,12 +147,6 @@ QUEUED → EXECUTING → PUSHED → CI_WAIT → REVIEW_WAIT → DONE
 **保留的外部生命周期状态（不能合并）：**
 - PUSHED / CI_WAIT / REVIEW_WAIT / ITERATING — 对应不同的外部交互阶段
 - PAUSED / NEEDS_HUMAN — 人工控制点
-
-**迁移策略（旧 run 兼容）：**
-1. Phase C3 执行时，新旧状态并存期：旧 run 继续使用 13 状态，新 run 使用 8 状态。
-2. DB 层通过 `schema_version` 字段区分新旧 run。
-3. 状态映射表用于旧 run 的只读查询：`DISCOVERY|PLAN_READY|IMPLEMENTING|LOCAL_VALIDATING → EXECUTING`，`FAILED_RETRYABLE|FAILED_TERMINAL|SKIPPED → FAILED`。
-4. 不做旧 run 的批量迁移——旧 run 只读冻结，新 run 用新状态。
 
 ### 4.4 Contract 的定位修订
 
@@ -280,10 +274,6 @@ NL 请求流程：
 13. `notify_user(message, priority)` — 新增
 14. `suggest_retry_strategy(run_id, diagnosis)` — 新增
 
-### 7.3 迁移策略
-
-Phase C2 期间新旧动作集并行（A/B 切换）。C3 完成后旧动作集退役。
-
 约束（始终有效）：
 1. Manager 不能调用任意 shell。
 2. 只能调用白名单 action。
@@ -345,17 +335,19 @@ Phase C2 期间新旧动作集并行（A/B 切换）。C3 完成后旧动作集�
 
 ## 10.1 LLM 能力边界（细化版，基于代码审计）
 
-### 应使用 LLM（当前严重不足的高价值场景）
+### 应使用 LLM（高价值场景进度表）
 
-| 场景 | 当前做法 | 目标做法 | 价值 |
-|------|----------|----------|------|
-| **失败原因分析** | runtime_analysis.py 1,400行 regex 分类 | **混合**：Rules 提取客观证据 + 硬护栏；LLM 读证据包做语义诊断和策略建议 | Rules 保证可审计，LLM 提供语义理解 |
-| **重试策略生成** | 硬编码 retry→DISCOVERY 或 IMPLEMENTING | LLM 基于失败原因，生成修改后的 prompt 或建议 | 智能重试而非盲重试 |
-| **Decision Card 的 why** | 机器规则文本（`reason_code` 直译） | LLM 用 2-3 句话解释”为什么到这一步，你需要做什么” | 人可读的运营建议 |
-| **Review comment 处理** | webhook→ITERATING，盲目重跑 worker | LLM 读评论内容，判断：改代码？回复解释？忽略 nitpick？ | 智能分流 |
-| **Contract 质量判断** | 仅检查字段是否存在 | LLM 判断 contract 与 repo 实际结构是否匹配 | 减少 bootstrap 合约导致的空跑 |
-| **全局运营汇报** | 无 | LLM 综合所有 run 状态，输出优先级排序和行动建议 | 你要的”智能经理”体验 |
-| **NL → action 路由** | 已有，基本可用 | 保持，可接入更丰富的上下文 | 已落地 |
+| 场景 | 状态 | 当前做法 | 目标做法 |
+|------|------|----------|----------|
+| **语义分级** | ✅ 已完成 | `hybrid_llm` 模式：rules 证据 + LLM `grade_worker_output` → PASS/NEEDS_REVIEW/FAIL + confidence | — |
+| **Confidence routing** | ✅ 已完成 | `ManagerRunFacts.latest_worker_confidence` → 低信心 PASS 升级人工 | — |
+| **Decision Card why_llm** | ✅ 已完成 | `explain_decision_card` → 双层展示 why_machine + why_llm + suggested_actions | — |
+| **NL → action 路由** | ✅ 已完成 | bot 双模路由 + manager LLM intent 解析 | — |
+| **通知** | 🔶 部分完成 | `notify_user` artifact 已在 loop 中产生 | 需 artifact → Telegram 推送桥接 |
+| **失败原因分析** | ❌ 未开始 | runtime_analysis.py 1,746 行 regex 分类 | 混合：Rules 证据 + LLM 语义诊断和策略建议 |
+| **重试策略生成** | ❌ 未开始 | 硬编码 retry → EXECUTING | LLM 基于失败原因生成修改后的 prompt |
+| **Review comment 处理** | ❌ 未开始 | webhook → ITERATING，盲目重跑 | LLM 读评论，判断改代码/回复/忽略 |
+| **全局运营汇报** | 🔶 部分完成 | `get_global_stats` 已实现（数据层） | 需接入 bot `/overview` 展示 + LLM 生成汇报 |
 
 ### 不应使用 LLM（当前做法正确，保持）
 
@@ -486,51 +478,62 @@ Orchestrator 外部控制 skill 注入（按状态映射 skill → 构建 task p
 15. Manager LLM 决策上下文已接入精简 `run_digest` 证据摘要（classification/validation/diff/attempt/recommendation）。
 16. Bot 已具备关键状态主动通知（`PUSHED`/`NEEDS_HUMAN_REVIEW`/`DONE`/GitHub 反馈触发的 `ITERATING`），并做去重落盘。
 
-未完成（按架构审计优先级重排）：
-1. **LLM 在正确位置发挥智能**（最高优先级）：
-   - runtime grading 引入 LLM 判断层（混合策略：rules 提取证据 + 硬护栏，LLM 做语义分级，替代纯 regex 分类）。
-   - Decision Card `why_llm` 增强层（可操作解释 + 具体建议）。
+已完成（本轮新增，2026-02-26）：
+19. V1 双轨代码删除：`StateSchemaVersion`、`_resolve_target_v1`、所有 V1/V2 分支逻辑清理（~250 行）。
+20. LLM 解析函数合并：4 个 `_parse_*_from_response` → 1 个 `_extract_tool_call_payload`（-86 行）。
+21. LLM 语义分级接入决策循环：`grade_worker_output()` → confidence → `ManagerRunFacts` → 低信心 PASS 升级人工，NEEDS_REVIEW 升级。
+22. `notify_user()` 自动触发：RUN_FINISH / RETRY / action 失败后记录 `manager_notification` artifact。
+23. Telegram 清理：删除死函数 `extract_repo_ref_from_text`、`default_execution_target_state` → `DEFAULT_TARGET_STATE` 常量。
+
+未完成（按优先级重排，反映当前真实状态）：
+1. **C1 第二轮真实验证**（最高优先级）：
+   - 选第 2 个 repo 跑完整 QUEUED → PUSHED → PR 流程，验证 V2 状态机 + 混合分级在真实场景的表现。
+   - 收集跨 repo 基线数据（成功率、attempt 数、耗时、失败分布）。
+2. **LLM 高阶智能补齐**（C4 前置）：
+   - ~~runtime grading LLM 判断层~~（已完成：`hybrid_llm` 模式 + confidence routing）。
+   - ~~Decision Card `why_llm`~~（已完成）。
    - review comment 智能分流（读评论内容，判断改代码/回复/忽略）。
-   - 重试策略 LLM 化（基于失败诊断生成修改过的 prompt）。
-2. **控制面简化**（降低维护成本）：
-   - 评估状态机精简（13 → 6-7 状态）。
-   - 评估 Skills 系统必要性（是否可用 prompt template 替代）。
-3. **运营体验**：
-   - 全局运营看板（通过数/等待PR数/阻塞分布/失败率）。
-   - 主动通知策略调优。
-   - bot 会话上下文持久化。
-4. **闭环迭代**：
-   - `skills-feedback` → prompt/policy patch 草案。
-   - bot 审计日志结构化。
+   - 失败诊断策略生成（基于失败证据，LLM 生成修改后的 prompt 或 retry 建议）。
+3. **C4 瘦身**（降低维护成本）：
+   - `cli.py`（4,628 行）拆分为子模块。
+   - `runtime_analysis.py`（1,746 行）：保留证据提取 + 硬护栏，分级判断迁移到 Manager LLM 层。
+   - `telegram_bot.py`（1,977 行）handler 扁平化。
+   - 删除被 Manager Agent 替代的纯 rules 分级代码。
+   - 目标：orchestrator < 10K 行（当前 14,510 行）。
+4. **运营闭环**：
+   - 全局运营看板产品化（数据已有：`get_global_stats`，缺展示层）。
+   - bot 会话上下文持久化（当前内存态）。
+   - `skills-feedback` → prompt/policy patch 草案闭环。
 
 ---
 
 ## 12.1 系统级对照（按你的目标验收）
 
-目标能力 A：你用自然语言下发任务，manager 自动完成到 `PUSHED/PR gate`  
-1. 当前状态：部分达成。NL 已可触发 `create_runs`、`manager_tick`；自动推进依赖常驻 loop。  
-2. 缺口：需要把“bot 收到 create 后持续跟踪并主动汇报”固化为常驻行为（不是一次性命令响应）。
+目标能力 A：你用自然语言下发任务，manager 自动完成到 `PUSHED/PR gate`
+1. 当前状态：**大部分达成**。NL 触发 `create_runs` → manager loop 自动推进 → PUSHED/gate。V2 状态机简化了推进路径。
+2. 缺口：常驻 loop 仍需手动启动（`run-manager-loop`），未做 systemd/cron 常驻化。
 
-目标能力 B：你问“现在什么情况”，系统能给全局态势 + 下一步  
-1. 当前状态：部分达成。`/overview` + `/show` 已有状态与决策卡。  
-2. 缺口：缺全局 KPI（通过数/等待 PR 数/阻塞分布/近 24h 失败率）与“下一步优先级队列”。
+目标能力 B：你问”现在什么情况”，系统能给全局态势 + 下一步
+1. 当前状态：**部分达成**。`/overview` + `/show` + Decision Card（双层 why_machine + why_llm）。`get_global_stats` 已实现（pass_rate、state_counts、top_reason_codes）。
+2. 缺口：`get_global_stats` 未接入 bot `/overview` 展示。缺”下一步优先级队列”。
 
-目标能力 C：run 结束/失败/需审批时，系统主动通知你  
-1. 当前状态：未完全达成。现在主要是你主动查询。  
-2. 缺口：缺“状态变更触发通知策略”和通知去重（避免刷屏）。
+目标能力 C：run 结束/失败/需审批时，系统主动通知你
+1. 当前状态：**基础达成**。Bot 有关键状态主动通知（PUSHED/NEEDS_HUMAN_REVIEW/DONE/ITERATING）+ 去重落盘。Manager loop 在 RUN_FINISH/RETRY/失败后自动记录 `manager_notification` artifact。
+2. 缺口：`manager_notification` artifact 产生了但尚未推送到 Telegram（缺 artifact→bot 推送桥接）。
 
-目标能力 D：PR review comments 到来后，系统主动问你“人工介入还是自动修复”  
-1. 当前状态：基础具备。Webhook/Sync 能把状态推进到 `ITERATING`。  
-2. 缺口：缺 bot 主动决策对话层（通知 + 可选动作 + 一键执行）。
+目标能力 D：PR review comments 到来后，系统主动问你”人工介入还是自动修复”
+1. 当前状态：基础具备。Webhook/Sync → `ITERATING` 状态推进。
+2. 缺口：缺 LLM review comment 分流（判断改代码/回复/忽略）和 bot 主动决策对话层。
 
-目标能力 E：manager 按收益判断是否做 prompt/skill 自我迭代，并交你审批  
-1. 当前状态：基础具备。已有 `skills-metrics/skills-feedback`。  
-2. 缺口：缺“自动提案 -> 审批 -> 应用”的闭环执行器与审批历史追踪。
+目标能力 E：manager 按收益判断是否做 prompt/skill 自我迭代，并交你审批
+1. 当前状态：基础具备。已有 `skills-metrics/skills-feedback`。
+2. 缺口：缺”自动提案 → 审批 → 应用”闭环执行器。
 
-系统结论：
-1. 架构方向正确，且和你的最终目标一致。
-2. 当前短板不是 worker 基础能力，而是 manager 的”主动运营层”尚未完全产品化。
-3. **架构审计补充判断**：更深层的短板是”复杂度放错了地方”——12K 行中大部分在确定性控制，而真正需要智能的场景（失败分析、review 处理、运营汇报）仍是空白或规则驱动。下一阶段应优先让 LLM 在正确的位置发挥能力，而非继续堆控制逻辑。
+系统结论（更新）：
+1. 架构方向正确，C2+C3 显著推进了 manager 智能层。
+2. **关键进展**：LLM 不再只是”橡皮章”——语义分级 + confidence routing 让 manager 能做出有依据的分流决策（高信心 PASS → push，低信心 → 升级人工，NEEDS_REVIEW → 等待）。这是从”规则驱动”到”智能辅助”的实质性一步。
+3. **当前短板**：(a) 缺第二轮真实验证数据——所有改进仍基于 C1 单次 DeepCode 测试；(b) 代码量从 12K 涨到 14.5K（新增 C2 模块），C4 瘦身是实际需求而非美观追求；(c) 通知 artifact 产生了但最后一公里（推到 Telegram）未连通。
+4. **复杂度分配已改善**：LLM 智能层从 ~5% 上升到 ~12%（manager_llm + manager_agent + manager_tools = 1,076 行），但确定性控制仍占 ~60%。C4 的目标是让这个比例更接近目标架构（控制面薄层 + 智能面厚层）。
 
 ---
 
@@ -570,30 +573,61 @@ Orchestrator 外部控制 skill 注入（按状态映射 skill → 构建 task p
 17. 工具细节决定成败：rg 默认跳过 `.github/` 隐藏目录导致 worker 看不到 PR template。这类问题需要在 prompt 或 prepare 脚本中修复（加 `--hidden` 或用 `find`）。
 18. runtime 分级的正确策略是混合：Rules 做证据提取 + 硬护栏（不可被 LLM 覆盖），LLM 做语义判断（基于固定评分标准）。不是全替换 regex，是分层。
 
+**LLM 接入后新增（2026-02-26）：**
+19. Confidence routing 是"LLM 辅助决策"的正确中间态：不是让 LLM 完全替代 rules，而是让 LLM 提供 confidence，rules 根据 confidence 做分流。安全兜底在 rules，语义理解在 LLM。
+20. "先删后加"比"边加边删"安全：先清理 V1 双轨 → 再接通 LLM，避免在冗余代码上叠加新逻辑导致理解困难。
+21. 代码量增长不等于膨胀：C2 是新增功能，增长正常。但超过 14K 行时维护成本明显上升，C4 瘦身是实际需求。
+22. 通知"最后一公里"容易被忽略：产生 artifact 只是一半，推送到用户（Telegram）才是闭环。这类"看似完成实则断链"的问题需要端到端验证发现。
+23. 每次真实测试 > 10 次代码审查。C1 一次 DeepCode 测试暴露的 rg 隐藏目录问题，比任何静态审查都有效。第二轮验证是当前最高优先级。
+
 ---
 
 ## 15. 下一步（直接执行清单）
 
 **立即执行（C1 迭代 — 修复已知问题后再跑）：**
 1. ~~选 mem0，用现有架构完整跑通一个 PR~~（已完成首次测试：HKUDS/DeepCode，结果 NEEDS_HUMAN_REVIEW/missing_test_evidence）
-2. 修复 rg 隐藏目录问题：worker prompt 或 prepare 脚本中的 `rg --files -g '.github/...'` 加 `--hidden`，或改用 `find`。
+2. ~~修复 rg 隐藏目录问题：worker prompt 或 prepare 脚本中的 `rg --files -g '.github/...'` 加 `--hidden`，或改用 `find`~~（已实现：prompt_template 二次搜索统一使用 `--hidden` + `find .github` fallback；skills-mode task packet 新增 deterministic governance scan）
 3. 选第 2 个 repo 再跑一次，验证修复效果 + 收集跨 repo 数据。
 4. 基于 2+ 次真实数据建立基线。
 
 **C1 稳定后（Phase C2 — 混合分级优先）：**
-5. 构建 `analyze_worker_output` 混合分级：rules 提取证据包 + LLM 按固定评分标准做语义分级。
-6. 构建 Manager Agent（LLM with tools），与现有 rules 并行运行（A/B 切换）。
-7. 首批 tools：`analyze_worker_output`、`get_global_stats`、`notify_user`。
-8. Decision Card 接入 `why_llm`。
+5. ~~构建 `analyze_worker_output` 混合分级：rules 提取证据包 + LLM 按固定评分标准做语义分级。~~（已实现 v1：`runtime_grading_mode=rules|hybrid|hybrid_llm`；`hybrid` 支持“无测试基础设施 + 有替代验证”语义放行；`hybrid_llm` 在有 manager API key 时启用 LLM 评分）
+6. ~~构建 Manager Agent（LLM with tools），与现有 rules 并行运行（A/B 切换）。~~（骨架已实现：`manager_agent.py` 接入 `manager_loop`，`rules|llm|hybrid` 决策统一由 agent 执行。已接入：LLM worker 语义分级（grade_worker_output）→ confidence 传入 ManagerRunFacts → 低信心 PASS 升级人工审核，NEEDS_REVIEW 直接升级；notify_user 在 RUN_FINISH / RETRY / 失败后自动发送通知。）
+7. ~~首批 tools：`analyze_worker_output`、`get_global_stats`、`notify_user`。~~（已实现工具模块 + CLI 命令：`analyze-worker-output`、`get-global-stats`、`notify-user`；manager loop LLM facts 已注入 tool 输出）
+8. ~~Decision Card 接入 `why_llm`。~~（已实现 Telegram Decision Card 双层展示：`why_machine` + `why_llm`（可选，配置 LLM 时生效），并附 `suggested_actions_llm`）
+9. ~~补齐本地 bot/human 演练链路。~~（已实现 `simulate-bot-session` CLI：复用 Telegram 同一套 command + NL handler，可离线演练 `/show`、NL 路由、Decision Card 展示）
+10. ~~修复 Decision Card 模式在 NL 路由不一致问题。~~（已修复：`decision_why_mode`/`decision_llm_client` 透传到 NL rules/LLM 分支，命令输入与自然语言输入展示一致）
 
 **C2 验证后（Phase C3）：**
-9. Worker 自主 skill 调用改造。
-10. 状态机简化（13 → 8）+ 迁移策略。
+11. ~~Worker 自主 skill 调用改造（v1）。~~（已实现 `agentpr_autonomous`：worker 在单次 run-agent-step 内自主管理 preflight-contract/implement-validate；manager 在 `DISCOVERY|PLAN_READY` 直接调度 `run_agent_step`）
+12. ~~状态机简化（13 → 8）。~~（已完成：V1 双轨代码已删除，V2 为唯一路径。`StateSchemaVersion`、`_resolve_target_v1`、所有 V1/V2 分支逻辑已清理。Legacy 状态值保留在 enum 中仅用于读旧 DB。）
 
-**长期（Phase C4）：**
-11. 瘦身：删除被 Manager Agent 替代的纯 regex 分级代码（保留证据提取 + 硬护栏）。
-12. 迭代闭环产品化。
-13. 全局运营看板。
+**C2+C3 后续落地（2026-02-26 完成）：**
+13. ~~LLM 语义分级接入决策循环。~~（已完成：`grade_worker_output` → confidence → ManagerRunFacts → 低信心 PASS 升级人工 / NEEDS_REVIEW 升级。）
+14. ~~notify_user 接入 manager loop。~~（已完成：RUN_FINISH / RETRY / 失败后自动记录通知 artifact。）
+15. ~~LLM 解析函数去重。~~（已完成：4→1 提取方法。）
+16. ~~V1 双轨代码删除。~~（已完成：~250 行 V1 分支逻辑删除。）
+17. ~~Telegram 死代码清理。~~（已完成：删除未使用函数，内联常量。）
+
+**接下来（按优先级排序）：**
+
+P0 — C1 第二轮真实验证：
+18. 选第 2 个 repo（建议 mem0），跑完整 QUEUED → PUSHED → PR 流程。重点验证：V2 状态机、混合分级（hybrid_llm）、confidence routing。
+19. 基于 2 次真实数据建立基线指标。
+
+P1 — 通知最后一公里 + 运营看板：
+20. `manager_notification` artifact → Telegram 推送桥接。
+21. `get_global_stats` 接入 bot `/overview`。
+
+P2 — LLM 高阶智能：
+22. review comment 智能分流（`triage_review_comment` tool）。
+23. 失败诊断策略生成（`suggest_retry_strategy` tool）。
+
+P3 — C4 瘦身：
+24. `cli.py` 拆分（4,628 行 → 多子模块）。
+25. `runtime_analysis.py` 分级逻辑迁移到 LLM 层（保留证据提取 + 硬护栏）。
+26. `telegram_bot.py` handler 扁平化。
+27. 目标：orchestrator < 10K 行。
 
 ---
 
@@ -668,47 +702,64 @@ Orchestrator 外部控制 skill 注入（按状态映射 skill → 构建 task p
 
 输出：PASS / NEEDS_REVIEW / FAIL + 原因说明
 
+### 16.6 DeepCode 当前进度标记（2026-02-26）
+
+1. 代码已提交并推送到分支：`feature/forge-20260225-195854`
+2. 最新 commit：`e38b1a1`（`Add Forge API fallback support`）
+3. `request-open-pr` 已生成请求文件：`run_2e642ed9c2f2_pr_open_request_20260226T030531274170Z.json`
+4. `approve-open-pr` 在严格 gate 下被拦截（`runtime_not_pass` + `insufficient_test_evidence`），与当前 C1 规则一致。
+5. 使用 `--allow-dod-bypass` 的尝试触发网络错误（`error connecting to api.github.com`），随后 run 已人工冻结到 `PAUSED`。
+6. 结论：该 repo 的 C1 范围（代码改动 + push + PR gate 流程验证）已完成；PR 语义生成与混合分级留给 C2 处理。
+
 ---
 
 ## 17. 架构审计记录（2026-02-25 全量代码审查）
 
-### 17.1 代码量分布
+### 17.1 代码量分布（2026-02-26 更新）
 
-| 文件 | 行数 | 角色 |
-|------|------|------|
-| cli.py | 4,093 | CLI 命令入口（15+ 命令） |
-| telegram_bot.py | 1,904 | Bot 双模控制面 |
-| runtime_analysis.py | 1,423 | 运行分级与证据提取 |
-| service.py | 606 | 事件与状态服务 |
-| db.py | 578 | SQLite 持久化 |
-| manager_loop.py | 558 | 自动推进循环 |
-| github_webhook.py | 539 | Webhook 接收 |
-| manager_llm.py | 512 | LLM 客户端 |
-| executor.py | 488 | Worker 执行器 |
-| preflight.py | 434 | 环境预检 |
-| manager_policy.py | 360 | 策略加载与合并 |
-| skills.py | 316 | 技能发现与 task packet |
-| manager_decision.py | 176 | 规则决策引擎 |
-| state_machine.py | 142 | 状态转移图 |
-| github_sync.py | 113 | GitHub 状态同步 |
-| models.py | 86 | 数据模型 |
-| **orchestrator 合计** | **12,385** | |
-| **全项目合计** | **~16,600** | 含 forge_integration、skills、deploy |
+| 文件 | 行数 | 变化 | 角色 |
+|------|------|------|------|
+| cli.py | 4,628 | +535 | CLI 命令入口（15+ 命令） |
+| telegram_bot.py | 1,977 | +73 | Bot 双模控制面 |
+| runtime_analysis.py | 1,746 | +323 | 运行分级与证据提取（含 hybrid/hybrid_llm） |
+| manager_llm.py | 727 | +215 | LLM 客户端（decide/grade/explain，4 工具） |
+| service.py | 658 | +52 | 事件与状态服务（V2 唯一路径） |
+| skills.py | 653 | +337 | 技能发现与 task packet（含 autonomous） |
+| manager_loop.py | 641 | +83 | 自动推进循环（含 LLM 分级 + 通知） |
+| db.py | 592 | +14 | SQLite 持久化 |
+| github_webhook.py | 539 | — | Webhook 接收 |
+| executor.py | 488 | — | Worker 执行器 |
+| preflight.py | 434 | — | 环境预检 |
+| manager_policy.py | 389 | +29 | 策略加载与合并 |
+| manager_decision.py | 260 | +84 | 规则决策（含 confidence 分流） |
+| manager_tools.py | 187 | 新增 | Manager 工具（analyze/stats/notify） |
+| state_machine.py | 170 | +28 | 状态转移图（含 V2 转移） |
+| manager_agent.py | 162 | 新增 | Manager Agent（rules/llm/hybrid 决策） |
+| github_sync.py | 113 | — | GitHub 状态同步 |
+| models.py | 89 | +3 | 数据模型（V2 唯一路径） |
+| codex_bin.py | 51 | — | Codex 二进制发现 |
+| **orchestrator 合计** | **14,510** | **+2,125** | |
+
+**代码量变化分析**：
+- 新增模块 +349 行：`manager_agent.py`（162）+ `manager_tools.py`（187）— 这是 C2 Manager Agent 的核心新增，是目标架构要求的。
+- 增长最大的文件：`cli.py`（+535）、`skills.py`（+337）、`runtime_analysis.py`（+323）— 主要是 C2 功能（autonomous skills、hybrid grading、V2 状态支持）。
+- 删除代码 ~400 行：V1 双轨逻辑、LLM 解析重复代码、死函数。
+- **净增 +2,125 行反映了 C2 功能的实际复杂度**。C4 瘦身的目标是将总量压缩到 <10K。
 
 ### 17.2 核心发现
 
-**复杂度分配：**
-- 确定性控制（状态机 + 规则 + regex + policy）：~70% 代码量
-- LLM 智能层：~5% 代码量（manager_llm.py 仅做"从 N 选 1"）
-- 基础设施（DB + CLI + Bot + webhook）：~25% 代码量
+**复杂度分配（2026-02-26 更新）：**
+- 确定性控制（状态机 + 规则 + regex + policy）：~60% 代码量（从 ~70% 下降）
+- LLM 智能层：~12% 代码量（`manager_llm` 727 + `manager_agent` 162 + `manager_tools` 187 = 1,076 行）
+- 基础设施（DB + CLI + Bot + webhook）：~28% 代码量
 
-**关键判断：**
+**关键判断（更新版）：**
 
-1. **Manager LLM 增量价值极低**：`manager_decision.py` 的 rules 已 100% 覆盖所有 state→action 映射。每个状态几乎只有 1 个合法动作 + `WAIT_HUMAN`。LLM 在此处的决策空间 ≈ 0。
-2. **runtime_analysis.py 需要混合策略**：1,400 行 regex 做失败分类过于刚性（如 `min_test_commands` 无法处理"项目没有测试基础设施"的情况）。正确做法：Rules 保留证据提取 + 硬护栏（sandbox、diff budget），LLM 层做语义分级和策略建议。不是全替换，是分层。
-3. **13 个状态过多**：DISCOVERY → PLAN_READY → IMPLEMENTING 本质是 worker 执行的子阶段，不需要顶层状态机介入。Manager 在这三个状态的决策都是"继续推进"。
-4. **Skills 是一层间接但非必要的抽象**：316 行代码的核心价值 = 在不同阶段给 worker 不同 prompt 片段，直接在 prompt template 中实现更简单。
-5. **与"直接让 codex 全接管"的对比**：codex 单独做不了状态持久化、PR 生命周期、CI 反馈闭环、安全 gate——这些是 orchestrator 的真正价值。但 orchestrator 当前过度微管理 worker 的判断（`min_test_commands`、`max_changed_files`），worker 自身比 regex 更能判断"改动是否合理"。
+1. ~~**Manager LLM 增量价值极低**~~ → **已改善**：LLM 现在参与三个实质性决策：(a) 语义分级（grade_worker_output → PASS/NEEDS_REVIEW/FAIL + confidence），(b) confidence routing（低信心 PASS 升级人工而非盲推），(c) Decision Card 解释（why_llm + suggested_actions）。决策空间从 ≈0 扩展到有实际价值。
+2. **runtime_analysis.py 仍需简化**：混合策略已实现（`hybrid`/`hybrid_llm` 模式），但 1,746 行 regex 代码仍全部保留。C4 应将分级判断迁移到 LLM 层，保留证据提取和硬护栏。
+3. ~~**13 个状态过多**~~ → **已解决**：V2 简化到 10 个状态（8 核心 + QUEUED/NEEDS_HUMAN_REVIEW）。Legacy 状态仅用于读旧 DB。
+4. **Skills 系统复杂度上升**：从 316 → 653 行（autonomous 模式新增）。C4 应评估是否可进一步简化。
+5. **cli.py 膨胀是最大维护债**：4,628 行单文件，占 orchestrator 32%。C4 拆分是必需。
 
 ### 17.3 与外部系统对比
 
@@ -721,18 +772,18 @@ Orchestrator 外部控制 skill 注入（按状态映射 skill → 构建 task p
 
 **结论**：行业趋势是"编排层做生命周期管理和安全约束，智能决策交给 LLM"。AgentPR 当前反过来了——编排层承担了太多决策逻辑。
 
-### 17.4 整体评价
+### 17.4 整体评价（2026-02-26 更新）
 
-| 维度 | 评分 | 说明 |
-|------|------|------|
-| 架构方向 | 正确 | manager-worker 分离、人工 gate、push_only |
-| 工程量 | 偏重 | 12K 行对于未产出首个合并 PR 的系统 |
-| LLM 使用 | 严重不足 | LLM 只做选择题，需要智能的地方用 regex |
-| 安全设计 | 恰当 | sandbox + gate + 审计是必要的 |
-| 抽象层数 | 过多 | 5 层 prompt 构建链过重 |
-| 核心矛盾 | 复杂度放错地方 | 应简化控制面、强化智能面 |
+| 维度 | 评分 | 变化 | 说明 |
+|------|------|------|------|
+| 架构方向 | 正确 | — | manager-worker 分离、人工 gate、push_only |
+| 工程量 | 偏重 | ↗ | 14.5K 行（从 12K 增长），C2 新功能驱动。C4 需瘦身 |
+| LLM 使用 | 改善中 | ↑↑ | 从"只做选择题"升级到"语义分级 + confidence routing + 解释"。但失败诊断/review 分流仍缺 |
+| 安全设计 | 恰当 | — | sandbox + gate + 审计持续在位 |
+| 抽象层数 | 改善中 | ↑ | V1/V2 双轨已删除，但 prompt 构建链仍有 4-5 层 |
+| 核心矛盾 | 部分缓解 | ↑ | LLM 智能层从 5% → 12%，控制面从 70% → 60%。方向对，但距目标仍有距离 |
 
-**一句话**：精密的工厂生产线管理一个有自主判断力的工人——应该反过来：轻量生产线 + 更多 worker 自主权 + 关键检查点硬约束。
+**一句话（更新版）**：从"精密工厂管理聪明工人"开始向"轻量生产线 + 智能经理 + 自主工人"转型。LLM 已有实质性决策参与，但控制面仍偏厚。下一步：用真实数据验证当前改进的效果，再决定 C4 瘦身的力度和方向。
 
 ---
 
@@ -747,3 +798,130 @@ Orchestrator 外部控制 skill 注入（按状态映射 skill → 构建 task p
 7. LangGraph 文档（agentic workflow 图）：<https://docs.langchain.com/oss/python/langgraph/overview>
 8. OpenClaw Security（one-user trusted operator 边界）：<https://raw.githubusercontent.com/openclaw/openclaw/main/SECURITY.md>
 9. SWE-agent（薄编排 + 强 agent PR 工作流）：<https://github.com/SWE-agent/SWE-agent>
+
+---
+
+## 19. 本轮实现落地记录（2026-02-26，C2 完成 + C3 完成 + 精简 + LLM 接入）
+
+### 19.1 本轮目标（与你确认后的执行口径）
+
+1. 继续按本计划推进，不回退到 C1；优先完成 C2 的 manager agent 主体落地。
+2. 在 C2 可用后，推进 C3：worker 自主 skill（v1）+ 状态机简化（v2）。
+3. 强调”流程不断”：允许新旧状态并存，旧 run 不做强制迁移，避免运行中断。
+4. **追加目标（代码审计后）**：删除 V1 双轨代码、合并 LLM 重复解析、接通 LLM 核心能力到决策循环、Telegram 清理。
+
+### 19.2 关键设计决策（本轮锁定）
+
+1. **混合策略继续保留**：Rules 负责硬护栏与证据提取，LLM 负责语义判断和建议，不做”全量替换 regex”的激进改造。
+2. **V2 唯一路径**：已删除 `StateSchemaVersion` 双轨代码，新 run 始终使用简化 8 状态。旧 DB 中的 legacy 状态值保留在 enum 中以兼容读取，但不再有 V1/V2 分支逻辑。
+3. **状态收敛**：`DISCOVERY/PLAN_READY/IMPLEMENTING/LOCAL_VALIDATING` → `EXECUTING`；`FAILED_RETRYABLE/FAILED_TERMINAL/SKIPPED` → `FAILED`。传入旧目标态时自动归一化。
+4. **Confidence routing**：LLM 语义分级产出 confidence（low/medium/high），rules 层使用 confidence 做分流：高信心 PASS → RUN_FINISH，低信心 PASS → WAIT_HUMAN。这实现了”LLM 判断 + 硬约束兜底”的混合策略。
+
+### 19.3 代码落地清单（按模块）
+
+#### A. 状态模型与持久化
+
+1. `orchestrator/models.py`
+   - V2 状态：`QUEUED/EXECUTING/PUSHED/CI_WAIT/REVIEW_WAIT/ITERATING/PAUSED/DONE/FAILED/NEEDS_HUMAN_REVIEW`。
+   - Legacy 状态保留在 enum 中仅用于读取旧 DB 行（`DISCOVERY/PLAN_READY/IMPLEMENTING/LOCAL_VALIDATING/SKIPPED/FAILED_RETRYABLE/FAILED_TERMINAL`）。
+   - 已删除：`StateSchemaVersion`、`LEGACY_*` frozensets、`canonical_display_state_for_v2`、`normalize_state_schema_version`。
+2. `orchestrator/db.py`
+   - `runs` 表 `state_schema_version` 列保留（旧 DB 兼容），新 run 硬编码写入 `"v2"`。
+3. `orchestrator/service.py`
+   - 已删除 `_resolve_target_v1`，仅保留 V2 解析逻辑（`_resolve_target`）。
+   - 已删除 `_normalize_target_for_schema`、`_display_state_for_schema`。
+   - 保留 `_normalize_legacy_target()` 用于将旧目标态归一化到 V2。
+   - `display_state` = `state`（identity，兼容下游代码）。
+
+#### B. 状态机与转移约束
+
+1. `orchestrator/state_machine.py`
+   - 增补 `EXECUTING`、`FAILED` 合法转移图。
+   - 保留 v1 旧态转移，不破坏旧 run。
+   - 允许 schema 归一化后的 `retry/resume` 目标转移。
+
+#### C. Manager 决策与 Agent 主体
+
+1. `orchestrator/manager_agent.py`
+   - C2 主体已接入：`rules|llm|hybrid` 统一入口。
+   - tools 上下文：`get_run_status`、`analyze_worker_output`、`get_global_stats`。
+   - LLM facts 包含 `latest_worker_confidence`。
+2. `orchestrator/manager_decision.py`
+   - 新增 `EXECUTING` 决策：默认 `RUN_AGENT_STEP`，若最新 worker grade=`PASS` 切到 `RUN_FINISH`。
+   - 新增 `FAILED` 决策：`RETRY` 目标 `EXECUTING`。
+   - **新增 confidence 分流**：`ManagerRunFacts.latest_worker_confidence` 字段；PASS + low confidence → `WAIT_HUMAN`；NEEDS_REVIEW → `WAIT_HUMAN`。
+3. `orchestrator/manager_loop.py`
+   - 事实注入增加 `latest_worker_grade` + `latest_worker_confidence`。
+   - `_latest_worker_grade()` 返回 `(grade, confidence)` 元组，从 digest 的 `classification.semantic.confidence` 或 `classification.confidence` 提取。
+   - **新增 LLM 分级调用**：当 grade 存在但 confidence 缺失且 LLM 可用时，调用 `grade_worker_output()` 获取语义评估。
+   - **新增 `_notify_after_action()`**：RUN_FINISH / RETRY / 失败后通过 `notify_user()` 记录通知 artifact。
+   - `RETRY` 默认目标始终 `EXECUTING`。
+
+#### D. CLI / Policy / Runtime 分级
+
+1. `orchestrator/cli.py`
+   - 已删除 `--state-schema-version` 参数。
+   - `run-agent-step` 支持 `EXECUTING`，legacy 策略默认值自动归一化到 V2。
+   - `converge_agent_success_state` 与 `apply_nonpass_verdict_state` 统一使用 V2 状态。
+2. `orchestrator/manager_policy.py` + `orchestrator/manager_policy.json`
+   - 默认 `success_state` 调整为 `EXECUTING`。
+   - 默认 `on_retryable_state` 调整为 `FAILED`。
+3. `orchestrator/runtime_analysis.py`
+   - 将 `EXECUTING` 纳入 test evidence / semantic override 的判定范围。
+
+#### E. Skills / Bot / 展示层
+
+1. `orchestrator/skills.py`
+   - `STAGE_SKILLS` 使用 `EXECUTING` 映射，已删除 legacy 状态条目。
+2. `orchestrator/telegram_bot.py`
+   - `retry/resume` 默认目标始终 `EXECUTING`（`DEFAULT_TARGET_STATE` 常量）。
+   - 已删除 `StateSchemaVersion` 导入。
+   - 已删除 `default_execution_target_state()` 函数（8 处调用 → `DEFAULT_TARGET_STATE` 常量）。
+   - 已删除死代码 `extract_repo_ref_from_text()`。
+3. `orchestrator/manager_tools.py`
+   - 全局统计优先使用 `display_state` 聚合，减少新旧状态混读歧义。
+
+#### F. 文档同步
+
+1. `README.md`、`orchestrator/README.md` 同步了：
+   - `agentpr_autonomous`、runtime grading、state schema、策略默认值更新。
+2. 本文档 `15` 节中 C3 第 12 项已标记完成（v2）。
+
+### 19.4 本轮测试与验证证据
+
+1. `python3.11 -m py_compile orchestrator/*.py`：通过。
+2. smoke（临时 DB）：
+   - `create-run` 后 `start-discovery`，状态进入 `EXECUTING`。
+   - `manager-tick --dry-run` 在 `EXECUTING` 下给出 `run_agent_step`。
+   - 注入 PASS digest 后，`manager-tick --dry-run` 在 `EXECUTING` 下给出 `run_finish`。
+   - `retry --target-state FAILED` 后，`manager-tick --dry-run` 给出 `retry -> EXECUTING`。
+3. bot 本地演练：
+   - `simulate-bot-session` 中 `/list` 显示状态；
+   - 自然语言”重试 run_id”默认落到 `EXECUTING`。
+
+### 19.5 质量结论（本轮更新）
+
+1. **达成度**：C2 Manager Agent 主体 + LLM 语义分级 + confidence routing + 通知已接入主流程。V2 唯一路径。C3 状态机简化完成。
+2. **代码风险等级**：中等可控。改动涉及 12+ 文件，但每一步都通过 `py_compile` 验证。LLM 分级和通知均为 best-effort（异常不阻塞主循环）。
+3. **提交可行性**：满足”可提交评审”标准。**强烈建议下一步做 C1 第二轮真实验证**——当前所有改进仍基于 1 次 DeepCode 测试，数据不足以确认稳定性。
+4. **代码量趋势**：从 12,385 → 14,510 行（+17%）。增长主要是 C2 新功能（manager_agent/tools/LLM 扩展），不是膨胀。但 C4 瘦身是实际需求。
+
+### 19.6 已知残留与后续建议
+
+1. **缺系统化测试**：当前以 CLI smoke + `py_compile` 为主，无单元测试。risk：confidence routing 等新逻辑的边界场景未验证。
+2. **通知最后一公里未连通**：`_notify_after_action()` 产生 `manager_notification` artifact，但 artifact 未推送到 Telegram。需要 artifact → bot 推送桥接。
+3. **LLM 高阶智能仍缺**：失败诊断策略生成（`suggest_retry_strategy`）和 review comment 分流（`triage_review_comment`）尚为目标架构中的规划，未实现。
+4. **`explain_decision_card()`** 已实现但仅在 Telegram Decision Card 场景被调用，manager_loop 主流程未直接使用。
+5. **代码瘦身 backlog**：`cli.py`（4,628）、`runtime_analysis.py`（1,746）、`telegram_bot.py`（1,977）是三个最大的单文件，C4 应拆分/简化。
+
+### 19.7 反思与认知更新
+
+1. **”先删后加”的节奏是对的**：V1 删除 → LLM 解析合并 → 再接通新能力，避免了在冗余代码上叠加新逻辑。
+2. **Confidence routing 是正确的中间态**：不是”LLM 全权决策”（太激进），也不是”LLM 只做选择题”（无价值）。而是”LLM 提供判断 + 置信度，rules 根据置信度做分流”。这既保留了安全兜底，又让 LLM 在正确的位置发挥作用。
+3. **代码量增长是预期内的**：C2 是新增功能（not 重构），代码量上升正常。但净增 2,125 行提醒我们：C4 瘦身不是美观追求，是维护成本控制。
+4. **真实验证是所有改进的试金石**：C1 只跑了 1 次 DeepCode，暴露了 rg 隐藏目录和 min_test_commands 两个问题。第二轮验证很可能暴露新问题。在没有更多数据前，不应继续堆新功能。
+5. **目标架构（Section 4）的进展评估**：
+   - “Manager 是真正的 LLM 大脑” — **部分达成**：LLM 参与语义分级和 confidence routing，但尚未参与失败诊断和 review 分流。
+   - “Orchestrator 是薄层” — **未达成**：14,510 行代码说明 orchestrator 仍然很厚。需要 C4 瘦身。
+   - “Worker 自主执行” — **基本达成**：`agentpr_autonomous` 模式下 worker 单次完成分析+实现+验证。
+   - “安全兜底” — **已达成**：sandbox + gate + 审计 + 硬约束一直在位。

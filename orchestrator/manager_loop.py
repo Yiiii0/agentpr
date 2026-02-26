@@ -8,14 +8,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from .manager_decision import (
-    ManagerAction,
-    ManagerActionKind,
-    ManagerRunFacts,
-    allowed_action_kinds,
-    decide_next_action,
-)
+from .manager_agent import ManagerAgent, ManagerAgentConfig
+from .manager_decision import ManagerAction, ManagerActionKind, ManagerRunFacts
 from .manager_llm import ManagerLLMClient, ManagerLLMError
+from .manager_policy import RunAgentPolicy, load_manager_policy, resolve_run_agent_effective_policy
 from .models import RunState, StepName
 from .service import OrchestratorService
 
@@ -52,6 +48,12 @@ class ManagerLoopRunner:
         self.service = service
         self.config = config
         self._llm_client: ManagerLLMClient | None = None
+        self._run_agent_policy: RunAgentPolicy | None = None
+        self._global_stats_cache: dict[str, Any] | None = None
+        try:
+            self._run_agent_policy = load_manager_policy(self.config.policy_file).run_agent_step
+        except (OSError, ValueError):
+            self._run_agent_policy = None
         if self.config.decision_mode in {"llm", "hybrid"}:
             try:
                 self._llm_client = ManagerLLMClient.from_runtime(
@@ -62,10 +64,21 @@ class ManagerLoopRunner:
                 )
             except ManagerLLMError:
                 self._llm_client = None
+        self._manager_agent = ManagerAgent(
+            service=self.service,
+            llm_client=self._llm_client,
+            config=ManagerAgentConfig(
+                decision_mode=self.config.decision_mode,
+                global_stats_limit=max(self.config.limit, 1),
+            ),
+        )
 
     def tick(self) -> dict[str, Any]:
         started_at = datetime.now(UTC)
         run_ids = self._resolve_run_ids()
+        self._global_stats_cache = self._manager_agent.compute_global_stats(
+            limit=max(self.config.limit, 1),
+        )
         results: list[dict[str, Any]] = []
 
         for run_id in run_ids:
@@ -138,6 +151,10 @@ class ManagerLoopRunner:
             action_record["output"] = outcome["output"]
             actions.append(action_record)
 
+            self._notify_after_action(
+                run_id=run_id, action=action, ok=outcome["ok"]
+            )
+
             attempts += 1
             if not outcome["ok"]:
                 errors.append(str(outcome.get("error") or "action failed"))
@@ -157,67 +174,12 @@ class ManagerLoopRunner:
         }
 
     def _decide_action(self, facts: ManagerRunFacts) -> tuple[ManagerAction, str]:
-        rules_action = decide_next_action(facts)
-        mode = self.config.decision_mode
-        if mode == "rules":
-            return rules_action, "rules"
-
-        allowed = [item.value for item in allowed_action_kinds(facts)]
         digest_context = self._load_digest_context(facts.run_id)
-        if self._llm_client is None:
-            if mode == "llm":
-                return (
-                    ManagerAction(
-                        kind=ManagerActionKind.WAIT_HUMAN,
-                        reason="manager llm unavailable; waiting human",
-                    ),
-                    "llm_unavailable",
-                )
-            return rules_action, "rules_fallback_llm_unavailable"
-
-        try:
-            selection = self._llm_client.decide_action(
-                facts={
-                    "run_id": facts.run_id,
-                    "owner": facts.owner,
-                    "repo": facts.repo,
-                    "state": facts.state.value,
-                    "prepare_attempts": facts.prepare_attempts,
-                    "has_contract": facts.has_contract,
-                    "has_prompt": facts.has_prompt,
-                    "pr_number": facts.pr_number,
-                    "run_digest": digest_context,
-                },
-                allowed_actions=allowed,
-            )
-            kind = ManagerActionKind(selection.action)
-            if kind.value not in allowed:
-                raise ManagerLLMError(
-                    f"selected action not allowed in current state: {kind.value}"
-                )
-            # Guardrail: avoid stalling in executable states when LLM is overly conservative.
-            if (
-                kind == ManagerActionKind.WAIT_HUMAN
-                and rules_action.kind not in {ManagerActionKind.WAIT_HUMAN, ManagerActionKind.NOOP}
-            ):
-                return rules_action, "llm_wait_human_overridden_by_rules"
-            metadata: dict[str, Any] = {}
-            if kind == ManagerActionKind.RETRY and selection.target_state:
-                metadata["target_state"] = selection.target_state
-            return (
-                ManagerAction(kind=kind, reason=selection.reason, metadata=metadata),
-                "llm",
-            )
-        except (ManagerLLMError, ValueError) as exc:
-            if mode == "llm":
-                return (
-                    ManagerAction(
-                        kind=ManagerActionKind.WAIT_HUMAN,
-                        reason=f"manager llm error: {exc}",
-                    ),
-                    "llm_error",
-                )
-            return rules_action, "rules_fallback_llm_error"
+        return self._manager_agent.decide_action(
+            facts=facts,
+            digest_context=digest_context,
+            global_stats=self._global_stats_cache,
+        )
 
     def _load_digest_context(self, run_id: str) -> dict[str, Any]:
         artifact = self.service.latest_artifact(run_id, artifact_type="run_digest")
@@ -323,6 +285,39 @@ class ManagerLoopRunner:
         prompt_ok = self.config.prompt_file is not None and self.config.prompt_file.exists()
         pr_number = run.get("pr_number")
         parsed_pr_number = int(pr_number) if isinstance(pr_number, int) else None
+        resolved_skills_mode = (
+            str(self.config.skills_mode).strip()
+            if self.config.skills_mode is not None
+            else self._resolve_policy_skills_mode(
+                owner=str(run["owner"]),
+                repo=str(run["repo"]),
+            )
+        )
+
+        grade, confidence = self._latest_worker_grade(run_id)
+
+        # When LLM is available and we have a grade but no confidence,
+        # ask the LLM for a semantic assessment.
+        if (
+            grade is not None
+            and confidence is None
+            and self._llm_client is not None
+            and self.config.decision_mode in {"llm", "hybrid"}
+        ):
+            try:
+                from .manager_tools import analyze_worker_output
+
+                evidence = analyze_worker_output(
+                    service=self.service, run_id=run_id
+                )
+                if evidence.get("ok"):
+                    llm_grade = self._llm_client.grade_worker_output(
+                        evidence=evidence
+                    )
+                    grade = llm_grade.verdict.strip().upper() or grade
+                    confidence = llm_grade.confidence.strip().lower() or None
+            except (ManagerLLMError, Exception):  # noqa: BLE001
+                pass  # Keep original grade; LLM grading is best-effort
 
         return ManagerRunFacts(
             run_id=run_id,
@@ -334,7 +329,51 @@ class ManagerLoopRunner:
             contract_uri=contract_uri,
             has_prompt=prompt_ok,
             pr_number=parsed_pr_number,
+            worker_autonomous=(resolved_skills_mode == "agentpr_autonomous"),
+            latest_worker_grade=grade,
+            latest_worker_confidence=confidence,
         )
+
+    def _latest_worker_grade(self, run_id: str) -> tuple[str | None, str | None]:
+        """Return (grade, confidence) from the latest worker digest."""
+        artifact = self.service.latest_artifact(run_id, artifact_type="run_digest")
+        if artifact is None:
+            artifact = self.service.latest_artifact(run_id, artifact_type="agent_runtime_report")
+        if artifact is None:
+            return None, None
+        raw_path = str(artifact.get("uri") or "").strip()
+        if not raw_path:
+            return None, None
+        path = Path(raw_path)
+        if not path.exists():
+            return None, None
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None, None
+        if not isinstance(payload, dict):
+            return None, None
+        classification = payload.get("classification")
+        classification = classification if isinstance(classification, dict) else {}
+        grade = str(classification.get("grade") or "").strip().upper() or None
+        # Confidence from semantic grading (hybrid_llm mode) or classification
+        confidence: str | None = None
+        semantic = classification.get("semantic")
+        if isinstance(semantic, dict):
+            confidence = str(semantic.get("confidence") or "").strip().lower() or None
+        if confidence is None:
+            confidence = str(classification.get("confidence") or "").strip().lower() or None
+        return grade, confidence
+
+    def _resolve_policy_skills_mode(self, *, owner: str, repo: str) -> str:
+        if self._run_agent_policy is None:
+            return "off"
+        effective = resolve_run_agent_effective_policy(
+            self._run_agent_policy,
+            owner=owner,
+            repo=repo,
+        )
+        return str(effective.get("skills_mode") or "off")
 
     def _execute_action(
         self,
@@ -411,7 +450,9 @@ class ManagerLoopRunner:
             return self._run_cli(argv)
 
         if action.kind == ManagerActionKind.RETRY:
-            target_state = str(action.metadata.get("target_state") or RunState.IMPLEMENTING.value)
+            target_state = str(
+                action.metadata.get("target_state") or RunState.EXECUTING.value
+            )
             return self._run_cli(
                 [
                     "retry",
@@ -464,6 +505,48 @@ class ManagerLoopRunner:
         )
         out_path.write_text(content, encoding="utf-8")
         return str(out_path)
+
+    def _notify_after_action(
+        self,
+        *,
+        run_id: str,
+        action: ManagerAction,
+        ok: bool,
+    ) -> None:
+        """Best-effort notification after significant manager actions."""
+        _NOTIFY_KINDS = {
+            ManagerActionKind.RUN_FINISH,
+            ManagerActionKind.RETRY,
+        }
+        if action.kind not in _NOTIFY_KINDS and ok:
+            return
+        try:
+            from .manager_tools import notify_user
+
+            if not ok:
+                notify_user(
+                    service=self.service,
+                    run_id=run_id,
+                    message=f"action {action.kind.value} failed: {action.reason}",
+                    priority="high",
+                )
+            elif action.kind == ManagerActionKind.RUN_FINISH:
+                notify_user(
+                    service=self.service,
+                    run_id=run_id,
+                    message="run finish/push completed",
+                    priority="normal",
+                )
+            elif action.kind == ManagerActionKind.RETRY:
+                target = action.metadata.get("target_state", "")
+                notify_user(
+                    service=self.service,
+                    run_id=run_id,
+                    message=f"retrying run → {target}",
+                    priority="normal",
+                )
+        except Exception:  # noqa: BLE001
+            pass  # Notification is best-effort; never block the loop
 
     def _run_cli(self, argv: list[str]) -> dict[str, Any]:
         cmd = [

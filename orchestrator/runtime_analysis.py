@@ -7,10 +7,58 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from .manager_llm import ManagerLLMClient, ManagerLLMError
 from .models import AgentRuntimeGrade, RunState
 from .service import OrchestratorService
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+TEST_COMMAND_PATTERNS: tuple[str, ...] = (
+    r"\bpytest\b",
+    r"\btox\b",
+    r"\bmake\s+test\b",
+    r"\bbun\s+test\b",
+    r"\bnpm\s+test\b",
+    r"\bpnpm\s+test\b",
+    r"\byarn\s+test\b",
+    r"\bhatch\s+run\s+.*\btest\b",
+)
+
+LINT_OR_VALIDATION_COMMAND_PATTERNS: tuple[str, ...] = (
+    r"\bmake\s+lint\b",
+    r"\bruff\b",
+    r"\beslint\b",
+    r"\bflake8\b",
+    r"\bmypy\b",
+    r"\bpyright\b",
+    r"\btypecheck\b",
+    r"\bpre-commit\b",
+)
+
+TEST_INFRA_DEPENDENCY_PATTERNS: tuple[str, ...] = (
+    r"\bpytest\b",
+    r"\btox\b",
+    r"\bjest\b",
+    r"\bvitest\b",
+    r"\bunittest\b",
+    r"\bava\b",
+    r"\bmocha\b",
+    r"\bcypress\b",
+    r"\bplaywright\b",
+)
+
+TEST_INFRA_WORKFLOW_PATTERNS: tuple[str, ...] = (
+    r"\bpytest\b",
+    r"\btox\b",
+    r"\bmake\s+test\b",
+    r"\bnpm\s+test\b",
+    r"\bpnpm\s+test\b",
+    r"\byarn\s+test\b",
+    r"\bbun\s+test\b",
+    r"\bgo\s+test\b",
+    r"\bcargo\s+test\b",
+    r"\bunit\s*test\b",
+)
 
 HARD_FAILURE_PATTERNS: tuple[str, ...] = (
     r"\bpermission denied\b",
@@ -69,25 +117,8 @@ def summarize_command_categories(commands: list[str]) -> dict[str, int]:
         r"\bbun\s+install\b",
         r"\byarn\s+install\b",
     )
-    test_patterns = (
-        r"\bpytest\b",
-        r"\btox\b",
-        r"\bmake\s+test\b",
-        r"\bbun\s+test\b",
-        r"\bnpm\s+test\b",
-        r"\bpnpm\s+test\b",
-        r"\byarn\s+test\b",
-        r"\bhatch\s+run\s+.*\btest\b",
-    )
-    lint_patterns = (
-        r"\bmake\s+lint\b",
-        r"\bruff\b",
-        r"\beslint\b",
-        r"\bflake8\b",
-        r"\bmypy\b",
-        r"\bpyright\b",
-        r"\btypecheck\b",
-    )
+    test_patterns = TEST_COMMAND_PATTERNS
+    lint_patterns = LINT_OR_VALIDATION_COMMAND_PATTERNS
     git_patterns = (
         r"\bgit\s+status\b",
         r"\bgit\s+diff\b",
@@ -161,6 +192,255 @@ def dedupe_strings(values: list[str], *, limit: int | None = None) -> list[str]:
         if max_items > 0 and len(out) >= max_items:
             break
     return out
+
+
+def detect_commands_by_patterns(
+    *,
+    commands: list[str],
+    patterns: tuple[str, ...],
+    limit: int = 40,
+) -> list[str]:
+    matched = [
+        command
+        for command in commands
+        if str(command).strip() and contains_any_pattern(str(command), patterns)
+    ]
+    return dedupe_strings(matched, limit=limit)
+
+
+def _read_text_file(path: Path, *, max_bytes: int = 200_000) -> str:
+    if not path.exists() or not path.is_file():
+        return ""
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return ""
+    clipped = data[:max(int(max_bytes), 1)]
+    return clipped.decode("utf-8", errors="replace")
+
+
+def scan_repo_test_infrastructure(repo_dir: Path) -> dict[str, Any]:
+    root = repo_dir.expanduser().resolve()
+    test_dir_candidates = ("tests", "test", "spec", "__tests__")
+    has_test_directory = any((root / name).is_dir() for name in test_dir_candidates)
+    has_test_files = False
+    file_globs = (
+        "test_*.py",
+        "*_test.py",
+        "*.spec.ts",
+        "*.test.ts",
+        "*.spec.js",
+        "*.test.js",
+    )
+    for pattern in file_globs:
+        if any(root.glob(pattern)):
+            has_test_files = True
+            break
+        tests_dir = root / "tests"
+        if tests_dir.exists() and any(tests_dir.rglob(pattern)):
+            has_test_files = True
+            break
+    dependency_files = (
+        "pyproject.toml",
+        "requirements.txt",
+        "requirements-dev.txt",
+        "setup.cfg",
+        "setup.py",
+        "Pipfile",
+        "package.json",
+        "pnpm-lock.yaml",
+        "bun.lockb",
+    )
+    dependency_matches: list[str] = []
+    scanned_dependency_files: list[str] = []
+    for name in dependency_files:
+        path = root / name
+        text = _read_text_file(path)
+        if not text:
+            continue
+        scanned_dependency_files.append(name)
+        if contains_any_pattern(text, TEST_INFRA_DEPENDENCY_PATTERNS):
+            dependency_matches.append(name)
+    ci_workflows_dir = root / ".github" / "workflows"
+    ci_workflows: list[str] = []
+    ci_test_workflows: list[str] = []
+    if ci_workflows_dir.exists():
+        for path in sorted(ci_workflows_dir.glob("*.y*ml")):
+            rel = path.relative_to(root).as_posix()
+            ci_workflows.append(rel)
+            text = _read_text_file(path)
+            if text and contains_any_pattern(text, TEST_INFRA_WORKFLOW_PATTERNS):
+                ci_test_workflows.append(rel)
+    return {
+        "has_test_directory": bool(has_test_directory),
+        "has_test_files": bool(has_test_files),
+        "has_test_dependencies": bool(dependency_matches),
+        "has_test_ci_workflow": bool(ci_test_workflows),
+        "scanned_dependency_files": scanned_dependency_files[:20],
+        "test_dependency_matches": dedupe_strings(dependency_matches, limit=20),
+        "ci_workflows": ci_workflows[:24],
+        "ci_test_workflows": ci_test_workflows[:24],
+    }
+
+
+def _semantic_override_heuristic(
+    *,
+    run_state: RunState,
+    test_signals: list[str],
+    lint_signals: list[str],
+    test_infra: dict[str, Any],
+    diff_summary: dict[str, Any],
+) -> dict[str, Any]:
+    has_test_infra = bool(
+        test_infra.get("has_test_directory")
+        or test_infra.get("has_test_files")
+        or test_infra.get("has_test_dependencies")
+        or test_infra.get("has_test_ci_workflow")
+    )
+    has_alternative_validation = bool(lint_signals)
+    changed_files_count = int(diff_summary.get("changed_files_count") or 0)
+    added_lines = int(diff_summary.get("added_lines") or 0)
+    low_risk_diff = changed_files_count <= 8 and added_lines <= 240
+    pass_candidate = (
+        run_state
+        in {RunState.EXECUTING, RunState.ITERATING}
+        and not has_test_infra
+        and not test_signals
+        and has_alternative_validation
+        and low_risk_diff
+    )
+    return {
+        "decision": "PASS" if pass_candidate else "NEEDS_REVIEW",
+        "reason": (
+            "no test infrastructure detected; alternative validation commands observed"
+            if pass_candidate
+            else "semantic conditions for no-test-infra pass not satisfied"
+        ),
+        "inputs": {
+            "has_test_infrastructure": has_test_infra,
+            "has_alternative_validation": has_alternative_validation,
+            "low_risk_diff": low_risk_diff,
+            "changed_files_count": changed_files_count,
+            "added_lines": added_lines,
+        },
+    }
+
+
+def _semantic_override_llm(
+    *,
+    evidence: dict[str, Any],
+) -> dict[str, Any]:
+    try:
+        client = ManagerLLMClient.from_runtime(
+            api_base=None,
+            model=None,
+            timeout_sec=20,
+            api_key_env="AGENTPR_MANAGER_API_KEY",
+        )
+        grade = client.grade_worker_output(evidence=evidence)
+    except ManagerLLMError as exc:
+        return {
+            "available": False,
+            "decision": "NEEDS_REVIEW",
+            "reason": f"manager llm unavailable: {exc}",
+        }
+    return {
+        "available": True,
+        "decision": grade.verdict,
+        "reason": grade.reason,
+        "confidence": grade.confidence,
+    }
+
+
+def apply_semantic_runtime_grading(
+    *,
+    run_state: RunState,
+    runtime_grading_mode: str,
+    rules_classification: dict[str, Any],
+    test_signals: list[str],
+    lint_signals: list[str],
+    failed_test_commands: list[str],
+    diff_summary: dict[str, Any],
+    test_infra: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    normalized_mode = str(runtime_grading_mode or "hybrid").strip().lower()
+    if normalized_mode not in {"rules", "hybrid", "hybrid_llm"}:
+        normalized_mode = "hybrid"
+    semantic: dict[str, Any] = {
+        "enabled": normalized_mode != "rules",
+        "mode": normalized_mode,
+        "applied": False,
+        "source": "none",
+        "decision": "NEEDS_REVIEW",
+        "reason": "",
+    }
+    if normalized_mode == "rules":
+        semantic["reason"] = "semantic grading disabled (rules mode)"
+        return rules_classification, semantic
+
+    reason_code = str(rules_classification.get("reason_code") or "").strip().lower()
+    if reason_code not in {"missing_test_evidence", "insufficient_test_evidence"}:
+        semantic["reason"] = "rules classification does not require semantic override"
+        return rules_classification, semantic
+
+    evidence = {
+        "run_state": run_state.value,
+        "rules_classification": {
+            "grade": str(rules_classification.get("grade") or ""),
+            "reason_code": reason_code,
+            "next_action": str(rules_classification.get("next_action") or ""),
+        },
+        "signals": {
+            "test_commands": list(test_signals),
+            "lint_or_validation_commands": list(lint_signals),
+            "failed_test_commands": list(failed_test_commands),
+            "diff": dict(diff_summary),
+        },
+        "test_infrastructure": dict(test_infra),
+    }
+    heuristic = _semantic_override_heuristic(
+        run_state=run_state,
+        test_signals=test_signals,
+        lint_signals=lint_signals,
+        test_infra=test_infra,
+        diff_summary=diff_summary,
+    )
+    semantic["source"] = "heuristic"
+    semantic["decision"] = str(heuristic.get("decision") or "NEEDS_REVIEW")
+    semantic["reason"] = str(heuristic.get("reason") or "")
+    semantic["heuristic"] = heuristic
+    if normalized_mode == "hybrid_llm":
+        llm = _semantic_override_llm(evidence=evidence)
+        semantic["llm"] = llm
+        if bool(llm.get("available")):
+            semantic["source"] = "llm"
+            semantic["decision"] = str(llm.get("decision") or "NEEDS_REVIEW")
+            semantic["reason"] = str(llm.get("reason") or semantic["reason"])
+
+    decision = str(semantic.get("decision") or "NEEDS_REVIEW").upper()
+    if decision != "PASS":
+        semantic["reason"] = str(semantic.get("reason") or "semantic review rejected override")
+        return rules_classification, semantic
+
+    semantic["applied"] = True
+    upgraded = dict(rules_classification)
+    upgraded["grade"] = AgentRuntimeGrade.PASS.value
+    upgraded["reason_code"] = "runtime_success_no_test_infra_with_validation"
+    upgraded["next_action"] = "advance"
+    evidence_out = dict(upgraded.get("evidence") or {})
+    evidence_out.update(
+        {
+            "semantic_mode": normalized_mode,
+            "semantic_source": str(semantic.get("source") or ""),
+            "semantic_reason": str(semantic.get("reason") or ""),
+            "test_infrastructure": dict(test_infra),
+            "lint_or_validation_commands": list(lint_signals)[:20],
+            "test_commands": list(test_signals)[:20],
+            "failed_test_commands": list(failed_test_commands)[:20],
+        }
+    )
+    upgraded["evidence"] = evidence_out
+    return upgraded, semantic
 
 
 def extract_string_by_keys(
@@ -473,8 +753,7 @@ def classify_agent_runtime(
         }
 
     requires_test_evidence = run_state in {
-        RunState.IMPLEMENTING,
-        RunState.LOCAL_VALIDATING,
+        RunState.EXECUTING,
         RunState.ITERATING,
     }
     if result.exit_code == 0:
@@ -628,10 +907,12 @@ def build_agent_runtime_report(
     max_added_lines: int,
     max_retryable_attempts: int,
     min_test_commands: int,
+    runtime_grading_mode: str,
     known_test_failure_allowlist: list[str],
     attempt_no: int,
     skills_mode: str,
     skill_plan: dict[str, Any] | None,
+    repo_dir: Path,
     task_packet_path: str | None,
     event_summary: dict[str, Any] | None,
     event_stream_path: str | None,
@@ -671,27 +952,15 @@ def build_agent_runtime_report(
             if re.search(pattern, command):
                 violations.append({"rule": tag, "command": command})
 
-    test_patterns = [
-        r"\bmake\s+test\b",
-        r"\bmake\s+lint\b",
-        r"\bpytest\b",
-        r"\btox\b",
-        r"\bhatch\s+run\s+test\b",
-        r"\bpoetry\s+run\s+(pytest|tox)\b",
-        r"\buv\s+run\s+(pytest|tox)\b",
-        r"\bbun\s+test\b",
-        r"\bbun\s+run\s+typecheck\b",
-        r"\bnpm\s+test\b",
-        r"\bpnpm\s+test\b",
-        r"\byarn\s+test\b",
-    ]
-    test_signals = sorted(
-        {
-            command
-            for command in commands
-            for pattern in test_patterns
-            if re.search(pattern, command)
-        }
+    test_signals = detect_commands_by_patterns(
+        commands=commands,
+        patterns=TEST_COMMAND_PATTERNS,
+        limit=40,
+    )
+    lint_signals = detect_commands_by_patterns(
+        commands=commands,
+        patterns=LINT_OR_VALIDATION_COMMAND_PATTERNS,
+        limit=40,
     )
     git_signals = sorted(
         {
@@ -703,7 +972,8 @@ def build_agent_runtime_report(
     )
     command_categories = summarize_command_categories(commands)
     failed_test_commands = extract_failed_test_commands(resolved_event_summary)
-    classification = classify_agent_runtime(
+    test_infra = scan_repo_test_infrastructure(repo_dir)
+    rules_classification = classify_agent_runtime(
         run_state=run_state,
         result=result,
         preflight_report=preflight_report,
@@ -719,6 +989,16 @@ def build_agent_runtime_report(
         min_test_commands=min_test_commands,
         known_test_failure_allowlist=known_test_failure_allowlist,
         attempt_no=attempt_no,
+    )
+    classification, semantic_grading = apply_semantic_runtime_grading(
+        run_state=run_state,
+        runtime_grading_mode=runtime_grading_mode,
+        rules_classification=rules_classification,
+        test_signals=test_signals,
+        lint_signals=lint_signals,
+        failed_test_commands=failed_test_commands,
+        diff_summary=diff_summary,
+        test_infra=test_infra,
     )
 
     return {
@@ -737,6 +1017,7 @@ def build_agent_runtime_report(
             "attempt_no": attempt_no,
             "max_retryable_attempts": max_retryable_attempts,
             "min_test_commands": min_test_commands,
+            "runtime_grading_mode": runtime_grading_mode,
             "known_test_failure_allowlist": list(known_test_failure_allowlist),
             "skills_mode": skills_mode,
             "skill_plan": skill_plan,
@@ -751,15 +1032,18 @@ def build_agent_runtime_report(
             "command_sample_count": len(commands),
             "command_categories": command_categories,
             "test_commands": test_signals,
+            "lint_or_validation_commands": lint_signals,
             "failed_test_commands": failed_test_commands,
             "git_commands": git_signals,
             "diff": diff_summary,
+            "test_infrastructure": test_infra,
             "agent_event_summary": resolved_event_summary,
         },
         "safety": {
             "violations": violations,
             "violation_count": len(violations),
         },
+        "semantic_grading": semantic_grading,
         "classification": classification,
     }
 
@@ -914,7 +1198,16 @@ def derive_iteration_hints(
 ) -> list[str]:
     code = str(reason_code).strip().lower()
     hints: list[str] = []
-    if code in {"missing_test_evidence", "insufficient_test_evidence"} or test_command_count == 0:
+    semantic_no_test_infra = (
+        code == "runtime_success_no_test_infra_with_validation"
+    )
+    if (
+        not semantic_no_test_infra
+        and (
+            code in {"missing_test_evidence", "insufficient_test_evidence"}
+            or test_command_count == 0
+        )
+    ):
         hints.append(
             "Strengthen implement/validate prompt to require explicit CI-aligned test command execution and evidence."
         )
@@ -1015,6 +1308,7 @@ def render_manager_insight_markdown(digest: dict[str, Any]) -> str:
         ),
         f"- Command events: `{events.get('command_event_count')}`",
         f"- Test commands: `{validation.get('test_command_count')}`",
+        f"- Lint/typecheck commands: `{validation.get('lint_or_validation_command_count')}`",
         f"- Failed test commands: `{validation.get('failed_test_command_count')}`",
         (
             f"- Diff: files `{changes.get('changed_files_count')}` | "
@@ -1066,6 +1360,8 @@ def build_run_digest(
     signals = signals if isinstance(signals, dict) else {}
     safety = agent_report.get("safety")
     safety = safety if isinstance(safety, dict) else {}
+    semantic_grading = agent_report.get("semantic_grading")
+    semantic_grading = semantic_grading if isinstance(semantic_grading, dict) else {}
     preflight = agent_report.get("preflight")
     preflight = preflight if isinstance(preflight, dict) else {}
     event_summary = signals.get("agent_event_summary")
@@ -1111,6 +1407,7 @@ def build_run_digest(
             "reason_code": reason_code,
             "next_action": next_action,
             "evidence": classification.get("evidence"),
+            "semantic": semantic_grading,
         },
         "skills": {
             "mode": str(runtime.get("skills_mode") or "off"),
@@ -1121,6 +1418,12 @@ def build_run_digest(
         "validation": {
             "test_command_count": len(list(signals.get("test_commands") or [])),
             "test_commands": list(signals.get("test_commands") or []),
+            "lint_or_validation_command_count": len(
+                list(signals.get("lint_or_validation_commands") or [])
+            ),
+            "lint_or_validation_commands": list(
+                signals.get("lint_or_validation_commands") or []
+            ),
             "failed_test_command_count": len(list(signals.get("failed_test_commands") or [])),
             "failed_test_commands": list(signals.get("failed_test_commands") or []),
         },
@@ -1290,6 +1593,7 @@ def evaluate_pr_gate_readiness(
         "runtime_success",
         "runtime_success_allowlisted_test_failures",
         "runtime_success_recovered_test_failures",
+        "runtime_success_no_test_infra_with_validation",
     }
     if not contract_available:
         failed_checks.append(
@@ -1341,15 +1645,33 @@ def evaluate_pr_gate_readiness(
     validation = digest.get("validation")
     validation = validation if isinstance(validation, dict) else {}
     required_tests = max(int(expected_policy.get("min_test_commands") or 0), 0)
+    runtime_grading_mode = str(
+        expected_policy.get("runtime_grading_mode") or "hybrid"
+    ).strip()
     test_count = int(validation.get("test_command_count") or 0)
     failed_test_count = int(validation.get("failed_test_command_count") or 0)
+    no_test_infra_semantic_pass = (
+        grade == AgentRuntimeGrade.PASS.value
+        and reason_code == "runtime_success_no_test_infra_with_validation"
+    )
     if required_tests > 0 and test_count < required_tests:
-        failed_checks.append(
-            {
-                "code": "insufficient_test_evidence",
-                "message": f"required={required_tests}, observed={test_count}",
-            }
-        )
+        if no_test_infra_semantic_pass:
+            warnings.append(
+                {
+                    "code": "semantic_no_test_infra_override",
+                    "message": (
+                        f"required={required_tests}, observed={test_count}, "
+                        f"runtime_grading_mode={runtime_grading_mode}"
+                    ),
+                }
+            )
+        else:
+            failed_checks.append(
+                {
+                    "code": "insufficient_test_evidence",
+                    "message": f"required={required_tests}, observed={test_count}",
+                }
+            )
     if failed_test_count > 0:
         if grade == AgentRuntimeGrade.PASS.value and reason_code in accepted_runtime_reason_codes:
             warnings.append(
@@ -1399,7 +1721,7 @@ def evaluate_pr_gate_readiness(
                 "message": f"expected={expected_mode}, observed={actual_mode}",
             }
         )
-    if actual_mode == "agentpr" and missing_required:
+    if actual_mode in {"agentpr", "agentpr_autonomous"} and missing_required:
         failed_checks.append(
             {
                 "code": "missing_required_skills",
@@ -1419,5 +1741,6 @@ def evaluate_pr_gate_readiness(
             "changed_files_count": changed_files,
             "added_lines": added_lines,
             "skills_mode": actual_mode,
+            "runtime_grading_mode": runtime_grading_mode,
         },
     }

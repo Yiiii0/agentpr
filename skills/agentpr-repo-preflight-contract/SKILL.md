@@ -18,7 +18,8 @@ Build a machine-checkable repo contract before any code edits. Favor objective r
 ## Workflow
 
 1. Read repository governance files first.
-- Read `AGENTS.md`, `CONTRIBUTING*`, `CODEOWNERS`, and PR template files.
+- Read `task_packet.repo.governance_scan` first when available, then open `AGENTS.md`, `CONTRIBUTING*`, `CODEOWNERS`, PR template files, README/dev/setup docs.
+- If expected files are missing, run secondary search with `--hidden` or `find .github` fallback before concluding they do not exist.
 - Extract branch base requirements, commit/PR message rules, and mandatory checklists.
 
 2. Read CI as source of truth for test/lint/install.

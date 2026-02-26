@@ -22,6 +22,7 @@ python3.11 -m orchestrator.cli create-run \
   --owner OWNER \
   --repo REPO \
   --prompt-version v1
+# optional: --state-schema-version v1 (default is v2)
 
 python3.11 -m orchestrator.cli start-discovery --run-id <run_id>
 python3.11 -m orchestrator.cli run-prepare --run-id <run_id>
@@ -31,6 +32,8 @@ python3.11 -m orchestrator.cli run-preflight --run-id <run_id> --codex-sandbox d
 python3.11 -m orchestrator.cli run-agent-step --run-id <run_id> --prompt-file <prompt.md> --codex-sandbox danger-full-access --success-state NEEDS_HUMAN_REVIEW
 # skills-mode (worker invokes stage skills, manager injects task packet):
 python3.11 -m orchestrator.cli run-agent-step --run-id <run_id> --prompt-file <prompt.md> --skills-mode agentpr --codex-sandbox danger-full-access --success-state NEEDS_HUMAN_REVIEW
+# worker-autonomous skills-mode (worker decides multi-skill flow in one run):
+python3.11 -m orchestrator.cli run-agent-step --run-id <run_id> --prompt-file <prompt.md> --skills-mode agentpr_autonomous --codex-sandbox danger-full-access --success-state NEEDS_HUMAN_REVIEW
 python3.11 -m orchestrator.cli mark-local-validated --run-id <run_id>
 python3.11 -m orchestrator.cli run-finish --run-id <run_id> --changes "..." --project REPO --commit-title "feat(scope): ..."
 ```
@@ -40,8 +43,12 @@ After manual review, open PR with forced double confirmation:
 ```bash
 python3.11 -m orchestrator.cli request-open-pr \
   --run-id <run_id> \
-  --title "feat(scope): ..." \
-  --body-file forge_integration/pr_description_template.md
+  --title "feat(scope): ..."
+# optional overrides:
+#   --body-file <path> / --body <text>
+#   --project-name <name>
+#   --skip-repo-pr-template
+#   --skip-about-forge
 
 python3.11 -m orchestrator.cli approve-open-pr \
   --run-id <run_id> \
@@ -131,6 +138,13 @@ Manager-facing run diagnostics:
 python3.11 -m orchestrator.cli inspect-run --run-id <run_id>
 python3.11 -m orchestrator.cli inspect-run --run-id <run_id> --include-log-tails
 python3.11 -m orchestrator.cli run-bottlenecks --limit 20
+python3.11 -m orchestrator.cli analyze-worker-output --run-id <run_id>
+python3.11 -m orchestrator.cli get-global-stats --limit 200
+python3.11 -m orchestrator.cli notify-user --run-id <run_id> --message "..." --priority normal
+python3.11 -m orchestrator.cli simulate-bot-session \
+  --text "/list 3" \
+  --text "查看 <run_id> 状态" \
+  --decision-why-mode off
 ```
 
 Rule-based manager automation (Phase B1):
@@ -167,6 +181,11 @@ Manager LLM envs for `--decision-mode llm|hybrid`:
 - `AGENTPR_WORKER_PROMPT_FILE` (optional, default worker base prompt for manager-tick/loop)
 - `AGENTPR_DEFAULT_PROMPT_VERSION` (optional, default prompt version used by bot `/create`, default `v1`)
 - `AGENTPR_CREATE_AUTOKICK` (optional, `1/0`, default `1`; after `/create`, auto-run one lightweight manager tick per new run)
+
+Telegram Decision Card `why_llm` envs:
+- `AGENTPR_TELEGRAM_DECISION_WHY_MODE` (`off|hybrid|llm`, default `hybrid`)
+- `AGENTPR_TELEGRAM_DECISION_API_KEY_ENV` (optional, default `AGENTPR_MANAGER_API_KEY`)
+- `AGENTPR_TELEGRAM_DECISION_MODEL` / `AGENTPR_TELEGRAM_DECISION_API_BASE` (optional)
 
 Whole-system runtime (not just one command):
 - process 1: `run-telegram-bot` (human interaction / NL ingress)
@@ -253,8 +272,9 @@ Notes:
 - `run-agent-step` now also emits `run_digest` + `manager_insight` artifacts for every attempt.
 - `run-agent-step` now keeps raw `agent_event_stream` for non-pass runs and deterministic sampled pass runs (digest is always kept).
 - Manager policy: use `run_digest` as machine-checkable truth; treat `manager_insight` as decision support, not as source of truth.
-- `run-agent-step --skills-mode agentpr` means worker uses stage-specific `$agentpr-*` skills; manager only injects task packet and policy.
-- In `--skills-mode agentpr`, contract artifacts are now materialized inside repo runtime path (`.agentpr_runtime/contracts/*`) so worker skills can read them without cross-repo path access.
+- `run-agent-step --skills-mode agentpr` means worker uses stage-specific `$agentpr-*` skills; manager injects stage plan + task packet.
+- `run-agent-step --skills-mode agentpr_autonomous` means worker self-orchestrates multi-skill flow (analyze -> implement -> validate) in one run, manager injects task packet + guardrails.
+- In skills-mode, contract artifacts are materialized inside repo runtime path (`.agentpr_runtime/contracts/*`) so worker skills can read them without cross-repo path access.
 - install/check skill readiness with `install-skills` / `skills-status`.
 - `inspect-run` is the primary manager artifact for per-run timing/step/event/runtime breakdown.
 - `run-bottlenecks` aggregates durations across recent runs to find slow phases before prompt tuning.
@@ -321,10 +341,11 @@ Notes:
   - If omitted, uses manager policy default (`run_agent_step.max_added_lines`).
 - `--allow-dirty-worktree`
   - Allow agent execution with pre-existing workspace changes.
-  - Default blocks dirty worktree in `DISCOVERY/IMPLEMENTING`.
+  - Default blocks dirty worktree in `EXECUTING/DISCOVERY/PLAN_READY/IMPLEMENTING`.
 - `--skills-mode`
   - `off`: legacy single-prompt mode.
   - `agentpr`: wrap prompt with task packet and stage skill chain (`$agentpr-*`).
+  - `agentpr_autonomous`: wrap prompt with task packet and let worker choose skill invocation order.
 - `--allow-missing-skills`
   - Continue even if required stage skill is not installed.
   - Default is strict fail-to-review.
@@ -334,8 +355,13 @@ Notes:
   - Retry cap for retryable failures; when exceeded, verdict upgrades to `HUMAN_REVIEW`.
   - If omitted, uses manager policy default.
 - `--min-test-commands`
-  - Minimum number of test/lint evidence commands required in implementation states for a success verdict.
+  - Minimum number of test/lint evidence commands required in executing/implementation states for a success verdict.
   - If omitted, uses manager policy default (can be overridden per repo in manager policy).
+- `--runtime-grading-mode`
+  - `rules`: deterministic grading only.
+  - `hybrid`: deterministic grading + semantic override for no-test-infra repos.
+  - `hybrid_llm`: same as `hybrid`, plus manager LLM semantic grading when API key is available.
+  - If omitted, uses manager policy default.
 
 Runtime mapping:
 
@@ -392,7 +418,7 @@ Recommended presets:
 Manager policy defaults:
 
 - Global `--policy-file` (default `orchestrator/manager_policy.json`) controls defaults for:
-  - `run_agent_step`: sandbox / skills mode / timeout / diff budgets / retry cap / test evidence threshold / known baseline-test allowlist / verdict convergence targets / repo-level overrides
+  - `run_agent_step`: sandbox / skills mode / timeout / diff budgets / retry cap / test evidence threshold / runtime grading mode (`rules|hybrid|hybrid_llm`) / known baseline-test allowlist / verdict convergence targets / repo-level overrides
   - `telegram_bot`: polling defaults / list limit / rate limits / audit log path
   - `github_webhook`: payload limit / audit log path
 - CLI flags still override policy values per command.
@@ -409,10 +435,11 @@ Policy file example:
     "max_added_lines": 120,
     "max_retryable_attempts": 3,
     "min_test_commands": 1,
+    "runtime_grading_mode": "hybrid",
     "known_test_failure_allowlist": [],
     "success_event_stream_sample_pct": 15,
-    "success_state": "LOCAL_VALIDATING",
-    "on_retryable_state": "FAILED_RETRYABLE",
+    "success_state": "EXECUTING",
+    "on_retryable_state": "FAILED",
     "on_human_review_state": "NEEDS_HUMAN_REVIEW",
     "repo_overrides": {
       "mem0ai/mem0": {
@@ -457,16 +484,21 @@ Policy file example:
 
 ## Skills Chain
 
-`run-agent-step --skills-mode agentpr` uses this split:
+`run-agent-step` skills modes:
 
-1. `DISCOVERY/PLAN_READY` -> `$agentpr-repo-preflight-contract`
-2. `IMPLEMENTING/LOCAL_VALIDATING` -> `$agentpr-implement-and-validate`
-3. `ITERATING/CI_WAIT/REVIEW_WAIT` -> `$agentpr-ci-review-fix`
+1. `--skills-mode agentpr` (staged split):
+   `EXECUTING/DISCOVERY/PLAN_READY -> preflight-contract`,
+   `IMPLEMENTING/LOCAL_VALIDATING -> implement-and-validate`,
+   `ITERATING/CI_WAIT/REVIEW_WAIT -> ci-review-fix`.
+2. `--skills-mode agentpr_autonomous` (worker autonomous):
+   manager provides installed-skill set + task packet;
+   worker decides invocation order inside one run.
 
 Manager vs worker boundary:
 
 1. Manager injects stage skill plan + task packet + policy.
 2. Worker (`codex exec`) executes the skill logic and code changes.
+3. Task packet includes deterministic `repo.governance_scan` (CONTRIBUTING/PR template/CI/README paths + secondary-search hints).
 
 Skill locations and install flow:
 
@@ -542,7 +574,7 @@ Classification behavior:
 4. `finish.sh` commit title validation bug was fixed (single-line check + empty-title check).
 5. MVP default sandbox is now `danger-full-access` with runtime guardrails and workspace-boundary preflight checks.
 6. Structured runtime report is now generated for each agent attempt, with automatic verdict classification and artifact metadata (`grade/reason_code/next_action`).
-7. Phase B PR gate MVP is implemented: `request-open-pr` + `approve-open-pr --confirm` (double confirmation).
+7. Phase B PR gate MVP is implemented: `request-open-pr` + `approve-open-pr --confirm` (double confirmation), with repo PR-template prepend + manager draft stub + optional About Forge auto-append.
 8. Phase B manager loop is now available: `sync-github` for GitHub state sync and `run-telegram-bot` for remote control commands.
 9. Phase B webhook ingress is available: `run-github-webhook` validates signatures and maps GitHub events to state-machine updates.
 10. Webhook replay hardening is enabled via delivery-id dedup records and cleanup command.
@@ -550,7 +582,7 @@ Classification behavior:
 12. Startup doctor + automatic gate is now implemented to fail fast on environment/auth/network prerequisites.
 13. Codex binary resolution now supports `AGENTPR_CODEX_BIN` and Cursor extension fallback for daemon/PATH stability.
 14. Runtime guardrails now include dirty-worktree blocking, no-push default, and diff-budget classification for `run-agent-step`.
-15. Skills chain is now integrated in `run-agent-step` (`--skills-mode agentpr`), with task packet artifact generation and stage-based required skill checks.
+15. Skills chain is integrated in `run-agent-step` (`--skills-mode agentpr|agentpr_autonomous`), with task packet artifact generation, deterministic governance scan injection, and staged/autonomous control models.
 16. Local AgentPR skills are now versioned under `agentpr/skills/` and installable via `install-skills`; curated CI helpers (`gh-fix-ci`, `gh-address-comments`) can be installed in the same command.
 17. `install-skills --install-curated-ci` is now idempotent for already-installed curated skills.
 18. Retry-cap policy is now configurable and enforced in runtime classification (`retryable_limit_exceeded`).
@@ -558,7 +590,7 @@ Classification behavior:
 20. Telegram bot production hardening is implemented (ACL + rate limits + JSONL audit).
 21. GitHub webhook production hardening is implemented (payload-size guard + JSONL audit + `webhook-audit-summary`).
 22. `run_digest` now includes stage-level observability (`stages.step_totals`, `stages.attempts_recent`, `stages.top_step`) and command-category shares.
-23. Manager policy now supports repo-specific runtime thresholds (`run_agent_step.repo_overrides`), including `min_test_commands`.
+23. Manager policy now supports repo-specific runtime thresholds (`run_agent_step.repo_overrides`), including `min_test_commands` and `runtime_grading_mode`.
 24. Skills-mode now materializes contract artifacts into repo runtime path (`.agentpr_runtime/contracts/*`) to avoid cross-root path blockers.
 25. Runtime classification now blocks false PASS when test/typecheck commands fail (`reason_code=test_command_failed`).
 26. Startup doctor workspace-write probe now uses process-unique filenames to avoid parallel probe collisions.

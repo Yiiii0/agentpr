@@ -44,6 +44,7 @@ bash /Users/yi/Documents/Career/TensorBlcok/agentpr/forge_integration/scripts/pr
 
 ### Step 2: 分析（prompt_template.md Phase 0.5 + Phase 1）
 按顺序回答所有分析问题。特别注意：
+- 优先消费 `task_packet.repo.governance_scan` 的已发现文件，再判断是否需要二次搜索
 - CONTRIBUTING 的 integration-specific 步骤清单 — 列出并全部执行
 - CI 是否有 coverage 要求、doc test
 - 确定用 common path 还是 special path

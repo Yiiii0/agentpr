@@ -19,7 +19,14 @@ from .executor import ScriptExecutor
 from .github_webhook import run_github_webhook_server
 from .github_sync import build_sync_decision
 from .manager_loop import ManagerLoopConfig, ManagerLoopRunner
-from .models import AgentRuntimeGrade, RunCreateInput, RunMode, RunState, StepName
+from .manager_tools import analyze_worker_output, get_global_stats, notify_user
+from .models import (
+    AgentRuntimeGrade,
+    RunCreateInput,
+    RunMode,
+    RunState,
+    StepName,
+)
 from .manager_policy import load_manager_policy, resolve_run_agent_effective_policy
 from .preflight import PreflightChecker, RuntimeDoctor
 from . import runtime_analysis as rt
@@ -36,9 +43,21 @@ from .skills import (
     render_skill_chain_prompt,
     resolve_codex_home,
     resolve_codex_skills_root,
+    scan_repo_governance_sources,
+    select_primary_pr_template,
 )
 from .state_machine import InvalidTransitionError, allowed_targets
-from .telegram_bot import TelegramClient, run_telegram_bot_loop
+from .telegram_bot import (
+    TelegramClient,
+    build_decision_llm_client_if_enabled,
+    build_nl_llm_client_if_enabled,
+    handle_bot_command,
+    handle_natural_language,
+    resolve_decision_why_mode,
+    resolve_telegram_nl_mode,
+    run_telegram_bot_loop,
+    sync_last_run_id_from_text,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -173,7 +192,7 @@ def add_manager_common_args(command_parser: argparse.ArgumentParser) -> None:
     )
     command_parser.add_argument(
         "--skills-mode",
-        choices=["off", "agentpr"],
+        choices=["off", "agentpr", "agentpr_autonomous"],
         help="Optional skills mode override passed to run-agent-step.",
     )
     command_parser.add_argument(
@@ -283,7 +302,7 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("show-run", help="Show single run snapshot")
     s.add_argument("--run-id", required=True)
 
-    d = sub.add_parser("start-discovery", help="Move to DISCOVERY")
+    d = sub.add_parser("start-discovery", help="Move to DISCOVERY (v1) or EXECUTING (v2)")
     d.add_argument("--run-id", required=True)
     add_idempotency_arg(d)
 
@@ -297,11 +316,17 @@ def build_parser() -> argparse.ArgumentParser:
     mp.add_argument("--contract-path", required=True)
     add_idempotency_arg(mp)
 
-    i = sub.add_parser("start-implementation", help="Move to IMPLEMENTING")
+    i = sub.add_parser(
+        "start-implementation",
+        help="Move to IMPLEMENTING (v1) or keep EXECUTING (v2)",
+    )
     i.add_argument("--run-id", required=True)
     add_idempotency_arg(i)
 
-    lv = sub.add_parser("mark-local-validated", help="Move to LOCAL_VALIDATING")
+    lv = sub.add_parser(
+        "mark-local-validated",
+        help="Move to LOCAL_VALIDATING (v1) or keep EXECUTING (v2)",
+    )
     lv.add_argument("--run-id", required=True)
     add_idempotency_arg(lv)
 
@@ -375,19 +400,21 @@ def build_parser() -> argparse.ArgumentParser:
     ag.add_argument(
         "--success-state",
         choices=[
+            RunState.EXECUTING.value,
             RunState.LOCAL_VALIDATING.value,
             RunState.NEEDS_HUMAN_REVIEW.value,
             "UNCHANGED",
         ],
         help=(
             "Optional state convergence after a successful agent run. "
-            "Supported: LOCAL_VALIDATING, NEEDS_HUMAN_REVIEW, UNCHANGED. "
+            "Supported: EXECUTING, LOCAL_VALIDATING, NEEDS_HUMAN_REVIEW, UNCHANGED. "
             "If omitted, uses manager policy default."
         ),
     )
     ag.add_argument(
         "--on-retryable-state",
         choices=[
+            RunState.FAILED.value,
             RunState.FAILED_RETRYABLE.value,
             RunState.NEEDS_HUMAN_REVIEW.value,
             "UNCHANGED",
@@ -401,6 +428,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--on-human-review-state",
         choices=[
             RunState.NEEDS_HUMAN_REVIEW.value,
+            RunState.FAILED.value,
             RunState.FAILED_RETRYABLE.value,
             "UNCHANGED",
         ],
@@ -494,7 +522,18 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         help=(
             "Minimum number of test/lint evidence commands required in "
-            "IMPLEMENTING/LOCAL_VALIDATING/ITERATING on successful exit. "
+            "EXECUTING/IMPLEMENTING/LOCAL_VALIDATING/ITERATING on successful exit. "
+            "If omitted, uses manager policy default."
+        ),
+    )
+    ag.add_argument(
+        "--runtime-grading-mode",
+        choices=["rules", "hybrid", "hybrid_llm"],
+        help=(
+            "Runtime grading mode for this run-agent-step. "
+            "'rules' keeps deterministic grading only; "
+            "'hybrid' enables semantic override for no-test-infra repos; "
+            "'hybrid_llm' adds manager-LLM semantic grading when available. "
             "If omitted, uses manager policy default."
         ),
     )
@@ -508,10 +547,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ag.add_argument(
         "--skills-mode",
-        choices=["off", "agentpr"],
+        choices=["off", "agentpr", "agentpr_autonomous"],
         help=(
             "Enable skills-based prompt envelope for this run. "
-            "agentpr mode invokes stage-specific AgentPR skills. "
+            "agentpr mode invokes stage-specific AgentPR skills; "
+            "agentpr_autonomous lets worker self-orchestrate multi-skill flow in one run. "
             "If omitted, uses manager policy default."
         ),
     )
@@ -544,11 +584,28 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ro.add_argument("--run-id", required=True)
     ro.add_argument("--title", required=True)
-    ro_body_group = ro.add_mutually_exclusive_group(required=True)
+    ro_body_group = ro.add_mutually_exclusive_group(required=False)
     ro_body_group.add_argument("--body", help="PR body text")
     ro_body_group.add_argument("--body-file", type=Path, help="PR body file path")
     ro.add_argument("--base", help="Base branch (defaults to origin/HEAD)")
     ro.add_argument("--head", help="Head branch (defaults to current branch)")
+    ro.add_argument(
+        "--project-name",
+        help=(
+            "Project name used in Forge context text "
+            "(defaults to repository name in workspace)."
+        ),
+    )
+    ro.add_argument(
+        "--skip-repo-pr-template",
+        action="store_true",
+        help="Skip auto-prepending repository PR template content.",
+    )
+    ro.add_argument(
+        "--skip-about-forge",
+        action="store_true",
+        help="Skip appending the shared About Forge section.",
+    )
     ro.add_argument("--draft", action="store_true", help="Create draft PR")
     ro.add_argument(
         "--confirm-ttl-minutes",
@@ -666,6 +723,38 @@ def build_parser() -> argparse.ArgumentParser:
         "--allow-any-chat",
         action="store_true",
         help="Allow any chat id (development only).",
+    )
+
+    sb = sub.add_parser(
+        "simulate-bot-session",
+        help="Simulate bot/human message flow locally without Telegram network calls",
+    )
+    sb.add_argument(
+        "--text",
+        action="append",
+        default=[],
+        help="Input message in chronological order. Can be repeated.",
+    )
+    sb.add_argument(
+        "--text-file",
+        type=Path,
+        help="Optional UTF-8 file with one message per line (appended after --text).",
+    )
+    sb.add_argument(
+        "--list-limit",
+        type=int,
+        default=8,
+        help="Default list/status limit used by bot handlers (default: 8).",
+    )
+    sb.add_argument(
+        "--nl-mode",
+        choices=["rules", "llm", "hybrid"],
+        help="Override AGENTPR_TELEGRAM_NL_MODE for this simulation.",
+    )
+    sb.add_argument(
+        "--decision-why-mode",
+        choices=["off", "hybrid", "llm"],
+        help="Override AGENTPR_TELEGRAM_DECISION_WHY_MODE for this simulation.",
     )
 
     wh = sub.add_parser("run-github-webhook", help="Run GitHub webhook HTTP server")
@@ -898,6 +987,36 @@ def build_parser() -> argparse.ArgumentParser:
         help="Include short stdout/stderr tails per step attempt.",
     )
 
+    awo = sub.add_parser(
+        "analyze-worker-output",
+        help="Analyze latest worker output artifacts for one run",
+    )
+    awo.add_argument("--run-id", required=True)
+
+    ggs = sub.add_parser(
+        "get-global-stats",
+        help="Summarize global run/grade/reason distributions",
+    )
+    ggs.add_argument(
+        "--limit",
+        type=int,
+        default=200,
+        help="Number of recent runs sampled (default: 200).",
+    )
+
+    nu = sub.add_parser(
+        "notify-user",
+        help="Record a manager notification artifact for one run",
+    )
+    nu.add_argument("--run-id", required=True)
+    nu.add_argument("--message", required=True)
+    nu.add_argument(
+        "--priority",
+        choices=["low", "normal", "high", "urgent"],
+        default="normal",
+    )
+    nu.add_argument("--channel", default="manager")
+
     rb = sub.add_parser(
         "run-bottlenecks",
         help="Summarize runtime bottlenecks across recent runs",
@@ -989,6 +1108,15 @@ def resolve_startup_doctor_profile(args: argparse.Namespace) -> dict[str, Any] |
             "check_network": True,
             "require_gh_auth": True,
             "require_codex": True,
+            "require_telegram_token": False,
+            "require_webhook_secret": False,
+        }
+    if command == "simulate-bot-session":
+        return {
+            "profile": "simulate",
+            "check_network": False,
+            "require_gh_auth": False,
+            "require_codex": False,
             "require_telegram_token": False,
             "require_webhook_secret": False,
         }
@@ -1247,6 +1375,131 @@ def main() -> int:
             print_json(report)
             return 0
 
+        if args.command == "analyze-worker-output":
+            report = analyze_worker_output(
+                service=service,
+                run_id=str(args.run_id).strip(),
+            )
+            print_json(report)
+            return 0 if bool(report.get("ok", False)) else 1
+
+        if args.command == "get-global-stats":
+            report = get_global_stats(
+                service=service,
+                limit=max(int(args.limit), 1),
+            )
+            print_json(report)
+            return 0
+
+        if args.command == "notify-user":
+            report = notify_user(
+                service=service,
+                run_id=str(args.run_id).strip(),
+                message=str(args.message),
+                priority=str(args.priority),
+                channel=str(args.channel),
+            )
+            print_json(report)
+            return 0
+
+        if args.command == "simulate-bot-session":
+            messages = [
+                str(item).strip()
+                for item in list(args.text or [])
+                if str(item).strip()
+            ]
+            if args.text_file is not None:
+                text_file = Path(args.text_file).expanduser()
+                if not text_file.exists():
+                    raise ValueError(f"Text file not found: {text_file}")
+                file_lines = text_file.read_text(encoding="utf-8").splitlines()
+                for raw in file_lines:
+                    line = str(raw).strip()
+                    if line:
+                        messages.append(line)
+            if not messages:
+                raise ValueError("simulate-bot-session requires at least one message.")
+
+            resolved_nl_mode = (
+                str(args.nl_mode).strip().lower()
+                if args.nl_mode is not None
+                else resolve_telegram_nl_mode()
+            )
+            if resolved_nl_mode not in {"rules", "llm", "hybrid"}:
+                resolved_nl_mode = "rules"
+            resolved_decision_why_mode = (
+                str(args.decision_why_mode).strip().lower()
+                if args.decision_why_mode is not None
+                else resolve_decision_why_mode()
+            )
+            if resolved_decision_why_mode not in {"off", "hybrid", "llm"}:
+                resolved_decision_why_mode = "hybrid"
+
+            nl_llm_client = build_nl_llm_client_if_enabled(
+                nl_mode=resolved_nl_mode,
+            )
+            decision_llm_client = build_decision_llm_client_if_enabled(
+                decision_why_mode=resolved_decision_why_mode,
+                fallback_client=nl_llm_client,
+            )
+            conversation_state: dict[str, Any] = {}
+            list_limit = max(int(args.list_limit), 1)
+            transcript: list[dict[str, Any]] = []
+            for idx, text in enumerate(messages, start=1):
+                if text.startswith("/"):
+                    response = handle_bot_command(
+                        text=text,
+                        service=service,
+                        db_path=Path(args.db),
+                        workspace_root=Path(args.workspace_root),
+                        integration_root=Path(args.integration_root),
+                        project_root=PROJECT_ROOT,
+                        list_limit=list_limit,
+                        decision_llm_client=decision_llm_client,
+                        decision_why_mode=resolved_decision_why_mode,
+                    )
+                    sync_last_run_id_from_text(conversation_state, text)
+                    input_mode = "command"
+                else:
+                    response = handle_natural_language(
+                        text=text,
+                        service=service,
+                        db_path=Path(args.db),
+                        workspace_root=Path(args.workspace_root),
+                        integration_root=Path(args.integration_root),
+                        project_root=PROJECT_ROOT,
+                        list_limit=list_limit,
+                        conversation_state=conversation_state,
+                        llm_client=nl_llm_client,
+                        nl_mode=resolved_nl_mode,
+                        decision_llm_client=decision_llm_client,
+                        decision_why_mode=resolved_decision_why_mode,
+                    )
+                    input_mode = "natural_language"
+                transcript.append(
+                    {
+                        "index": idx,
+                        "input_mode": input_mode,
+                        "input": text,
+                        "response": response,
+                    }
+                )
+            print_json(
+                {
+                    "ok": True,
+                    "message_count": len(messages),
+                    "nl_mode": resolved_nl_mode,
+                    "decision_why_mode": resolved_decision_why_mode,
+                    "llm_clients": {
+                        "nl_available": nl_llm_client is not None,
+                        "decision_available": decision_llm_client is not None,
+                    },
+                    "last_run_id": str(conversation_state.get("last_run_id") or ""),
+                    "transcript": transcript,
+                }
+            )
+            return 0
+
         if args.command == "run-bottlenecks":
             report = gather_run_bottlenecks(
                 service=service,
@@ -1435,6 +1688,11 @@ def main() -> int:
                 if args.min_test_commands is not None
                 else int(effective_policy["min_test_commands"])
             )
+            resolved_runtime_grading_mode = (
+                str(args.runtime_grading_mode).strip()
+                if args.runtime_grading_mode is not None
+                else str(effective_policy.get("runtime_grading_mode") or "hybrid")
+            )
             resolved_known_test_failure_allowlist = [
                 str(item).strip()
                 for item in list(effective_policy.get("known_test_failure_allowlist") or [])
@@ -1459,34 +1717,50 @@ def main() -> int:
                 else str(effective_policy["on_human_review_state"])
             )
             current_state = RunState(snapshot["state"])
+            # Normalize legacy policy defaults to V2 states.
             if (
                 args.success_state is None
-                and current_state == RunState.DISCOVERY
                 and resolved_success_state == RunState.LOCAL_VALIDATING.value
             ):
-                resolved_success_state = "UNCHANGED"
-            if current_state == RunState.LOCAL_VALIDATING and resolved_success_state == RunState.LOCAL_VALIDATING.value:
-                resolved_success_state = "UNCHANGED"
+                resolved_success_state = RunState.EXECUTING.value
+            if (
+                args.on_retryable_state is None
+                and resolved_on_retryable_state == RunState.FAILED_RETRYABLE.value
+            ):
+                resolved_on_retryable_state = RunState.FAILED.value
+            if (
+                args.on_human_review_state is None
+                and resolved_on_human_review_state == RunState.FAILED_RETRYABLE.value
+            ):
+                resolved_on_human_review_state = RunState.FAILED.value
             preflight_report: dict[str, Any] | None = None
             if current_state == RunState.QUEUED:
-                service.start_discovery(args.run_id)
-                current_state = RunState.DISCOVERY
+                transitioned = service.start_discovery(args.run_id)
+                current_state = RunState(str(transitioned["state"]))
             if current_state not in {
+                RunState.EXECUTING,
+                RunState.ITERATING,
+                # Legacy states for old runs still in-flight:
                 RunState.DISCOVERY,
+                RunState.PLAN_READY,
                 RunState.IMPLEMENTING,
                 RunState.LOCAL_VALIDATING,
-                RunState.ITERATING,
             }:
                 raise ValueError(
-                    "run-agent-step is allowed only in DISCOVERY/IMPLEMENTING/"
-                    "LOCAL_VALIDATING/ITERATING states."
+                    "run-agent-step is allowed only in "
+                    "EXECUTING/ITERATING states."
                 )
             repo_dir = Path(run["workspace_dir"])
             if not repo_dir.exists():
                 raise ValueError(f"Workspace not found: {repo_dir}")
             if (
                 not args.allow_dirty_worktree
-                and current_state in {RunState.DISCOVERY, RunState.IMPLEMENTING}
+                and current_state in {
+                    RunState.EXECUTING,
+                    RunState.DISCOVERY,
+                    RunState.PLAN_READY,
+                    RunState.IMPLEMENTING,
+                }
             ):
                 preexisting_diff = collect_repo_diff_summary(repo_dir=repo_dir)
                 if int(preexisting_diff.get("changed_files_count", 0)) > 0:
@@ -1548,13 +1822,16 @@ def main() -> int:
             )
             external_read_only_paths = resolve_external_read_only_paths(
                 integration_root=Path(args.integration_root),
-                include_skills_root=(resolved_skills_mode == "agentpr"),
+                include_skills_root=(
+                    resolved_skills_mode in {"agentpr", "agentpr_autonomous"}
+                ),
                 user_paths=[str(item) for item in (args.allow_read_path or [])],
             )
             prompt = load_prompt(args)
             skill_plan_payload: dict[str, Any] | None = None
             task_packet_path: Path | None = None
-            if resolved_skills_mode == "agentpr":
+            governance_scan: dict[str, Any] | None = None
+            if resolved_skills_mode in {"agentpr", "agentpr_autonomous"}:
                 installed_skills = discover_installed_skills()
                 plan = build_skill_plan(
                     run_state=current_state,
@@ -1582,7 +1859,7 @@ def main() -> int:
                     print_json(
                         {
                             "ok": False,
-                            "error": "required skills are missing for agentpr skills-mode",
+                            "error": "required skills are missing for enabled skills-mode",
                             "missing_required": list(plan.missing_required),
                             "skills_root": str(plan.skills_root),
                             "state": state_result["state"],
@@ -1607,6 +1884,7 @@ def main() -> int:
                 user_packet: Any | None = None
                 if args.task_packet_file is not None:
                     user_packet = load_user_task_packet(args.task_packet_file)
+                governance_scan = scan_repo_governance_sources(repo_dir=repo_dir)
                 task_packet = build_task_packet(
                     run=run,
                     run_state=current_state,
@@ -1620,6 +1898,7 @@ def main() -> int:
                     max_added_lines=resolved_max_added_lines,
                     integration_root=Path(args.integration_root),
                     skill_plan=plan,
+                    governance_scan=governance_scan,
                     user_packet=user_packet,
                 )
                 task_packet_path = write_task_packet(args.run_id, task_packet)
@@ -1631,6 +1910,11 @@ def main() -> int:
                         "skills_mode": resolved_skills_mode,
                         "required_now": list(plan.required_now),
                         "missing_required": list(plan.missing_required),
+                        "primary_pr_template": str(
+                            governance_scan.get("primary_pr_template") or ""
+                        )
+                        if isinstance(governance_scan, dict)
+                        else "",
                     },
                 )
                 prompt = render_skill_chain_prompt(
@@ -1704,10 +1988,12 @@ def main() -> int:
                 max_added_lines=resolved_max_added_lines,
                 max_retryable_attempts=resolved_max_retryable_attempts,
                 min_test_commands=resolved_min_test_commands,
+                runtime_grading_mode=resolved_runtime_grading_mode,
                 known_test_failure_allowlist=resolved_known_test_failure_allowlist,
                 attempt_no=agent_attempt_no,
                 skills_mode=resolved_skills_mode,
                 skill_plan=skill_plan_payload,
+                repo_dir=repo_dir,
                 task_packet_path=str(task_packet_path) if task_packet_path else None,
                 event_summary=event_summary,
                 event_stream_path=None,
@@ -1723,6 +2009,7 @@ def main() -> int:
                         "max_added_lines": policy_agent.max_added_lines,
                         "max_retryable_attempts": policy_agent.max_retryable_attempts,
                         "min_test_commands": policy_agent.min_test_commands,
+                        "runtime_grading_mode": policy_agent.runtime_grading_mode,
                         "known_test_failure_allowlist": list(policy_agent.known_test_failure_allowlist),
                         "success_event_stream_sample_pct": policy_agent.success_event_stream_sample_pct,
                         "success_state": policy_agent.success_state,
@@ -1734,6 +2021,7 @@ def main() -> int:
                         "resolved_on_human_review_state": resolved_on_human_review_state,
                         "resolved_success_event_stream_sample_pct": resolved_success_event_stream_sample_pct,
                         "resolved_max_agent_seconds": resolved_max_agent_seconds,
+                        "resolved_runtime_grading_mode": resolved_runtime_grading_mode,
                         "resolved_known_test_failure_allowlist": resolved_known_test_failure_allowlist,
                         "resolved_external_read_only_paths": [
                             str(item) for item in external_read_only_paths
@@ -1976,9 +2264,25 @@ def main() -> int:
             title = args.title.strip()
             if not title:
                 raise ValueError("PR title cannot be empty.")
-            body = load_optional_text(args.body, args.body_file, arg_name="PR body")
+            user_body = load_optional_text(args.body, args.body_file, arg_name="PR body")
+            project_name = (
+                str(args.project_name).strip()
+                if args.project_name is not None
+                else repo_dir.name
+            )
+            body, body_meta = build_request_open_pr_body(
+                repo_dir=repo_dir,
+                integration_root=Path(args.integration_root),
+                user_body=user_body,
+                project_name=project_name,
+                prepend_repo_pr_template=not bool(args.skip_repo_pr_template),
+                append_about_forge=not bool(args.skip_about_forge),
+            )
             if not body.strip():
-                raise ValueError("PR body cannot be empty.")
+                raise ValueError(
+                    "PR body is empty after composition. "
+                    "Pass --body/--body-file or provide a valid repo template."
+                )
             head = (args.head or executor.current_branch(repo_dir)).strip()
             base = (args.base or executor.default_base_branch(repo_dir)).strip()
             if not head:
@@ -1998,6 +2302,7 @@ def main() -> int:
                 "confirm_token": confirm_token,
                 "created_at": created_at.isoformat(),
                 "expires_at": expires_at.isoformat(),
+                "body_meta": body_meta,
             }
             request_path = write_pr_open_request(args.run_id, request_payload)
             service.add_artifact(
@@ -2008,6 +2313,7 @@ def main() -> int:
                     "base": base,
                     "head": head,
                     "expires_at": expires_at.isoformat(),
+                    "body_meta": body_meta,
                 },
             )
             print_json(
@@ -2022,6 +2328,8 @@ def main() -> int:
                         "base": base,
                         "head": head,
                         "draft": bool(args.draft),
+                        "project_name": project_name,
+                        "body_meta": body_meta,
                     },
                     "next_command": (
                         "python3.11 -m orchestrator.cli approve-open-pr "
@@ -2491,6 +2799,183 @@ def load_optional_text(inline: str | None, file_path: Path | None, *, arg_name: 
         return file_path.read_text(encoding="utf-8")
     except OSError as exc:
         raise ValueError(f"Failed to read {arg_name} file {file_path}: {exc}") from exc
+
+
+def _read_text_if_exists(path: Path) -> str:
+    if not path.exists() or not path.is_file():
+        return ""
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+
+
+def _normalize_text_block(text: str) -> str:
+    return str(text or "").strip()
+
+
+def _strip_template_preamble(text: str) -> str:
+    normalized = _normalize_text_block(text)
+    if not normalized:
+        return ""
+    # Drop instructional preamble from local template files when present.
+    parts = re.split(r"\n-{3,}\n", normalized, maxsplit=1)
+    if len(parts) == 2 and (
+        "PR Description Template" in parts[0]
+        or "创建 PR 时复制以下内容" in parts[0]
+    ):
+        return _normalize_text_block(parts[1])
+    return normalized
+
+
+def _contains_about_forge_section(text: str) -> bool:
+    return re.search(
+        r"^\s{0,3}#{1,6}\s*about forge\b",
+        str(text or ""),
+        flags=re.IGNORECASE | re.MULTILINE,
+    ) is not None
+
+
+def _load_repo_pr_template_text(repo_dir: Path) -> tuple[str, str]:
+    governance = scan_repo_governance_sources(repo_dir=repo_dir)
+    groups = governance.get("groups")
+    groups = groups if isinstance(groups, dict) else {}
+    candidates = [str(item).strip() for item in list(groups.get("pr_templates") or [])]
+    primary = select_primary_pr_template(candidates) or str(
+        governance.get("primary_pr_template") or ""
+    ).strip()
+    if not primary:
+        return "", ""
+    path = repo_dir / primary
+    return primary, _normalize_text_block(_read_text_if_exists(path))
+
+
+def _load_about_forge_text(
+    *,
+    integration_root: Path,
+    project_name: str,
+) -> tuple[str, str]:
+    finish_script = integration_root / "scripts" / "finish.sh"
+    finish_text = _read_text_if_exists(finish_script)
+    if finish_text:
+        match = re.search(
+            r"## About Forge\n(?P<section>.*?)(?:\nEOF\b)",
+            finish_text,
+            flags=re.DOTALL,
+        )
+        if match:
+            section = _normalize_text_block(
+                "## About Forge\n" + str(match.group("section") or "")
+            )
+            if section:
+                section = section.replace("${PROJECT}", project_name)
+                return section, "finish.sh"
+
+    pr_template_path = integration_root / "pr_description_template.md"
+    pr_template_text = _read_text_if_exists(pr_template_path)
+    if pr_template_text:
+        match = re.search(
+            r"## About Forge\n(?P<section>.*)$",
+            pr_template_text,
+            flags=re.DOTALL,
+        )
+        if match:
+            section = _normalize_text_block(
+                "## About Forge\n" + str(match.group("section") or "")
+            )
+            if section:
+                section = section.replace("[Project Name]", project_name)
+                return section, "pr_description_template.md"
+    return "", ""
+
+
+def _load_default_pr_body(*, integration_root: Path, project_name: str) -> tuple[str, str]:
+    template_path = integration_root / "pr_description_template.md"
+    body = _strip_template_preamble(_read_text_if_exists(template_path))
+    if not body:
+        return "", ""
+    body = body.replace("[Project Name]", project_name)
+    body = body.replace("[具体改动描述，按 repo 填写]", "Integrated Forge with minimal-diff changes.")
+    return body, str(template_path)
+
+
+def _build_manager_pr_body_stub(*, project_name: str) -> str:
+    return (
+        "## AgentPR Draft Summary\n\n"
+        f"- Integrated Forge support for {project_name} with minimal-diff changes.\n"
+        "- Kept existing provider behavior unchanged (additive integration only).\n"
+        "- Validation evidence and run artifacts are attached in AgentPR outputs."
+    )
+
+
+def build_request_open_pr_body(
+    *,
+    repo_dir: Path,
+    integration_root: Path,
+    user_body: str,
+    project_name: str,
+    prepend_repo_pr_template: bool,
+    append_about_forge: bool,
+) -> tuple[str, dict[str, Any]]:
+    user_body_text = _normalize_text_block(user_body)
+    sections: list[str] = []
+    metadata: dict[str, Any] = {
+        "project_name": project_name,
+        "user_body_supplied": bool(user_body_text),
+        "repo_pr_template_used": False,
+        "repo_pr_template_path": "",
+        "manager_stub_appended": False,
+        "fallback_body_used": False,
+        "fallback_body_source": "",
+        "about_forge_appended": False,
+        "about_forge_source": "",
+    }
+
+    if prepend_repo_pr_template:
+        template_relpath, template_text = _load_repo_pr_template_text(repo_dir)
+        if template_text:
+            sections.append(template_text)
+            metadata["repo_pr_template_used"] = True
+            metadata["repo_pr_template_path"] = template_relpath
+
+    if user_body_text:
+        sections.append(user_body_text)
+
+    if metadata["repo_pr_template_used"] and not user_body_text:
+        sections.append(_build_manager_pr_body_stub(project_name=project_name))
+        metadata["manager_stub_appended"] = True
+
+    if not sections:
+        fallback_body, fallback_source = _load_default_pr_body(
+            integration_root=integration_root,
+            project_name=project_name,
+        )
+        if fallback_body:
+            sections.append(fallback_body)
+            metadata["fallback_body_used"] = True
+            metadata["fallback_body_source"] = fallback_source
+
+    composed = "\n\n---\n\n".join(
+        section for section in sections if _normalize_text_block(section)
+    ).strip()
+
+    if append_about_forge:
+        about_forge_text, about_source = _load_about_forge_text(
+            integration_root=integration_root,
+            project_name=project_name,
+        )
+        if about_forge_text and not _contains_about_forge_section(composed):
+            composed = (
+                f"{composed}\n\n---\n\n{about_forge_text.strip()}"
+                if composed
+                else about_forge_text.strip()
+            )
+            metadata["about_forge_appended"] = True
+            metadata["about_forge_source"] = about_source
+        elif about_forge_text:
+            metadata["about_forge_source"] = about_source
+
+    return composed.strip(), metadata
 
 
 def resolve_external_read_only_paths(
@@ -3441,6 +3926,10 @@ def recommended_actions_for_state(state: RunState) -> list[str]:
             "start-discovery --run-id <run_id>",
             "run-prepare --run-id <run_id>",
         ],
+        RunState.EXECUTING: [
+            "run-agent-step --run-id <run_id> --prompt-file <path> --success-state EXECUTING",
+            "run-finish --run-id <run_id> --changes <summary>",
+        ],
         RunState.DISCOVERY: [
             "mark-plan-ready --run-id <run_id> --contract-path <path>",
             "run-agent-step --run-id <run_id> --prompt-file <path>",
@@ -3457,7 +3946,7 @@ def recommended_actions_for_state(state: RunState) -> list[str]:
             "run-finish --run-id <run_id> --changes <summary>",
         ],
         RunState.PUSHED: [
-            "request-open-pr --run-id <run_id> --title <title> --body-file <path>",
+            "request-open-pr --run-id <run_id> --title <title> [--body-file <path>]",
             "or keep push_only and wait for manual PR decision",
         ],
         RunState.CI_WAIT: [
@@ -3478,6 +3967,10 @@ def recommended_actions_for_state(state: RunState) -> list[str]:
         ],
         RunState.FAILED_RETRYABLE: [
             "retry --run-id <run_id> --target-state IMPLEMENTING",
+            "inspect-run --run-id <run_id>",
+        ],
+        RunState.FAILED: [
+            "retry --run-id <run_id> --target-state EXECUTING",
             "inspect-run --run-id <run_id>",
         ],
         RunState.PAUSED: [
@@ -4049,16 +4542,53 @@ def converge_agent_success_state(
     *,
     success_state: str | None = None,
 ) -> str:
+    snapshot = service.get_run_snapshot(args.run_id)
+    current_state = RunState(snapshot["state"])
     resolved_success_state = success_state if success_state is not None else args.success_state
     if resolved_success_state is None:
-        return service.get_run_snapshot(args.run_id)["state"]
+        return current_state.value
     if str(resolved_success_state).strip().upper() == "UNCHANGED":
-        return service.get_run_snapshot(args.run_id)["state"]
+        return current_state.value
 
-    target = RunState(str(resolved_success_state))
+    target = RunState(str(resolved_success_state).strip().upper())
+    # Normalize legacy target to V2.
     if target == RunState.LOCAL_VALIDATING:
-        current_state = RunState(service.get_run_snapshot(args.run_id)["state"])
-        if current_state in {RunState.LOCAL_VALIDATING, RunState.DISCOVERY, RunState.PLAN_READY}:
+        target = RunState.EXECUTING
+
+    if target == RunState.EXECUTING:
+        if current_state == RunState.EXECUTING:
+            return current_state.value
+        result = service.retry_run(
+            args.run_id,
+            target_state=RunState.EXECUTING,
+        )
+        return str(result["state"])
+
+    if target == RunState.LOCAL_VALIDATING:
+        if current_state == RunState.LOCAL_VALIDATING:
+            return current_state.value
+        if current_state == RunState.DISCOVERY:
+            contract_artifact = service.latest_artifact(
+                args.run_id,
+                artifact_type="contract",
+            )
+            contract_uri = (
+                str(contract_artifact.get("uri"))
+                if isinstance(contract_artifact, dict) and contract_artifact.get("uri")
+                else f"inline://auto_contract/{args.run_id}"
+            )
+            service.mark_plan_ready(
+                args.run_id,
+                contract_path=contract_uri,
+            )
+            current_state = RunState(service.get_run_snapshot(args.run_id)["state"])
+        if current_state == RunState.PLAN_READY:
+            service.start_implementation(args.run_id)
+            current_state = RunState(service.get_run_snapshot(args.run_id)["state"])
+        if current_state in {RunState.IMPLEMENTING, RunState.ITERATING}:
+            result = service.mark_local_validation_passed(args.run_id)
+            return str(result["state"])
+        if current_state == RunState.PAUSED:
             return current_state.value
         result = service.mark_local_validation_passed(args.run_id)
         return str(result["state"])
@@ -4082,6 +4612,11 @@ def apply_nonpass_verdict_state(
     normalized = str(target_state).strip().upper()
     if normalized == "UNCHANGED":
         return service.get_run_snapshot(run_id)
+    # Normalize legacy targets to V2.
+    if normalized == RunState.FAILED_RETRYABLE.value:
+        normalized = RunState.FAILED.value
+    if normalized == RunState.IMPLEMENTING.value:
+        normalized = RunState.EXECUTING.value
     target = RunState(normalized)
     return service.retry_run(
         run_id,

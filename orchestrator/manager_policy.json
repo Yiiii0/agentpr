@@ -7,10 +7,11 @@
     "max_added_lines": 120,
     "max_retryable_attempts": 3,
     "min_test_commands": 1,
+    "runtime_grading_mode": "hybrid",
     "known_test_failure_allowlist": [],
     "success_event_stream_sample_pct": 15,
-    "success_state": "LOCAL_VALIDATING",
-    "on_retryable_state": "FAILED_RETRYABLE",
+    "success_state": "EXECUTING",
+    "on_retryable_state": "FAILED",
     "on_human_review_state": "NEEDS_HUMAN_REVIEW",
     "repo_overrides": {
       "mem0ai/mem0": {

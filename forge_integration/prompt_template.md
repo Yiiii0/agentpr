@@ -30,6 +30,11 @@ Before full analysis, answer these questions:
 
 **Read these in order. They determine everything else.**
 
+0. **Use manager-provided governance scan first (if present in task packet):**
+   - Read `task_packet.repo.governance_scan.groups` and open those files first.
+   - Treat this as deterministic seed evidence (reusable across skill-1/skill-2).
+   - Then decide whether second-pass search is needed for naming variants.
+
 1. **CONTRIBUTING / AGENTS.md / PR template:**
    - What branch to create from? Cross-check with `git remote show upstream | grep HEAD`
    - What code style rules?
@@ -49,6 +54,13 @@ Before full analysis, answer these questions:
    - **Priority: project-specific setup docs > CI workflows > pyproject.toml inference**
 
 4. **Code style config:** `.editorconfig`, `ruff.toml`, `.eslintrc`, `.prettierrc`?
+
+5. **If anything is missing/ambiguous, run secondary search with hidden paths enabled (`--hidden`):**
+   - `rg --files --hidden -g 'CONTRIBUT*' -g 'CODE_OF_CONDUCT*' -g 'CODEOWNERS' -g 'AGENTS.md'`
+   - `rg --files --hidden -g '.github/PULL_REQUEST_TEMPLATE*' -g '.github/pull_request_template*' -g '.github/PULL_REQUEST_TEMPLATE/**' -g '.github/pull_request_template/**'`
+   - `find .github -maxdepth 4 -type f \( -iname '*pull_request_template*' -o -iname '*pr_template*' \)`
+   - `rg --files --hidden -g 'README*' -g 'DEVELOP*' -g 'DEVELOPMENT*' -g 'SETUP*' -g 'HACKING*' -g 'INSTALL*' -g 'docs/**'`
+   - `rg -n --hidden -i 'contribut|development|setup|testing|pull request|pr template' README* docs/**`
 
 ### 1.2 Project Basics
 - Language? Package manager? Test runner? Formatter/linter?

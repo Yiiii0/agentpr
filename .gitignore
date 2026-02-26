@@ -13,3 +13,4 @@ workspaces/
 .tmp_vendor_skills/
 
 data/
+start_claude_code.sh

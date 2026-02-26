@@ -41,6 +41,22 @@ class BotLLMSelection:
     raw: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class WorkerOutputGrade:
+    verdict: str
+    reason: str
+    confidence: str
+    raw: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class DecisionCardExplanation:
+    why_llm: str
+    suggested_actions: list[str]
+    confidence: str
+    raw: dict[str, Any]
+
+
 class ManagerLLMClient:
     def __init__(self, config: ManagerLLMConfig) -> None:
         self.config = config
@@ -142,7 +158,7 @@ class ManagerLLMClient:
         }
         try:
             data = self._request_chat_completion(payload)
-            return self._parse_manager_selection_from_response(data)
+            return self._selection_from_payload(self._extract_tool_call_payload(data), data)
         except ManagerLLMError as exc:
             if not self._should_try_json_fallback(exc):
                 raise
@@ -254,7 +270,7 @@ class ManagerLLMClient:
         }
         try:
             data = self._request_chat_completion(payload)
-            return self._parse_bot_selection_from_response(data)
+            return self._bot_selection_from_payload(self._extract_tool_call_payload(data), data)
         except ManagerLLMError as exc:
             if not self._should_try_json_fallback(exc):
                 raise
@@ -270,6 +286,181 @@ class ManagerLLMClient:
                 ),
             )
             return self._bot_selection_from_payload(
+                parsed,
+                {
+                    "fallback_mode": "json_no_tools",
+                    "fallback_reason": str(exc),
+                },
+            )
+
+    def grade_worker_output(
+        self,
+        *,
+        evidence: dict[str, Any],
+    ) -> WorkerOutputGrade:
+        tool_schema = {
+            "type": "function",
+            "function": {
+                "name": "grade_worker_output",
+                "description": (
+                    "Grade worker output semantics for runtime classification."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "verdict": {
+                            "type": "string",
+                            "enum": ["PASS", "NEEDS_REVIEW", "FAIL"],
+                        },
+                        "reason": {
+                            "type": "string",
+                            "description": "One-sentence explanation grounded in evidence.",
+                        },
+                        "confidence": {
+                            "type": "string",
+                            "enum": ["low", "medium", "high"],
+                        },
+                    },
+                    "required": ["verdict", "reason", "confidence"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are AgentPR runtime semantic grader. "
+                    "Use only provided evidence. Apply these fixed criteria: "
+                    "(1) test infrastructure exists? "
+                    "(2) if exists, required tests executed? "
+                    "(3) if absent, alternative validation sufficient? "
+                    "(4) change scope matches risk? "
+                    "(5) PR-template testing expectations satisfied or not applicable? "
+                    "(6) worker self-report aligns with evidence? "
+                    "Output PASS only when criteria are clearly satisfied."
+                ),
+            },
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {"worker_output_evidence": evidence},
+                    ensure_ascii=True,
+                    sort_keys=True,
+                ),
+            },
+        ]
+        payload = {
+            "model": self.config.model,
+            "temperature": 0,
+            "messages": messages,
+            "tools": [tool_schema],
+            "tool_choice": {
+                "type": "function",
+                "function": {"name": "grade_worker_output"},
+            },
+        }
+        try:
+            data = self._request_chat_completion(payload)
+            return self._worker_output_grade_from_payload(
+                self._extract_tool_call_payload(data), data
+            )
+        except ManagerLLMError as exc:
+            if not self._should_try_json_fallback(exc):
+                raise
+            parsed = self._request_json_fallback(
+                messages=messages,
+                schema_instruction=(
+                    "Return ONLY one compact JSON object with fields: "
+                    "verdict (PASS|NEEDS_REVIEW|FAIL), reason (string), "
+                    "confidence (low|medium|high)."
+                ),
+            )
+            return self._worker_output_grade_from_payload(
+                parsed,
+                {
+                    "fallback_mode": "json_no_tools",
+                    "fallback_reason": str(exc),
+                },
+            )
+
+    def explain_decision_card(
+        self,
+        *,
+        decision_card: dict[str, Any],
+    ) -> DecisionCardExplanation:
+        tool_schema = {
+            "type": "function",
+            "function": {
+                "name": "explain_decision_card",
+                "description": "Generate human-readable decision explanation and next steps.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "why_llm": {
+                            "type": "string",
+                            "description": "2-3 sentence explanation in operator language.",
+                        },
+                        "suggested_actions": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Concrete next actions for operator.",
+                        },
+                        "confidence": {
+                            "type": "string",
+                            "enum": ["low", "medium", "high"],
+                        },
+                    },
+                    "required": ["why_llm", "suggested_actions", "confidence"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are AgentPR operations manager. "
+                    "Explain deterministic decision-card evidence in plain actionable terms. "
+                    "Do not invent facts. Keep suggestions concrete and safe."
+                ),
+            },
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {"decision_card": decision_card},
+                    ensure_ascii=True,
+                    sort_keys=True,
+                ),
+            },
+        ]
+        payload = {
+            "model": self.config.model,
+            "temperature": 0,
+            "messages": messages,
+            "tools": [tool_schema],
+            "tool_choice": {
+                "type": "function",
+                "function": {"name": "explain_decision_card"},
+            },
+        }
+        try:
+            data = self._request_chat_completion(payload)
+            return self._decision_card_explanation_from_payload(
+                self._extract_tool_call_payload(data), data
+            )
+        except ManagerLLMError as exc:
+            if not self._should_try_json_fallback(exc):
+                raise
+            parsed = self._request_json_fallback(
+                messages=messages,
+                schema_instruction=(
+                    "Return ONLY one compact JSON object with fields: "
+                    "why_llm (string), suggested_actions (string array), "
+                    "confidence (low|medium|high)."
+                ),
+            )
+            return self._decision_card_explanation_from_payload(
                 parsed,
                 {
                     "fallback_mode": "json_no_tools",
@@ -352,16 +543,14 @@ class ManagerLLMClient:
             raise ManagerLLMError("manager llm content json must be object")
         return parsed
 
-    def _parse_manager_selection_from_response(
-        self, raw: dict[str, Any]
-    ) -> ManagerLLMSelection:
+    def _extract_tool_call_payload(self, raw: dict[str, Any]) -> dict[str, Any]:
+        """Extract parsed JSON payload from a tool-call response (or content fallback)."""
         choices = raw.get("choices")
         if not isinstance(choices, list) or not choices:
             raise ManagerLLMError("manager llm missing choices")
         message = (choices[0] or {}).get("message")
         if not isinstance(message, dict):
             raise ManagerLLMError("manager llm missing message")
-
         tool_calls = message.get("tool_calls")
         if isinstance(tool_calls, list) and tool_calls:
             first_call = tool_calls[0] if isinstance(tool_calls[0], dict) else {}
@@ -377,38 +566,9 @@ class ManagerLLMClient:
                 raise ManagerLLMError(
                     f"manager llm invalid tool arguments: {arguments[:400]}"
                 ) from exc
-            return self._selection_from_payload(parsed, raw)
-
-        parsed = self._parse_json_content_payload(raw)
-        return self._selection_from_payload(parsed, raw)
-
-    def _parse_bot_selection_from_response(self, raw: dict[str, Any]) -> BotLLMSelection:
-        choices = raw.get("choices")
-        if not isinstance(choices, list) or not choices:
-            raise ManagerLLMError("manager llm missing choices")
-        message = (choices[0] or {}).get("message")
-        if not isinstance(message, dict):
-            raise ManagerLLMError("manager llm missing message")
-
-        tool_calls = message.get("tool_calls")
-        if isinstance(tool_calls, list) and tool_calls:
-            first_call = tool_calls[0] if isinstance(tool_calls[0], dict) else {}
-            fn_payload = (
-                first_call.get("function")
-                if isinstance(first_call.get("function"), dict)
-                else {}
-            )
-            arguments = str(fn_payload.get("arguments") or "{}").strip()
-            try:
-                parsed = json.loads(arguments)
-            except json.JSONDecodeError as exc:
-                raise ManagerLLMError(
-                    f"manager llm invalid bot tool arguments: {arguments[:400]}"
-                ) from exc
-            return self._bot_selection_from_payload(parsed, raw)
-
-        parsed = self._parse_json_content_payload(raw)
-        return self._bot_selection_from_payload(parsed, raw)
+            if isinstance(parsed, dict):
+                return parsed
+        return self._parse_json_content_payload(raw)
 
     @staticmethod
     def _extract_text_content(content: Any) -> str:
@@ -508,5 +668,60 @@ class ManagerLLMClient:
             prompt_version=prompt_version,
             target_state=target_state,
             limit=limit,
+            raw=raw,
+        )
+
+    @staticmethod
+    def _worker_output_grade_from_payload(
+        payload: Any,
+        raw: dict[str, Any],
+    ) -> WorkerOutputGrade:
+        if not isinstance(payload, dict):
+            raise ManagerLLMError("manager llm grading payload must be object")
+        verdict = str(payload.get("verdict") or "").strip().upper()
+        reason = str(payload.get("reason") or "").strip()
+        confidence = str(payload.get("confidence") or "").strip().lower()
+        if verdict not in {"PASS", "NEEDS_REVIEW", "FAIL"}:
+            raise ManagerLLMError(
+                f"manager llm invalid grading verdict: {verdict}"
+            )
+        if confidence not in {"low", "medium", "high"}:
+            confidence = "medium"
+        if not reason:
+            reason = "semantic grade inferred from worker evidence"
+        return WorkerOutputGrade(
+            verdict=verdict,
+            reason=reason,
+            confidence=confidence,
+            raw=raw,
+        )
+
+    @staticmethod
+    def _decision_card_explanation_from_payload(
+        payload: Any,
+        raw: dict[str, Any],
+    ) -> DecisionCardExplanation:
+        if not isinstance(payload, dict):
+            raise ManagerLLMError("manager llm decision-card payload must be object")
+        why_llm = str(payload.get("why_llm") or "").strip()
+        suggested_actions_raw = payload.get("suggested_actions")
+        confidence = str(payload.get("confidence") or "").strip().lower()
+        if confidence not in {"low", "medium", "high"}:
+            confidence = "medium"
+        if not why_llm:
+            why_llm = "LLM explanation unavailable; use deterministic decision-card evidence."
+        suggested_actions: list[str] = []
+        if isinstance(suggested_actions_raw, list):
+            for item in suggested_actions_raw:
+                text = str(item).strip()
+                if not text:
+                    continue
+                suggested_actions.append(text)
+        if not suggested_actions:
+            suggested_actions = ["Review deterministic evidence and apply the suggested machine action."]
+        return DecisionCardExplanation(
+            why_llm=why_llm,
+            suggested_actions=suggested_actions[:4],
+            confidence=confidence,
             raw=raw,
         )

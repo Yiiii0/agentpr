@@ -55,9 +55,9 @@ BOT_RULES_FOOTER = (
     "`/overview` "
     "`/list` `/show <run_id>` `/status <run_id>` "
     "`/pause <run_id>` `/resume <run_id> <state>` `/retry <run_id> <state>`。\n"
-    "5) 支持的状态值：`DISCOVERY` `PLAN_READY` `IMPLEMENTING` "
+    "5) 支持的状态值：`EXECUTING` `DISCOVERY` `PLAN_READY` `IMPLEMENTING` "
     "`LOCAL_VALIDATING` `PUSHED` `CI_WAIT` `REVIEW_WAIT` `ITERATING` "
-    "`NEEDS_HUMAN_REVIEW` `FAILED_RETRYABLE` `DONE` `SKIPPED` `FAILED_TERMINAL`."
+    "`NEEDS_HUMAN_REVIEW` `FAILED` `FAILED_RETRYABLE` `DONE` `SKIPPED` `FAILED_TERMINAL`."
 )
 
 REASON_CODE_EXPLANATIONS: dict[str, str] = {
@@ -67,6 +67,9 @@ REASON_CODE_EXPLANATIONS: dict[str, str] = {
     ),
     "runtime_success_allowlisted_test_failures": (
         "Observed known baseline failures that matched allowlist and final run converged."
+    ),
+    "runtime_success_no_test_infra_with_validation": (
+        "No repository test infrastructure was detected; semantic grading accepted lint/typecheck validation evidence."
     ),
     "missing_test_evidence": "Required test execution evidence is missing for this state.",
     "insufficient_test_evidence": "Test evidence exists but does not meet configured minimum.",
@@ -81,6 +84,15 @@ NL_MODE_RULES = "rules"
 NL_MODE_LLM = "llm"
 NL_MODE_HYBRID = "hybrid"
 NL_MODES = {NL_MODE_RULES, NL_MODE_LLM, NL_MODE_HYBRID}
+
+DECISION_WHY_MODE_OFF = "off"
+DECISION_WHY_MODE_HYBRID = "hybrid"
+DECISION_WHY_MODE_LLM = "llm"
+DECISION_WHY_MODES = {
+    DECISION_WHY_MODE_OFF,
+    DECISION_WHY_MODE_HYBRID,
+    DECISION_WHY_MODE_LLM,
+}
 
 BOT_NL_ALLOWED_ACTIONS = [
     "help",
@@ -98,6 +110,7 @@ BOT_NL_ALLOWED_ACTIONS = [
 NOTIFY_TERMINAL_STATES = {
     RunState.PUSHED.value,
     RunState.NEEDS_HUMAN_REVIEW.value,
+    RunState.FAILED.value,
     RunState.DONE.value,
 }
 
@@ -122,6 +135,19 @@ def resolve_telegram_nl_mode() -> str:
     if raw in NL_MODES:
         return raw
     return NL_MODE_RULES
+
+
+def resolve_decision_why_mode() -> str:
+    raw = str(
+        os.environ.get("AGENTPR_TELEGRAM_DECISION_WHY_MODE")
+        or DECISION_WHY_MODE_HYBRID
+    ).strip().lower()
+    if raw in DECISION_WHY_MODES:
+        return raw
+    return DECISION_WHY_MODE_HYBRID
+
+
+DEFAULT_TARGET_STATE: str = RunState.EXECUTING.value
 
 
 def parse_positive_int_env(name: str, default: int) -> int:
@@ -154,6 +180,42 @@ def build_nl_llm_client_if_enabled(*, nl_mode: str) -> ManagerLLMClient | None:
         os.environ.get("AGENTPR_TELEGRAM_NL_API_KEY_ENV") or "AGENTPR_MANAGER_API_KEY"
     ).strip() or "AGENTPR_MANAGER_API_KEY"
     timeout_sec = parse_positive_int_env("AGENTPR_TELEGRAM_NL_TIMEOUT_SEC", 20)
+    try:
+        return ManagerLLMClient.from_runtime(
+            api_base=api_base,
+            model=model,
+            timeout_sec=timeout_sec,
+            api_key_env=api_key_env,
+        )
+    except ManagerLLMError:
+        return None
+
+
+def build_decision_llm_client_if_enabled(
+    *,
+    decision_why_mode: str,
+    fallback_client: ManagerLLMClient | None,
+) -> ManagerLLMClient | None:
+    if decision_why_mode == DECISION_WHY_MODE_OFF:
+        return None
+    if fallback_client is not None:
+        return fallback_client
+    api_base = str(
+        os.environ.get("AGENTPR_TELEGRAM_DECISION_API_BASE")
+        or os.environ.get("AGENTPR_TELEGRAM_NL_API_BASE")
+        or ""
+    ).strip() or None
+    model = str(
+        os.environ.get("AGENTPR_TELEGRAM_DECISION_MODEL")
+        or os.environ.get("AGENTPR_TELEGRAM_NL_MODEL")
+        or ""
+    ).strip() or None
+    api_key_env = str(
+        os.environ.get("AGENTPR_TELEGRAM_DECISION_API_KEY_ENV")
+        or os.environ.get("AGENTPR_TELEGRAM_NL_API_KEY_ENV")
+        or "AGENTPR_MANAGER_API_KEY"
+    ).strip() or "AGENTPR_MANAGER_API_KEY"
+    timeout_sec = parse_positive_int_env("AGENTPR_TELEGRAM_DECISION_TIMEOUT_SEC", 20)
     try:
         return ManagerLLMClient.from_runtime(
             api_base=api_base,
@@ -318,6 +380,11 @@ def run_telegram_bot_loop(
     conversation_state: dict[int, dict[str, Any]] = {}
     nl_mode = resolve_telegram_nl_mode()
     llm_client = build_nl_llm_client_if_enabled(nl_mode=nl_mode)
+    decision_why_mode = resolve_decision_why_mode()
+    decision_llm_client = build_decision_llm_client_if_enabled(
+        decision_why_mode=decision_why_mode,
+        fallback_client=llm_client,
+    )
     notify_enabled = parse_bool_env("AGENTPR_TELEGRAM_NOTIFY_ENABLED", True)
     notify_scan_sec = parse_positive_int_env("AGENTPR_TELEGRAM_NOTIFY_SCAN_SEC", 30)
     notify_scan_limit = parse_positive_int_env("AGENTPR_TELEGRAM_NOTIFY_SCAN_LIMIT", 200)
@@ -435,6 +502,8 @@ def run_telegram_bot_loop(
                         conversation_state=chat_ctx,
                         llm_client=llm_client,
                         nl_mode=nl_mode,
+                        decision_llm_client=decision_llm_client,
+                        decision_why_mode=decision_why_mode,
                     )
                 else:
                     response = handle_bot_command(
@@ -445,6 +514,8 @@ def run_telegram_bot_loop(
                         integration_root=integration_root,
                         project_root=project_root,
                         list_limit=list_limit,
+                        decision_llm_client=decision_llm_client,
+                        decision_why_mode=decision_why_mode,
                     )
                     sync_last_run_id_from_text(chat_ctx, text)
                 response = format_bot_response(response)
@@ -648,12 +719,23 @@ def build_state_change_notification(
             classification = digest.get("classification")
             classification = classification if isinstance(classification, dict) else {}
             reason_code = str(classification.get("reason_code") or "unknown")
+        default_target = DEFAULT_TARGET_STATE
         lines = [
             f"[notify] {run_id}",
             f"{owner}/{repo} needs human review (reason={reason_code}).",
             f"- inspect: /show {run_id}",
-            f"- retry: /retry {run_id} IMPLEMENTING",
-            f"- resume: /resume {run_id} IMPLEMENTING",
+            f"- retry: /retry {run_id} {default_target}",
+            f"- resume: /resume {run_id} {default_target}",
+        ]
+        return "\n".join(lines)
+
+    if state == RunState.FAILED.value:
+        default_target = DEFAULT_TARGET_STATE
+        lines = [
+            f"[notify] {run_id}",
+            f"{owner}/{repo} moved to FAILED.",
+            f"- inspect: /show {run_id}",
+            f"- retry: /retry {run_id} {default_target}",
         ]
         return "\n".join(lines)
 
@@ -710,7 +792,7 @@ def maybe_emit_state_notifications(
     rows = service.list_runs(limit=max(int(scan_limit), 1))
     for row in rows:
         run_id = str(row.get("run_id") or "").strip()
-        state = str(row.get("current_state") or "").strip()
+        state = str(row.get("display_state") or row.get("current_state") or "").strip()
         if not run_id or not state:
             continue
         should_scan = state in NOTIFY_TERMINAL_STATES or state == RunState.ITERATING.value
@@ -924,6 +1006,8 @@ def render_run_detail(
     service: OrchestratorService,
     run_id: str,
     snapshot: dict[str, Any],
+    decision_llm_client: ManagerLLMClient | None,
+    decision_why_mode: str,
 ) -> str:
     run = snapshot["run"]
     state = str(snapshot["state"])
@@ -1006,9 +1090,54 @@ def render_run_detail(
             top_duration_ms = int(first.get("total_duration_ms") or 0)
 
     lines.append("")
+    why_llm_text = ""
+    why_llm_actions: list[str] = []
+    if decision_why_mode != DECISION_WHY_MODE_OFF and decision_llm_client is not None:
+        try:
+            explanation = decision_llm_client.explain_decision_card(
+                decision_card={
+                    "run_id": run_id,
+                    "repo": f"{run['owner']}/{run['repo']}",
+                    "state": {"before": state_before, "after": state_after},
+                    "classification": {
+                        "grade": grade,
+                        "reason_code": reason_code,
+                        "next_action": next_action,
+                    },
+                    "recommendation": {
+                        "action": action,
+                        "priority": priority,
+                        "why_machine": why,
+                    },
+                    "validation": {
+                        "test_command_count": test_count,
+                        "failed_test_command_count": failed_test_count,
+                    },
+                    "changes": {
+                        "changed_files_count": changed_files_count,
+                        "added_lines": added_lines,
+                        "deleted_lines": deleted_lines,
+                    },
+                }
+            )
+            why_llm_text = clamp_str(explanation.why_llm, max_len=280)
+            why_llm_actions = [
+                clamp_str(item, max_len=180) for item in explanation.suggested_actions
+            ][:3]
+        except ManagerLLMError:
+            why_llm_text = ""
+
     lines.append("Decision Card:")
     lines.append(f"- decision: {action} (priority={priority})")
-    lines.append(f"- why: {why}")
+    lines.append(f"- why_machine: {why}")
+    if why_llm_text:
+        lines.append(f"- why_llm: {why_llm_text}")
+        if why_llm_actions:
+            lines.append(f"- suggested_actions_llm: {' | '.join(why_llm_actions)}")
+    elif decision_why_mode != DECISION_WHY_MODE_OFF:
+        lines.append(
+            "- why_llm: unavailable (configure manager API key/model for decision explanation)."
+        )
     lines.append(f"- runtime: grade={grade} reason={reason_code} next={next_action}")
     lines.append(f"- reason_detail: {reason_detail}")
     lines.append(f"- state_flow: {state_before} -> {state_after}")
@@ -1059,15 +1188,17 @@ def render_run_detail(
             lines.append(f"- approve_pr_cmd: /approve_pr {run_id} <confirm_token>")
         lines.append(f"- approve_pr_expires_at: {expires_at}")
     elif state == RunState.NEEDS_HUMAN_REVIEW.value:
+        default_target = DEFAULT_TARGET_STATE
         lines.append("")
         lines.append("Human Decision Needed:")
         lines.append(f"- inspect: /show {run_id}")
-        lines.append(f"- retry_default: /retry {run_id} IMPLEMENTING")
-        lines.append(f"- resume_default: /resume {run_id} IMPLEMENTING")
-    elif state == RunState.FAILED_RETRYABLE.value:
+        lines.append(f"- retry_default: /retry {run_id} {default_target}")
+        lines.append(f"- resume_default: /resume {run_id} {default_target}")
+    elif state in {RunState.FAILED_RETRYABLE.value, RunState.FAILED.value}:
+        default_target = DEFAULT_TARGET_STATE
         lines.append("")
         lines.append("Suggested Action:")
-        lines.append(f"- retry: /retry {run_id} IMPLEMENTING")
+        lines.append(f"- retry: /retry {run_id} {default_target}")
 
     return "\n".join(lines)
 
@@ -1079,14 +1210,15 @@ def render_overview(*, service: OrchestratorService, list_limit: int) -> str:
     lines: list[str] = []
     lines.append(f"Total recent runs: {len(runs)}")
     latest = runs[0]
+    latest_state = str(latest.get("display_state") or latest.get("current_state") or "UNKNOWN")
     lines.append(
         "Latest: "
-        f"{latest['run_id']} | {latest['owner']}/{latest['repo']} | {latest['current_state']}"
+        f"{latest['run_id']} | {latest['owner']}/{latest['repo']} | {latest_state}"
     )
 
     state_counts: dict[str, int] = {}
     for row in runs:
-        state = str(row.get("current_state") or "UNKNOWN")
+        state = str(row.get("display_state") or row.get("current_state") or "UNKNOWN")
         state_counts[state] = int(state_counts.get(state, 0)) + 1
     top_states = sorted(state_counts.items(), key=lambda item: (-item[1], item[0]))[:6]
     if top_states:
@@ -1095,16 +1227,22 @@ def render_overview(*, service: OrchestratorService, list_limit: int) -> str:
     attention_states = {
         RunState.PUSHED.value,
         RunState.NEEDS_HUMAN_REVIEW.value,
+        RunState.FAILED.value,
         RunState.FAILED_RETRYABLE.value,
         RunState.FAILED_TERMINAL.value,
         RunState.PAUSED.value,
     }
-    attention = [row for row in runs if str(row.get("current_state")) in attention_states][:8]
+    attention = [
+        row
+        for row in runs
+        if str(row.get("display_state") or row.get("current_state")) in attention_states
+    ][:8]
     if attention:
         lines.append("Need attention:")
         for row in attention:
+            state = str(row.get("display_state") or row.get("current_state") or "UNKNOWN")
             lines.append(
-                f"- {row['run_id']} | {row['owner']}/{row['repo']} | {row['current_state']}"
+                f"- {row['run_id']} | {row['owner']}/{row['repo']} | {state}"
             )
 
     pending_pr_lines: list[str] = []
@@ -1137,6 +1275,8 @@ def handle_bot_command(
     integration_root: Path,
     project_root: Path,
     list_limit: int,
+    decision_llm_client: ManagerLLMClient | None = None,
+    decision_why_mode: str | None = None,
 ) -> str:
     try:
         parts = shlex.split(text)
@@ -1144,6 +1284,19 @@ def handle_bot_command(
         return "Invalid command format."
     if not parts:
         return "Empty command."
+    resolved_why_mode = (
+        str(decision_why_mode).strip().lower()
+        if decision_why_mode is not None
+        else resolve_decision_why_mode()
+    )
+    if resolved_why_mode not in DECISION_WHY_MODES:
+        resolved_why_mode = DECISION_WHY_MODE_HYBRID
+    resolved_decision_llm_client = decision_llm_client
+    if resolved_decision_llm_client is None and resolved_why_mode != DECISION_WHY_MODE_OFF:
+        resolved_decision_llm_client = build_decision_llm_client_if_enabled(
+            decision_why_mode=resolved_why_mode,
+            fallback_client=None,
+        )
 
     command = parts[0].split("@", 1)[0].lower()
     args = parts[1:]
@@ -1192,8 +1345,9 @@ def handle_bot_command(
             return "No runs."
         lines = ["Latest runs:"]
         for row in runs:
+            state = str(row.get("display_state") or row.get("current_state") or "UNKNOWN")
             lines.append(
-                f"{row['run_id']} | {row['repo']} | {row['current_state']}"
+                f"{row['run_id']} | {row['repo']} | {state}"
             )
         return "\n".join(lines)
 
@@ -1212,6 +1366,8 @@ def handle_bot_command(
             service=service,
             run_id=run_id,
             snapshot=snapshot,
+            decision_llm_client=resolved_decision_llm_client,
+            decision_why_mode=resolved_why_mode,
         )
 
     if command == "/pending_pr":
@@ -1315,6 +1471,8 @@ def handle_natural_language(
     conversation_state: dict[str, Any],
     llm_client: ManagerLLMClient | None,
     nl_mode: str,
+    decision_llm_client: ManagerLLMClient | None,
+    decision_why_mode: str | None,
 ) -> str:
     mode = str(nl_mode).strip().lower()
     if mode not in NL_MODES:
@@ -1329,6 +1487,8 @@ def handle_natural_language(
             project_root=project_root,
             list_limit=list_limit,
             conversation_state=conversation_state,
+            decision_llm_client=decision_llm_client,
+            decision_why_mode=decision_why_mode,
         )
     if llm_client is None:
         if mode == NL_MODE_LLM:
@@ -1346,6 +1506,8 @@ def handle_natural_language(
             project_root=project_root,
             list_limit=list_limit,
             conversation_state=conversation_state,
+            decision_llm_client=decision_llm_client,
+            decision_why_mode=decision_why_mode,
         )
 
     normalized = str(text).strip()
@@ -1379,6 +1541,8 @@ def handle_natural_language(
                 project_root=project_root,
                 list_limit=list_limit,
                 conversation_state=conversation_state,
+                decision_llm_client=decision_llm_client,
+                decision_why_mode=decision_why_mode,
             )
             return f"[manager:rules_fallback] {fallback}"
         return f"manager nl routing failed: {exc}"
@@ -1394,6 +1558,8 @@ def handle_natural_language(
                 project_root=project_root,
                 list_limit=list_limit,
                 conversation_state=conversation_state,
+                decision_llm_client=decision_llm_client,
+                decision_why_mode=decision_why_mode,
             )
             return f"[manager:rules_fallback] {fallback}"
         return f"manager returned unsupported action: {selection.action}"
@@ -1409,6 +1575,8 @@ def handle_natural_language(
         project_root=project_root,
         list_limit=list_limit,
         conversation_state=conversation_state,
+        decision_llm_client=decision_llm_client,
+        decision_why_mode=decision_why_mode,
     )
     return f"[manager:{selection.action}] {result}"
 
@@ -1423,7 +1591,22 @@ def handle_natural_language_rules(
     project_root: Path,
     list_limit: int,
     conversation_state: dict[str, Any],
+    decision_llm_client: ManagerLLMClient | None,
+    decision_why_mode: str | None,
 ) -> str:
+    def dispatch_bot(command_text: str) -> str:
+        return handle_bot_command(
+            text=command_text,
+            service=service,
+            db_path=db_path,
+            workspace_root=workspace_root,
+            integration_root=integration_root,
+            project_root=project_root,
+            list_limit=list_limit,
+            decision_llm_client=decision_llm_client,
+            decision_why_mode=decision_why_mode,
+        )
+
     normalized = str(text).strip()
     if not normalized:
         return "Empty message."
@@ -1441,93 +1624,37 @@ def handle_natural_language_rules(
         if repo_refs:
             prompt_version = extract_prompt_version_from_text(normalized) or resolve_default_prompt_version()
             argv = ["/create", *repo_refs, "--prompt-version", prompt_version]
-            return handle_bot_command(
-                text=" ".join(argv),
-                service=service,
-                db_path=db_path,
-                workspace_root=workspace_root,
-                integration_root=integration_root,
-                project_root=project_root,
-                list_limit=list_limit,
-            )
+            return dispatch_bot(" ".join(argv))
 
     if contains_any(lowered, ["list", "all runs", "运行列表", "全部运行", "列出"]):
         limit = max(1, min(int(list_limit), 50))
-        return handle_bot_command(
-            text=f"/list {limit}",
-            service=service,
-            db_path=db_path,
-            workspace_root=workspace_root,
-            integration_root=integration_root,
-            project_root=project_root,
-            list_limit=list_limit,
-        )
+        return dispatch_bot(f"/list {limit}")
 
     if run_id and contains_any(
         lowered,
         ["status", "show", "state", "状态", "进展", "情况"],
     ):
-        return handle_bot_command(
-            text=f"/show {run_id}",
-            service=service,
-            db_path=db_path,
-            workspace_root=workspace_root,
-            integration_root=integration_root,
-            project_root=project_root,
-            list_limit=list_limit,
-        )
+        return dispatch_bot(f"/show {run_id}")
 
     if contains_any(lowered, ["status", "overall", "overview", "目前", "整体", "全局", "近况", "情况"]):
-        return handle_bot_command(
-            text="/overview",
-            service=service,
-            db_path=db_path,
-            workspace_root=workspace_root,
-            integration_root=integration_root,
-            project_root=project_root,
-            list_limit=list_limit,
-        )
+        return dispatch_bot("/overview")
 
     if run_id and contains_any(lowered, ["pause", "暂停"]):
-        return handle_bot_command(
-            text=f"/pause {run_id}",
-            service=service,
-            db_path=db_path,
-            workspace_root=workspace_root,
-            integration_root=integration_root,
-            project_root=project_root,
-            list_limit=list_limit,
-        )
+        return dispatch_bot(f"/pause {run_id}")
 
     if run_id and contains_any(lowered, ["resume", "恢复", "继续"]):
         target = normalize_target_state(
             extract_target_state_from_text(normalized),
-            default=RunState.IMPLEMENTING.value,
+            default=DEFAULT_TARGET_STATE,
         )
-        return handle_bot_command(
-            text=f"/resume {run_id} {target}",
-            service=service,
-            db_path=db_path,
-            workspace_root=workspace_root,
-            integration_root=integration_root,
-            project_root=project_root,
-            list_limit=list_limit,
-        )
+        return dispatch_bot(f"/resume {run_id} {target}")
 
     if run_id and contains_any(lowered, ["retry", "重试"]):
         target = normalize_target_state(
             extract_target_state_from_text(normalized),
-            default=RunState.IMPLEMENTING.value,
+            default=DEFAULT_TARGET_STATE,
         )
-        return handle_bot_command(
-            text=f"/retry {run_id} {target}",
-            service=service,
-            db_path=db_path,
-            workspace_root=workspace_root,
-            integration_root=integration_root,
-            project_root=project_root,
-            list_limit=list_limit,
-        )
+        return dispatch_bot(f"/retry {run_id} {target}")
 
     if contains_any(lowered, ["manager tick", "推进", "继续跑", "next step", "run tick"]):
         argv = ["manager-tick", "--limit", str(max(1, min(int(list_limit), 50)))]
@@ -1559,7 +1686,7 @@ def handle_natural_language_rules(
         "收到自然语言请求，但未识别可执行意图。"
         "你可以说：'创建 run mem0ai/mem0'、'create https://github.com/a/b https://github.com/c/d'、"
         "'目前什么情况'、'列出运行'、'查看 <run_id> 状态'、"
-        "'暂停 <run_id>'、'恢复 <run_id> 到 IMPLEMENTING'、'重试 <run_id>'、'推进一次'。"
+        "'暂停 <run_id>'、'恢复 <run_id> 到 EXECUTING/IMPLEMENTING'、'重试 <run_id>'、'推进一次'。"
     )
 
 
@@ -1575,7 +1702,22 @@ def execute_nl_selection(
     project_root: Path,
     list_limit: int,
     conversation_state: dict[str, Any],
+    decision_llm_client: ManagerLLMClient | None,
+    decision_why_mode: str | None,
 ) -> str:
+    def dispatch_bot(command_text: str) -> str:
+        return handle_bot_command(
+            text=command_text,
+            service=service,
+            db_path=db_path,
+            workspace_root=workspace_root,
+            integration_root=integration_root,
+            project_root=project_root,
+            list_limit=list_limit,
+            decision_llm_client=decision_llm_client,
+            decision_why_mode=decision_why_mode,
+        )
+
     action = selection.action
     run_id = selection.run_id or explicit_run_id or get_last_run_id(conversation_state)
     if run_id:
@@ -1583,15 +1725,7 @@ def execute_nl_selection(
     if action == "help":
         return "自然语言模式已启用。直接说需求，或继续使用 /commands。"
     if action == "status_overview":
-        return handle_bot_command(
-            text="/overview",
-            service=service,
-            db_path=db_path,
-            workspace_root=workspace_root,
-            integration_root=integration_root,
-            project_root=project_root,
-            list_limit=list_limit,
-        )
+        return dispatch_bot("/overview")
     if action == "create_run":
         repo_ref = selection.repo_ref or extract_repo_ref_text(text)
         if not repo_ref:
@@ -1601,41 +1735,17 @@ def execute_nl_selection(
             return "repo 格式无效。请使用 owner/repo 或 github URL。"
         owner, repo = parsed_repo
         prompt_version = selection.prompt_version or extract_prompt_version_from_text(text) or resolve_default_prompt_version()
-        return handle_bot_command(
-            text=f"/create {owner}/{repo} --prompt-version {prompt_version}",
-            service=service,
-            db_path=db_path,
-            workspace_root=workspace_root,
-            integration_root=integration_root,
-            project_root=project_root,
-            list_limit=list_limit,
-        )
+        return dispatch_bot(f"/create {owner}/{repo} --prompt-version {prompt_version}")
     if action == "create_runs":
         repo_refs = selection.repo_refs or extract_repo_refs_text(text)
         if not repo_refs:
             return "缺少 repo 列表。请提供 owner/repo 或 github URL。"
         prompt_version = selection.prompt_version or extract_prompt_version_from_text(text) or resolve_default_prompt_version()
         argv = ["/create", *repo_refs, "--prompt-version", prompt_version]
-        return handle_bot_command(
-            text=" ".join(argv),
-            service=service,
-            db_path=db_path,
-            workspace_root=workspace_root,
-            integration_root=integration_root,
-            project_root=project_root,
-            list_limit=list_limit,
-        )
+        return dispatch_bot(" ".join(argv))
     if action == "list_runs":
         limit = max(1, min(int(selection.limit or list_limit), 50))
-        return handle_bot_command(
-            text=f"/list {limit}",
-            service=service,
-            db_path=db_path,
-            workspace_root=workspace_root,
-            integration_root=integration_root,
-            project_root=project_root,
-            list_limit=list_limit,
-        )
+        return dispatch_bot(f"/list {limit}")
     if action == "show_run":
         if not run_id:
             recent = service.list_runs(limit=1)
@@ -1644,59 +1754,27 @@ def execute_nl_selection(
                 set_last_run_id(conversation_state, run_id)
             else:
                 return "缺少 run_id。请在消息中包含 run_id，或先执行 /list。"
-        return handle_bot_command(
-            text=f"/show {run_id}",
-            service=service,
-            db_path=db_path,
-            workspace_root=workspace_root,
-            integration_root=integration_root,
-            project_root=project_root,
-            list_limit=list_limit,
-        )
+        return dispatch_bot(f"/show {run_id}")
     if action == "pause_run":
         if not run_id:
             return "缺少 run_id。请在消息中包含 run_id。"
-        return handle_bot_command(
-            text=f"/pause {run_id}",
-            service=service,
-            db_path=db_path,
-            workspace_root=workspace_root,
-            integration_root=integration_root,
-            project_root=project_root,
-            list_limit=list_limit,
-        )
+        return dispatch_bot(f"/pause {run_id}")
     if action == "resume_run":
         if not run_id:
             return "缺少 run_id。请在消息中包含 run_id。"
         target = normalize_target_state(
             selection.target_state or extract_target_state_from_text(text),
-            default=RunState.IMPLEMENTING.value,
+            default=DEFAULT_TARGET_STATE,
         )
-        return handle_bot_command(
-            text=f"/resume {run_id} {target}",
-            service=service,
-            db_path=db_path,
-            workspace_root=workspace_root,
-            integration_root=integration_root,
-            project_root=project_root,
-            list_limit=list_limit,
-        )
+        return dispatch_bot(f"/resume {run_id} {target}")
     if action == "retry_run":
         if not run_id:
             return "缺少 run_id。请在消息中包含 run_id。"
         target = normalize_target_state(
             selection.target_state or extract_target_state_from_text(text),
-            default=RunState.IMPLEMENTING.value,
+            default=DEFAULT_TARGET_STATE,
         )
-        return handle_bot_command(
-            text=f"/retry {run_id} {target}",
-            service=service,
-            db_path=db_path,
-            workspace_root=workspace_root,
-            integration_root=integration_root,
-            project_root=project_root,
-            list_limit=list_limit,
-        )
+        return dispatch_bot(f"/retry {run_id} {target}")
     if action == "manager_tick":
         argv = ["manager-tick", "--limit", str(max(1, min(int(list_limit), 50)))]
         if run_id:
@@ -1762,13 +1840,6 @@ def extract_repo_ref_text(text: str) -> str | None:
     return refs[0]
 
 
-def extract_repo_ref_from_text(text: str) -> tuple[str, str] | None:
-    repo_ref = extract_repo_ref_text(text)
-    if not repo_ref:
-        return None
-    return parse_repo_ref(repo_ref)
-
-
 def parse_repo_ref(value: str) -> tuple[str, str] | None:
     raw = str(value).strip()
     if not raw:
@@ -1815,6 +1886,7 @@ def extract_target_state_from_text(text: str) -> str | None:
         if state.value in raw:
             return state.value
     zh_map = {
+        "执行": RunState.EXECUTING.value,
         "发现": RunState.DISCOVERY.value,
         "计划": RunState.PLAN_READY.value,
         "实现": RunState.IMPLEMENTING.value,
@@ -1824,6 +1896,7 @@ def extract_target_state_from_text(text: str) -> str | None:
         "等待REVIEW": RunState.REVIEW_WAIT.value,
         "迭代": RunState.ITERATING.value,
         "人工": RunState.NEEDS_HUMAN_REVIEW.value,
+        "失败": RunState.FAILED.value,
         "重试失败": RunState.FAILED_RETRYABLE.value,
         "完成": RunState.DONE.value,
         "跳过": RunState.SKIPPED.value,

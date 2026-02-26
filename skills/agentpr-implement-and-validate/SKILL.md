@@ -19,6 +19,7 @@ Execute contract-driven code changes with strict minimal-diff discipline, then r
 
 1. Reconfirm constraints.
 - Recheck contract fields: target files, branch rules, required checks, docs requirements.
+- Reuse `task_packet.repo.governance_scan` evidence first (CONTRIBUTING/PR template/CI/README paths) and only run secondary search when coverage is insufficient.
 - Stop with `NEEDS REVIEW` if contract is missing/ambiguous.
 
 2. Set up environment exactly as CI/docs require.

@@ -31,6 +31,9 @@ class ManagerRunFacts:
     contract_uri: str | None
     has_prompt: bool
     pr_number: int | None
+    worker_autonomous: bool = False
+    latest_worker_grade: str | None = None
+    latest_worker_confidence: str | None = None
 
 
 @dataclass(frozen=True)
@@ -81,6 +84,19 @@ def decide_next_action(facts: ManagerRunFacts) -> ManagerAction:
         )
 
     if state == RunState.DISCOVERY:
+        if facts.worker_autonomous:
+            if not facts.has_prompt:
+                return ManagerAction(
+                    kind=ManagerActionKind.WAIT_HUMAN,
+                    reason="manager prompt file is missing",
+                )
+            return ManagerAction(
+                kind=ManagerActionKind.RUN_AGENT_STEP,
+                reason=(
+                    "autonomous worker should execute discovery→implementation"
+                    " in one agent step"
+                ),
+            )
         if facts.prepare_attempts <= 0:
             return ManagerAction(
                 kind=ManagerActionKind.RUN_PREPARE,
@@ -93,9 +109,48 @@ def decide_next_action(facts: ManagerRunFacts) -> ManagerAction:
         )
 
     if state == RunState.PLAN_READY:
+        if facts.worker_autonomous:
+            if not facts.has_prompt:
+                return ManagerAction(
+                    kind=ManagerActionKind.WAIT_HUMAN,
+                    reason="manager prompt file is missing",
+                )
+            return ManagerAction(
+                kind=ManagerActionKind.RUN_AGENT_STEP,
+                reason=(
+                    "autonomous worker should execute plan→implementation"
+                    " in one agent step"
+                ),
+            )
         return ManagerAction(
             kind=ManagerActionKind.START_IMPLEMENTATION,
             reason="plan is ready; start implementation",
+        )
+
+    if state == RunState.EXECUTING:
+        if facts.latest_worker_grade == "PASS":
+            if facts.latest_worker_confidence == "low":
+                return ManagerAction(
+                    kind=ManagerActionKind.WAIT_HUMAN,
+                    reason="worker PASS but low confidence; escalating for human review",
+                )
+            return ManagerAction(
+                kind=ManagerActionKind.RUN_FINISH,
+                reason="worker pass evidence found; execute finish/push",
+            )
+        if facts.latest_worker_grade == "NEEDS_REVIEW":
+            return ManagerAction(
+                kind=ManagerActionKind.WAIT_HUMAN,
+                reason="worker output needs human review",
+            )
+        if not facts.has_prompt:
+            return ManagerAction(
+                kind=ManagerActionKind.WAIT_HUMAN,
+                reason="manager prompt file is missing",
+            )
+        return ManagerAction(
+            kind=ManagerActionKind.RUN_AGENT_STEP,
+            reason="executing stage requires worker execution",
         )
 
     if state in {RunState.IMPLEMENTING, RunState.ITERATING}:
@@ -127,6 +182,13 @@ def decide_next_action(facts: ManagerRunFacts) -> ManagerAction:
             metadata={"target_state": target.value},
         )
 
+    if state == RunState.FAILED:
+        return ManagerAction(
+            kind=ManagerActionKind.RETRY,
+            reason="failed run should retry through executing",
+            metadata={"target_state": RunState.EXECUTING.value},
+        )
+
     if state in {RunState.CI_WAIT, RunState.REVIEW_WAIT}:
         return ManagerAction(
             kind=ManagerActionKind.SYNC_GITHUB,
@@ -152,12 +214,31 @@ def allowed_action_kinds(facts: ManagerRunFacts) -> tuple[ManagerActionKind, ...
         return (ManagerActionKind.START_DISCOVERY, ManagerActionKind.WAIT_HUMAN)
 
     if state == RunState.DISCOVERY:
+        if facts.worker_autonomous:
+            if not facts.has_prompt:
+                return (ManagerActionKind.WAIT_HUMAN,)
+            return (ManagerActionKind.RUN_AGENT_STEP, ManagerActionKind.WAIT_HUMAN)
         if facts.prepare_attempts <= 0:
             return (ManagerActionKind.RUN_PREPARE, ManagerActionKind.WAIT_HUMAN)
         return (ManagerActionKind.MARK_PLAN_READY, ManagerActionKind.WAIT_HUMAN)
 
     if state == RunState.PLAN_READY:
+        if facts.worker_autonomous:
+            if not facts.has_prompt:
+                return (ManagerActionKind.WAIT_HUMAN,)
+            return (ManagerActionKind.RUN_AGENT_STEP, ManagerActionKind.WAIT_HUMAN)
         return (ManagerActionKind.START_IMPLEMENTATION, ManagerActionKind.WAIT_HUMAN)
+
+    if state == RunState.EXECUTING:
+        if facts.latest_worker_grade == "PASS":
+            if facts.latest_worker_confidence == "low":
+                return (ManagerActionKind.RUN_FINISH, ManagerActionKind.WAIT_HUMAN)
+            return (ManagerActionKind.RUN_FINISH, ManagerActionKind.WAIT_HUMAN)
+        if facts.latest_worker_grade == "NEEDS_REVIEW":
+            return (ManagerActionKind.WAIT_HUMAN, ManagerActionKind.RUN_AGENT_STEP)
+        if not facts.has_prompt:
+            return (ManagerActionKind.WAIT_HUMAN,)
+        return (ManagerActionKind.RUN_AGENT_STEP, ManagerActionKind.WAIT_HUMAN)
 
     if state in {RunState.IMPLEMENTING, RunState.ITERATING}:
         if not facts.has_prompt:
@@ -168,6 +249,9 @@ def allowed_action_kinds(facts: ManagerRunFacts) -> tuple[ManagerActionKind, ...
         return (ManagerActionKind.RUN_FINISH, ManagerActionKind.WAIT_HUMAN)
 
     if state == RunState.FAILED_RETRYABLE:
+        return (ManagerActionKind.RETRY, ManagerActionKind.WAIT_HUMAN)
+
+    if state == RunState.FAILED:
         return (ManagerActionKind.RETRY, ManagerActionKind.WAIT_HUMAN)
 
     if state in {RunState.CI_WAIT, RunState.REVIEW_WAIT}:

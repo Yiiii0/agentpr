@@ -43,6 +43,7 @@ class Database:
                     repo TEXT NOT NULL,
                     prompt_version TEXT NOT NULL,
                     mode TEXT NOT NULL,
+                    state_schema_version TEXT NOT NULL DEFAULT 'v1',
                     budget_json TEXT NOT NULL,
                     workspace_dir TEXT NOT NULL,
                     pr_number INTEGER,
@@ -108,6 +109,17 @@ class Database:
                 ON webhook_deliveries(source, received_at);
                 """
             )
+            self._ensure_runs_state_schema_column(conn)
+
+    @staticmethod
+    def _ensure_runs_state_schema_column(conn: sqlite3.Connection) -> None:
+        """Backward compat: add column if missing in old DBs."""
+        rows = conn.execute("PRAGMA table_info(runs)").fetchall()
+        if any(str(row["name"]) == "state_schema_version" for row in rows):
+            return
+        conn.execute(
+            "ALTER TABLE runs ADD COLUMN state_schema_version TEXT NOT NULL DEFAULT 'v1'"
+        )
 
     def insert_run(
         self,
@@ -125,10 +137,10 @@ class Database:
         conn.execute(
             """
             INSERT INTO runs (
-                run_id, owner, repo, prompt_version, mode, budget_json,
+                run_id, owner, repo, prompt_version, mode, state_schema_version, budget_json,
                 workspace_dir, created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 run_id,
@@ -136,6 +148,7 @@ class Database:
                 repo,
                 prompt_version,
                 mode.value,
+                "v2",
                 json.dumps(budget, sort_keys=True),
                 workspace_dir,
                 now,
@@ -193,6 +206,7 @@ class Database:
                 r.owner,
                 r.repo,
                 r.mode,
+                r.state_schema_version,
                 r.prompt_version,
                 r.pr_number,
                 s.current_state,
