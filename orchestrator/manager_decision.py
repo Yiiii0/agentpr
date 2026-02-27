@@ -34,6 +34,9 @@ class ManagerRunFacts:
     worker_autonomous: bool = False
     latest_worker_grade: str | None = None
     latest_worker_confidence: str | None = None
+    review_triage_action: str | None = None  # fix_code | reply_explain | ignore
+    retry_should_retry: bool | None = None
+    retry_target_state: str | None = None
 
 
 @dataclass(frozen=True)
@@ -153,7 +156,28 @@ def decide_next_action(facts: ManagerRunFacts) -> ManagerAction:
             reason="executing stage requires worker execution",
         )
 
-    if state in {RunState.IMPLEMENTING, RunState.ITERATING}:
+    if state == RunState.ITERATING:
+        if facts.review_triage_action == "ignore":
+            return ManagerAction(
+                kind=ManagerActionKind.WAIT_HUMAN,
+                reason="review comment triaged as ignorable; no action needed",
+            )
+        if facts.review_triage_action == "reply_explain":
+            return ManagerAction(
+                kind=ManagerActionKind.WAIT_HUMAN,
+                reason="review comment needs human reply (not a code fix)",
+            )
+        if not facts.has_prompt:
+            return ManagerAction(
+                kind=ManagerActionKind.WAIT_HUMAN,
+                reason="manager prompt file is missing",
+            )
+        return ManagerAction(
+            kind=ManagerActionKind.RUN_AGENT_STEP,
+            reason="iterating: review comment requires code fix",
+        )
+
+    if state == RunState.IMPLEMENTING:
         if not facts.has_prompt:
             return ManagerAction(
                 kind=ManagerActionKind.WAIT_HUMAN,
@@ -183,10 +207,16 @@ def decide_next_action(facts: ManagerRunFacts) -> ManagerAction:
         )
 
     if state == RunState.FAILED:
+        if facts.retry_should_retry is False:
+            return ManagerAction(
+                kind=ManagerActionKind.WAIT_HUMAN,
+                reason="LLM diagnosis: retry not worthwhile",
+            )
+        target = facts.retry_target_state or RunState.EXECUTING.value
         return ManagerAction(
             kind=ManagerActionKind.RETRY,
-            reason="failed run should retry through executing",
-            metadata={"target_state": RunState.EXECUTING.value},
+            reason="failed run should retry",
+            metadata={"target_state": target},
         )
 
     if state in {RunState.CI_WAIT, RunState.REVIEW_WAIT}:
@@ -240,7 +270,14 @@ def allowed_action_kinds(facts: ManagerRunFacts) -> tuple[ManagerActionKind, ...
             return (ManagerActionKind.WAIT_HUMAN,)
         return (ManagerActionKind.RUN_AGENT_STEP, ManagerActionKind.WAIT_HUMAN)
 
-    if state in {RunState.IMPLEMENTING, RunState.ITERATING}:
+    if state == RunState.ITERATING:
+        if facts.review_triage_action in {"ignore", "reply_explain"}:
+            return (ManagerActionKind.WAIT_HUMAN, ManagerActionKind.RUN_AGENT_STEP)
+        if not facts.has_prompt:
+            return (ManagerActionKind.WAIT_HUMAN,)
+        return (ManagerActionKind.RUN_AGENT_STEP, ManagerActionKind.WAIT_HUMAN)
+
+    if state == RunState.IMPLEMENTING:
         if not facts.has_prompt:
             return (ManagerActionKind.WAIT_HUMAN,)
         return (ManagerActionKind.RUN_AGENT_STEP, ManagerActionKind.WAIT_HUMAN)
@@ -252,6 +289,8 @@ def allowed_action_kinds(facts: ManagerRunFacts) -> tuple[ManagerActionKind, ...
         return (ManagerActionKind.RETRY, ManagerActionKind.WAIT_HUMAN)
 
     if state == RunState.FAILED:
+        if facts.retry_should_retry is False:
+            return (ManagerActionKind.WAIT_HUMAN, ManagerActionKind.RETRY)
         return (ManagerActionKind.RETRY, ManagerActionKind.WAIT_HUMAN)
 
     if state in {RunState.CI_WAIT, RunState.REVIEW_WAIT}:

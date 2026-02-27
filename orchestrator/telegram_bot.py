@@ -418,6 +418,13 @@ def run_telegram_bot_loop(
                 scan_limit=notify_scan_limit,
                 audit=audit,
             )
+            maybe_emit_manager_notifications(
+                client=client,
+                service=service,
+                notification_chat_ids=notification_chat_ids,
+                scan_limit=notify_scan_limit,
+                audit=audit,
+            )
             last_notify_scan_ts = now_scan_ts
 
         if not updates:
@@ -848,6 +855,57 @@ def maybe_emit_state_notifications(
         )
 
 
+def maybe_emit_manager_notifications(
+    *,
+    client: TelegramClient,
+    service: OrchestratorService,
+    notification_chat_ids: list[int],
+    scan_limit: int,
+    audit: TelegramAuditLogger,
+) -> None:
+    """Push unsent manager_notification artifacts to Telegram."""
+    if not notification_chat_ids:
+        return
+    artifacts = service.list_artifacts_global(
+        artifact_type="manager_notification", limit=max(int(scan_limit), 1)
+    )
+    for artifact in artifacts:
+        artifact_id = artifact.get("id")
+        run_id = str(artifact.get("run_id") or "").strip()
+        if not artifact_id or not run_id:
+            continue
+        marker_key = f"mgr_notify:{artifact_id}"
+        markers = load_notification_markers(service, run_id)
+        if marker_key in markers:
+            continue
+        meta = artifact.get("metadata")
+        meta = meta if isinstance(meta, dict) else {}
+        message = str(meta.get("message") or "").strip()
+        priority = str(meta.get("priority") or "normal").strip()
+        if not message:
+            continue
+        prefix = f"[{priority.upper()}] " if priority in {"high", "urgent"} else ""
+        text = f"{prefix}{run_id}: {message}"
+        delivered = False
+        for chat_id in notification_chat_ids:
+            ok = safe_send_message(client=client, chat_id=chat_id, text=format_bot_response(text))
+            delivered = delivered or ok
+        if not delivered:
+            continue
+        record_notification_marker(
+            service=service, run_id=run_id, marker_key=marker_key, state="manager_notification"
+        )
+        audit.append(
+            {
+                "ts": datetime.now(UTC).isoformat(),
+                "kind": "mgr_notify",
+                "run_id": run_id,
+                "artifact_id": artifact_id,
+                "priority": priority,
+            }
+        )
+
+
 def parse_create_command_args(args: list[str]) -> tuple[list[str], str] | None:
     if not args:
         return None
@@ -1262,6 +1320,26 @@ def render_overview(*, service: OrchestratorService, list_limit: int) -> str:
     if pending_pr_lines:
         lines.append("Pending PR approvals:")
         lines.extend(pending_pr_lines)
+
+    try:
+        from .manager_tools import get_global_stats
+
+        stats = get_global_stats(service=service, limit=max(1, min(int(list_limit), 50)))
+        if stats.get("ok") and stats.get("digest_available_runs", 0) > 0:
+            lines.append(
+                f"Pass rate: {stats['pass_rate_pct']}%"
+                f" ({stats['digest_available_runs']} runs graded)"
+            )
+            grades = stats.get("grade_counts") or {}
+            if grades:
+                grade_parts = [f"{k}={v}" for k, v in sorted(grades.items(), key=lambda x: -x[1])]
+                lines.append("Grades: " + ", ".join(grade_parts))
+            top_reasons = stats.get("top_reason_codes") or []
+            if top_reasons:
+                reason_parts = [f"{code}({n})" for code, n in top_reasons[:3]]
+                lines.append("Top reasons: " + ", ".join(reason_parts))
+    except Exception:  # noqa: BLE001
+        pass  # Stats are best-effort
 
     return "\n".join(lines)
 

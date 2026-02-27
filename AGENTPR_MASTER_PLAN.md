@@ -1,7 +1,7 @@
 # AgentPR Master Plan (Manager-Worker Final Target)
 
-> 更新时间：2026-02-26（C2 LLM 语义分级接入 + C3 V2 唯一路径 + 代码精简 + 文档全面刷新）
-> 状态：C2 + C3 核心已完成。LLM 语义分级→confidence routing→通知已接入决策循环。V2 为唯一路径。下一步：C1 第二轮真实验证 + C4 瘦身。
+> 更新时间：2026-02-27（P1 通知闭环 + P2 review triage/failure diagnosis 完成）
+> 状态：C2 + C3 完成。P1（通知→Telegram 桥接 + overview 全局统计）+ P2（review triage + retry strategy LLM 工具 + 决策接入）已完成。下一步：P0 第二轮真实验证 → C4 瘦身。
 > 目标：人只通过 bot 与系统交互，manager 持续编排 worker 完成 OSS 小改动 PR 流程（默认 `push_only` + 人工 PR gate）
 
 ---
@@ -343,11 +343,11 @@ NL 请求流程：
 | **Confidence routing** | ✅ 已完成 | `ManagerRunFacts.latest_worker_confidence` → 低信心 PASS 升级人工 | — |
 | **Decision Card why_llm** | ✅ 已完成 | `explain_decision_card` → 双层展示 why_machine + why_llm + suggested_actions | — |
 | **NL → action 路由** | ✅ 已完成 | bot 双模路由 + manager LLM intent 解析 | — |
-| **通知** | 🔶 部分完成 | `notify_user` artifact 已在 loop 中产生 | 需 artifact → Telegram 推送桥接 |
-| **失败原因分析** | ❌ 未开始 | runtime_analysis.py 1,746 行 regex 分类 | 混合：Rules 证据 + LLM 语义诊断和策略建议 |
-| **重试策略生成** | ❌ 未开始 | 硬编码 retry → EXECUTING | LLM 基于失败原因生成修改后的 prompt |
-| **Review comment 处理** | ❌ 未开始 | webhook → ITERATING，盲目重跑 | LLM 读评论，判断改代码/回复/忽略 |
-| **全局运营汇报** | 🔶 部分完成 | `get_global_stats` 已实现（数据层） | 需接入 bot `/overview` 展示 + LLM 生成汇报 |
+| **通知** | ✅ 已完成 | `notify_user` artifact → `maybe_emit_manager_notifications()` → Telegram 推送（含优先级标记） | — |
+| **失败原因分析** | ✅ 已完成 | `suggest_retry_strategy` LLM 工具：分析失败证据，判断是否值得重试 + 目标状态 + 修改指令 | — |
+| **重试策略生成** | ✅ 已完成 | `_diagnose_failure()` → `RetryStrategy` → `ManagerRunFacts.retry_should_retry/retry_target_state` → FAILED 决策分流 | — |
+| **Review comment 处理** | ✅ 已完成 | `triage_review_comment` LLM 工具 → `_triage_iterating_review()` → fix_code/reply_explain/ignore → ITERATING 决策分流 | — |
+| **全局运营汇报** | ✅ 已完成 | `get_global_stats` 接入 `/overview`：pass_rate、grade 分布、top reason_codes | — |
 
 ### 不应使用 LLM（当前做法正确，保持）
 
@@ -487,21 +487,15 @@ Orchestrator 外部控制 skill 注入（按状态映射 skill → 构建 task p
 
 未完成（按优先级重排，反映当前真实状态）：
 1. **C1 第二轮真实验证**（最高优先级）：
-   - 选第 2 个 repo 跑完整 QUEUED → PUSHED → PR 流程，验证 V2 状态机 + 混合分级在真实场景的表现。
+   - 选第 2 个 repo 跑完整 QUEUED → PUSHED → PR 流程，验证 V2 状态机 + 混合分级 + review triage + retry strategy 在真实场景的表现。
    - 收集跨 repo 基线数据（成功率、attempt 数、耗时、失败分布）。
-2. **LLM 高阶智能补齐**（C4 前置）：
-   - ~~runtime grading LLM 判断层~~（已完成：`hybrid_llm` 模式 + confidence routing）。
-   - ~~Decision Card `why_llm`~~（已完成）。
-   - review comment 智能分流（读评论内容，判断改代码/回复/忽略）。
-   - 失败诊断策略生成（基于失败证据，LLM 生成修改后的 prompt 或 retry 建议）。
-3. **C4 瘦身**（降低维护成本）：
+2. **C4 瘦身**（降低维护成本）：
    - `cli.py`（4,628 行）拆分为子模块。
    - `runtime_analysis.py`（1,746 行）：保留证据提取 + 硬护栏，分级判断迁移到 Manager LLM 层。
-   - `telegram_bot.py`（1,977 行）handler 扁平化。
+   - `telegram_bot.py` handler 扁平化。
    - 删除被 Manager Agent 替代的纯 rules 分级代码。
-   - 目标：orchestrator < 10K 行（当前 14,510 行）。
-4. **运营闭环**：
-   - 全局运营看板产品化（数据已有：`get_global_stats`，缺展示层）。
+   - 目标：orchestrator < 10K 行。
+3. **运营闭环**：
    - bot 会话上下文持久化（当前内存态）。
    - `skills-feedback` → prompt/policy patch 草案闭环。
 
@@ -609,19 +603,17 @@ Orchestrator 外部控制 skill 注入（按状态映射 skill → 构建 task p
 16. ~~V1 双轨代码删除。~~（已完成：~250 行 V1 分支逻辑删除。）
 17. ~~Telegram 死代码清理。~~（已完成：删除未使用函数，内联常量。）
 
+**P1+P2 已完成（2026-02-27）：**
+18. ~~`manager_notification` artifact → Telegram 推送桥接。~~（已完成：`maybe_emit_manager_notifications()` 在 bot loop 中与 state notifications 同频扫描，按优先级标记推送。）
+19. ~~`get_global_stats` 接入 bot `/overview`。~~（已完成：pass_rate、grade 分布、top reason codes 展示。）
+20. ~~review comment 智能分流。~~（已完成：`triage_review_comment` LLM 工具 + `_triage_iterating_review()` → ITERATING 决策分流 fix_code/reply_explain/ignore。）
+21. ~~失败诊断策略生成。~~（已完成：`suggest_retry_strategy` LLM 工具 + `_diagnose_failure()` → FAILED 决策分流 should_retry + target_state。）
+
 **接下来（按优先级排序）：**
 
 P0 — C1 第二轮真实验证：
-18. 选第 2 个 repo（建议 mem0），跑完整 QUEUED → PUSHED → PR 流程。重点验证：V2 状态机、混合分级（hybrid_llm）、confidence routing。
-19. 基于 2 次真实数据建立基线指标。
-
-P1 — 通知最后一公里 + 运营看板：
-20. `manager_notification` artifact → Telegram 推送桥接。
-21. `get_global_stats` 接入 bot `/overview`。
-
-P2 — LLM 高阶智能：
-22. review comment 智能分流（`triage_review_comment` tool）。
-23. 失败诊断策略生成（`suggest_retry_strategy` tool）。
+22. 选第 2 个 repo（建议 mem0），跑完整 QUEUED → PUSHED → PR 流程。重点验证：V2 状态机、混合分级（hybrid_llm）、confidence routing、review triage、retry strategy。
+23. 基于 2 次真实数据建立基线指标。
 
 P3 — C4 瘦身：
 24. `cli.py` 拆分（4,628 行 → 多子模块）。

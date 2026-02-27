@@ -57,6 +57,25 @@ class DecisionCardExplanation:
     raw: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class ReviewCommentTriage:
+    action: str  # fix_code | reply_explain | ignore
+    reason: str
+    confidence: str
+    reply_draft: str | None
+    raw: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class RetryStrategy:
+    should_retry: bool
+    target_state: str
+    modified_instructions: str
+    reason: str
+    confidence: str
+    raw: dict[str, Any]
+
+
 class ManagerLLMClient:
     def __init__(self, config: ManagerLLMConfig) -> None:
         self.config = config
@@ -722,6 +741,228 @@ class ManagerLLMClient:
         return DecisionCardExplanation(
             why_llm=why_llm,
             suggested_actions=suggested_actions[:4],
+            confidence=confidence,
+            raw=raw,
+        )
+
+    # ------------------------------------------------------------------
+    # triage_review_comment
+    # ------------------------------------------------------------------
+
+    def triage_review_comment(
+        self,
+        *,
+        comment_body: str,
+        run_context: dict[str, Any],
+    ) -> ReviewCommentTriage:
+        tool_schema = {
+            "type": "function",
+            "function": {
+                "name": "triage_review_comment",
+                "description": "Triage a PR review comment into an action.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "enum": ["fix_code", "reply_explain", "ignore"],
+                        },
+                        "reason": {
+                            "type": "string",
+                            "description": "One-sentence justification.",
+                        },
+                        "confidence": {
+                            "type": "string",
+                            "enum": ["low", "medium", "high"],
+                        },
+                        "reply_draft": {
+                            "type": "string",
+                            "description": "Draft reply if action is reply_explain.",
+                        },
+                    },
+                    "required": ["action", "reason", "confidence"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are AgentPR review-comment triage agent. "
+                    "Decide the best action for each review comment. Criteria: "
+                    "(1) changes_requested with concrete code suggestions → fix_code. "
+                    "(2) Questions about design choices → reply_explain. "
+                    "(3) Nitpicks, style-only, praise, or approvals → ignore. "
+                    "(4) If uncertain, prefer fix_code over ignore."
+                ),
+            },
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {"comment": comment_body, "run_context": run_context},
+                    ensure_ascii=True,
+                    sort_keys=True,
+                ),
+            },
+        ]
+        payload = {
+            "model": self.config.model,
+            "temperature": 0,
+            "messages": messages,
+            "tools": [tool_schema],
+            "tool_choice": {"type": "function", "function": {"name": "triage_review_comment"}},
+        }
+        try:
+            data = self._request_chat_completion(payload)
+            return self._review_triage_from_payload(self._extract_tool_call_payload(data), data)
+        except ManagerLLMError as exc:
+            if not self._should_try_json_fallback(exc):
+                raise
+            parsed = self._request_json_fallback(
+                messages=messages,
+                schema_instruction=(
+                    "Return ONLY one compact JSON object with fields: "
+                    "action (fix_code|reply_explain|ignore), reason (string), "
+                    "confidence (low|medium|high), reply_draft (string|null)."
+                ),
+            )
+            return self._review_triage_from_payload(parsed, {"fallback_mode": "json_no_tools"})
+
+    @staticmethod
+    def _review_triage_from_payload(
+        payload: Any,
+        raw: dict[str, Any],
+    ) -> ReviewCommentTriage:
+        if not isinstance(payload, dict):
+            raise ManagerLLMError("review triage payload must be object")
+        action = str(payload.get("action") or "").strip().lower()
+        if action not in {"fix_code", "reply_explain", "ignore"}:
+            raise ManagerLLMError(f"invalid triage action: {action}")
+        reason = str(payload.get("reason") or "").strip()
+        confidence = str(payload.get("confidence") or "medium").strip().lower()
+        if confidence not in {"low", "medium", "high"}:
+            confidence = "medium"
+        reply_draft = payload.get("reply_draft")
+        reply_draft = str(reply_draft).strip() if reply_draft else None
+        return ReviewCommentTriage(
+            action=action,
+            reason=reason or "triage decision",
+            confidence=confidence,
+            reply_draft=reply_draft,
+            raw=raw,
+        )
+
+    # ------------------------------------------------------------------
+    # suggest_retry_strategy
+    # ------------------------------------------------------------------
+
+    def suggest_retry_strategy(
+        self,
+        *,
+        failure_evidence: dict[str, Any],
+    ) -> RetryStrategy:
+        tool_schema = {
+            "type": "function",
+            "function": {
+                "name": "suggest_retry_strategy",
+                "description": "Analyze failure and recommend retry strategy.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "should_retry": {
+                            "type": "boolean",
+                            "description": "Whether retrying is worthwhile.",
+                        },
+                        "target_state": {
+                            "type": "string",
+                            "description": "State to retry from (e.g. EXECUTING).",
+                        },
+                        "modified_instructions": {
+                            "type": "string",
+                            "description": "Adjusted instructions for the retry attempt.",
+                        },
+                        "reason": {
+                            "type": "string",
+                            "description": "One-sentence explanation.",
+                        },
+                        "confidence": {
+                            "type": "string",
+                            "enum": ["low", "medium", "high"],
+                        },
+                    },
+                    "required": ["should_retry", "reason", "confidence"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are AgentPR failure-diagnosis agent. "
+                    "Given failure evidence, decide: "
+                    "(1) Is retrying worthwhile or will it repeat the same error? "
+                    "(2) What target state to retry from? "
+                    "(3) What instructions should change for the retry? "
+                    "Criteria: environment/transient errors → retry. "
+                    "Fundamental misunderstanding of task → do not retry. "
+                    "Test failures with clear fix path → retry with specific guidance. "
+                    "If uncertain, recommend retry with low confidence."
+                ),
+            },
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {"failure_evidence": failure_evidence},
+                    ensure_ascii=True,
+                    sort_keys=True,
+                ),
+            },
+        ]
+        payload = {
+            "model": self.config.model,
+            "temperature": 0,
+            "messages": messages,
+            "tools": [tool_schema],
+            "tool_choice": {"type": "function", "function": {"name": "suggest_retry_strategy"}},
+        }
+        try:
+            data = self._request_chat_completion(payload)
+            return self._retry_strategy_from_payload(self._extract_tool_call_payload(data), data)
+        except ManagerLLMError as exc:
+            if not self._should_try_json_fallback(exc):
+                raise
+            parsed = self._request_json_fallback(
+                messages=messages,
+                schema_instruction=(
+                    "Return ONLY one compact JSON object with fields: "
+                    "should_retry (boolean), target_state (string), "
+                    "modified_instructions (string), reason (string), "
+                    "confidence (low|medium|high)."
+                ),
+            )
+            return self._retry_strategy_from_payload(parsed, {"fallback_mode": "json_no_tools"})
+
+    @staticmethod
+    def _retry_strategy_from_payload(
+        payload: Any,
+        raw: dict[str, Any],
+    ) -> RetryStrategy:
+        if not isinstance(payload, dict):
+            raise ManagerLLMError("retry strategy payload must be object")
+        should_retry = bool(payload.get("should_retry", True))
+        target_state = str(payload.get("target_state") or "EXECUTING").strip()
+        modified_instructions = str(payload.get("modified_instructions") or "").strip()
+        reason = str(payload.get("reason") or "").strip()
+        confidence = str(payload.get("confidence") or "medium").strip().lower()
+        if confidence not in {"low", "medium", "high"}:
+            confidence = "medium"
+        return RetryStrategy(
+            should_retry=should_retry,
+            target_state=target_state,
+            modified_instructions=modified_instructions,
+            reason=reason or "retry strategy decision",
             confidence=confidence,
             raw=raw,
         )

@@ -91,6 +91,8 @@ class ManagerAgent:
                     "pr_number": facts.pr_number,
                     "latest_worker_grade": facts.latest_worker_grade,
                     "latest_worker_confidence": facts.latest_worker_confidence,
+                    "review_triage_action": facts.review_triage_action,
+                    "retry_should_retry": facts.retry_should_retry,
                     "run_digest": digest_context,
                     "tools": tool_context,
                 },

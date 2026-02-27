@@ -10,7 +10,7 @@ from typing import Any
 
 from .manager_agent import ManagerAgent, ManagerAgentConfig
 from .manager_decision import ManagerAction, ManagerActionKind, ManagerRunFacts
-from .manager_llm import ManagerLLMClient, ManagerLLMError
+from .manager_llm import ManagerLLMClient, ManagerLLMError, RetryStrategy
 from .manager_policy import RunAgentPolicy, load_manager_policy, resolve_run_agent_effective_policy
 from .models import RunState, StepName
 from .service import OrchestratorService
@@ -319,6 +319,20 @@ class ManagerLoopRunner:
             except (ManagerLLMError, Exception):  # noqa: BLE001
                 pass  # Keep original grade; LLM grading is best-effort
 
+        # Review triage for ITERATING runs
+        review_triage_action: str | None = None
+        if state == RunState.ITERATING and self._llm_client is not None:
+            review_triage_action = self._triage_iterating_review(run_id)
+
+        # Retry strategy for FAILED runs
+        retry_should_retry: bool | None = None
+        retry_target_state: str | None = None
+        if state == RunState.FAILED and self._llm_client is not None:
+            strategy = self._diagnose_failure(run_id)
+            if strategy is not None:
+                retry_should_retry = strategy.should_retry
+                retry_target_state = strategy.target_state or None
+
         return ManagerRunFacts(
             run_id=run_id,
             owner=str(run["owner"]),
@@ -332,6 +346,9 @@ class ManagerLoopRunner:
             worker_autonomous=(resolved_skills_mode == "agentpr_autonomous"),
             latest_worker_grade=grade,
             latest_worker_confidence=confidence,
+            review_triage_action=review_triage_action,
+            retry_should_retry=retry_should_retry,
+            retry_target_state=retry_target_state,
         )
 
     def _latest_worker_grade(self, run_id: str) -> tuple[str | None, str | None]:
@@ -364,6 +381,52 @@ class ManagerLoopRunner:
         if confidence is None:
             confidence = str(classification.get("confidence") or "").strip().lower() or None
         return grade, confidence
+
+    def _triage_iterating_review(self, run_id: str) -> str | None:
+        """Best-effort LLM triage of the latest review comment. Returns action or None."""
+        if self._llm_client is None:
+            return None
+        try:
+            events = self.service.list_events(run_id, limit=1)
+            if not events:
+                return None
+            latest = events[0]
+            event_type = str(latest.get("event_type") or "")
+            if event_type != "github.review.submitted":
+                return None  # Only triage review comments, not CI checks
+            event_payload = latest.get("payload")
+            event_payload = event_payload if isinstance(event_payload, dict) else {}
+            comment_body = str(event_payload.get("body") or "").strip()
+            if not comment_body:
+                return "fix_code"  # No body = changes_requested without detail, default to fix
+            snapshot = self.service.get_run_snapshot(run_id)
+            run = snapshot["run"]
+            triage = self._llm_client.triage_review_comment(
+                comment_body=comment_body,
+                run_context={
+                    "run_id": run_id,
+                    "owner": str(run.get("owner") or ""),
+                    "repo": str(run.get("repo") or ""),
+                    "state": str(snapshot.get("state") or ""),
+                },
+            )
+            return triage.action
+        except (ManagerLLMError, Exception):  # noqa: BLE001
+            return None  # Triage is best-effort
+
+    def _diagnose_failure(self, run_id: str) -> RetryStrategy | None:
+        """Best-effort LLM failure diagnosis. Returns strategy or None."""
+        if self._llm_client is None:
+            return None
+        try:
+            from .manager_tools import analyze_worker_output
+
+            evidence = analyze_worker_output(service=self.service, run_id=run_id)
+            if not evidence.get("ok"):
+                return None
+            return self._llm_client.suggest_retry_strategy(failure_evidence=evidence)
+        except (ManagerLLMError, Exception):  # noqa: BLE001
+            return None  # Diagnosis is best-effort
 
     def _resolve_policy_skills_mode(self, *, owner: str, repo: str) -> str:
         if self._run_agent_policy is None:
