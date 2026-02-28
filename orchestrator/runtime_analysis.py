@@ -92,6 +92,19 @@ RETRYABLE_FAILURE_PATTERNS: tuple[str, ...] = (
 )
 
 
+def _safe_dict(obj: Any) -> dict[str, Any]:
+    return obj if isinstance(obj, dict) else {}
+
+
+def _write_report(run_id: str, suffix: str, content: str, *, ext: str = "json") -> Path:
+    reports_dir = PROJECT_ROOT / "orchestrator" / "data" / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    path = reports_dir / f"{run_id}_{suffix}_{stamp}.{ext}"
+    path.write_text(content, encoding="utf-8")
+    return path
+
+
 def contains_any_pattern(text: str, patterns: tuple[str, ...]) -> bool:
     return any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in patterns)
 
@@ -1049,24 +1062,14 @@ def build_agent_runtime_report(
 
 
 def write_agent_event_stream(run_id: str, stdout_text: str) -> Path:
-    reports_dir = PROJECT_ROOT / "orchestrator" / "data" / "reports"
-    reports_dir.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
-    stream_path = reports_dir / f"{run_id}_agent_events_{stamp}.jsonl"
-    stream_path.write_text(stdout_text, encoding="utf-8")
-    return stream_path
+    return _write_report(run_id, "agent_events", stdout_text, ext="jsonl")
 
 
 def write_agent_runtime_report(run_id: str, payload: dict[str, Any]) -> Path:
-    reports_dir = PROJECT_ROOT / "orchestrator" / "data" / "reports"
-    reports_dir.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
-    report_path = reports_dir / f"{run_id}_agent_runtime_{stamp}.json"
-    report_path.write_text(
+    return _write_report(
+        run_id, "agent_runtime",
         json.dumps(payload, ensure_ascii=True, sort_keys=True, indent=2),
-        encoding="utf-8",
     )
-    return report_path
 
 
 def percentile_ms(values: list[int], p: float) -> int:
@@ -1235,28 +1238,18 @@ def derive_iteration_hints(
 
 
 def render_manager_insight_markdown(digest: dict[str, Any]) -> str:
-    run = digest.get("run") if isinstance(digest, dict) else {}
-    run = run if isinstance(run, dict) else {}
-    state = digest.get("state") if isinstance(digest, dict) else {}
-    state = state if isinstance(state, dict) else {}
-    attempt = digest.get("attempt") if isinstance(digest, dict) else {}
-    attempt = attempt if isinstance(attempt, dict) else {}
-    classification = digest.get("classification") if isinstance(digest, dict) else {}
-    classification = classification if isinstance(classification, dict) else {}
-    commands = digest.get("commands") if isinstance(digest, dict) else {}
-    commands = commands if isinstance(commands, dict) else {}
-    events = digest.get("events") if isinstance(digest, dict) else {}
-    events = events if isinstance(events, dict) else {}
-    validation = digest.get("validation") if isinstance(digest, dict) else {}
-    validation = validation if isinstance(validation, dict) else {}
-    changes = digest.get("changes") if isinstance(digest, dict) else {}
-    changes = changes if isinstance(changes, dict) else {}
-    recommendation = digest.get("manager_recommendation") if isinstance(digest, dict) else {}
-    recommendation = recommendation if isinstance(recommendation, dict) else {}
-    usage = digest.get("usage") if isinstance(digest, dict) else {}
-    usage = usage if isinstance(usage, dict) else {}
-    stages = digest.get("stages") if isinstance(digest, dict) else {}
-    stages = stages if isinstance(stages, dict) else {}
+    d = _safe_dict(digest)
+    run = _safe_dict(d.get("run"))
+    state = _safe_dict(d.get("state"))
+    attempt = _safe_dict(d.get("attempt"))
+    classification = _safe_dict(d.get("classification"))
+    commands = _safe_dict(d.get("commands"))
+    events = _safe_dict(d.get("events"))
+    validation = _safe_dict(d.get("validation"))
+    changes = _safe_dict(d.get("changes"))
+    recommendation = _safe_dict(d.get("manager_recommendation"))
+    usage = _safe_dict(d.get("usage"))
+    stages = _safe_dict(d.get("stages"))
     stage_rows = list(stages.get("step_totals") or [])[:3]
     stage_lines: list[str] = []
     for row in stage_rows:
@@ -1350,30 +1343,19 @@ def build_run_digest(
     last_message_path: Path | None,
     stage_summary: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    classification = agent_report.get("classification")
-    classification = classification if isinstance(classification, dict) else {}
-    runtime = agent_report.get("runtime")
-    runtime = runtime if isinstance(runtime, dict) else {}
-    result = agent_report.get("result")
-    result = result if isinstance(result, dict) else {}
-    signals = agent_report.get("signals")
-    signals = signals if isinstance(signals, dict) else {}
-    safety = agent_report.get("safety")
-    safety = safety if isinstance(safety, dict) else {}
-    semantic_grading = agent_report.get("semantic_grading")
-    semantic_grading = semantic_grading if isinstance(semantic_grading, dict) else {}
-    preflight = agent_report.get("preflight")
-    preflight = preflight if isinstance(preflight, dict) else {}
-    event_summary = signals.get("agent_event_summary")
-    event_summary = event_summary if isinstance(event_summary, dict) else {}
-    skill_plan = runtime.get("skill_plan")
-    skill_plan = skill_plan if isinstance(skill_plan, dict) else {}
-    usage = event_summary.get("usage")
-    usage = usage if isinstance(usage, dict) else {}
-    command_categories = signals.get("command_categories")
-    command_categories = command_categories if isinstance(command_categories, dict) else {}
+    classification = _safe_dict(agent_report.get("classification"))
+    runtime = _safe_dict(agent_report.get("runtime"))
+    result = _safe_dict(agent_report.get("result"))
+    signals = _safe_dict(agent_report.get("signals"))
+    safety = _safe_dict(agent_report.get("safety"))
+    semantic_grading = _safe_dict(agent_report.get("semantic_grading"))
+    preflight = _safe_dict(agent_report.get("preflight"))
+    event_summary = _safe_dict(signals.get("agent_event_summary"))
+    skill_plan = _safe_dict(runtime.get("skill_plan"))
+    usage = _safe_dict(event_summary.get("usage"))
+    command_categories = _safe_dict(signals.get("command_categories"))
     category_share_pct = compute_count_shares(command_categories)
-    resolved_stage_summary = stage_summary if isinstance(stage_summary, dict) else {}
+    resolved_stage_summary = _safe_dict(stage_summary)
 
     grade = str(classification.get("grade") or "UNKNOWN")
     reason_code = str(classification.get("reason_code") or "unknown")
@@ -1463,24 +1445,14 @@ def build_run_digest(
 
 
 def write_run_digest(run_id: str, payload: dict[str, Any]) -> Path:
-    reports_dir = PROJECT_ROOT / "orchestrator" / "data" / "reports"
-    reports_dir.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
-    digest_path = reports_dir / f"{run_id}_run_digest_{stamp}.json"
-    digest_path.write_text(
+    return _write_report(
+        run_id, "run_digest",
         json.dumps(payload, ensure_ascii=True, sort_keys=True, indent=2),
-        encoding="utf-8",
     )
-    return digest_path
 
 
 def write_manager_insight(run_id: str, markdown: str) -> Path:
-    reports_dir = PROJECT_ROOT / "orchestrator" / "data" / "reports"
-    reports_dir.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
-    insight_path = reports_dir / f"{run_id}_manager_insight_{stamp}.md"
-    insight_path.write_text(markdown, encoding="utf-8")
-    return insight_path
+    return _write_report(run_id, "manager_insight", markdown, ext="md")
 
 
 def persist_run_analysis_artifacts(
@@ -1605,8 +1577,7 @@ def evaluate_pr_gate_readiness(
         )
         return {"ok": False, "failed_checks": failed_checks}
 
-    classification = digest.get("classification")
-    classification = classification if isinstance(classification, dict) else {}
+    classification = _safe_dict(digest.get("classification"))
     grade = str(classification.get("grade") or "")
     reason_code = str(classification.get("reason_code") or "")
     if grade != AgentRuntimeGrade.PASS.value:
@@ -1621,8 +1592,7 @@ def evaluate_pr_gate_readiness(
             }
         )
 
-    preflight = digest.get("preflight")
-    preflight = preflight if isinstance(preflight, dict) else {}
+    preflight = _safe_dict(digest.get("preflight"))
     if not bool(preflight.get("ok", False)):
         failed_checks.append(
             {
@@ -1631,8 +1601,7 @@ def evaluate_pr_gate_readiness(
             }
         )
 
-    safety = digest.get("safety")
-    safety = safety if isinstance(safety, dict) else {}
+    safety = _safe_dict(digest.get("safety"))
     safety_count = int(safety.get("violation_count") or 0)
     if safety_count > 0:
         failed_checks.append(
@@ -1642,8 +1611,7 @@ def evaluate_pr_gate_readiness(
             }
         )
 
-    validation = digest.get("validation")
-    validation = validation if isinstance(validation, dict) else {}
+    validation = _safe_dict(digest.get("validation"))
     required_tests = max(int(expected_policy.get("min_test_commands") or 0), 0)
     runtime_grading_mode = str(
         expected_policy.get("runtime_grading_mode") or "hybrid"
@@ -1688,8 +1656,7 @@ def evaluate_pr_gate_readiness(
                 }
             )
 
-    changes = digest.get("changes")
-    changes = changes if isinstance(changes, dict) else {}
+    changes = _safe_dict(digest.get("changes"))
     changed_files = int(changes.get("changed_files_count") or 0)
     added_lines = int(changes.get("added_lines") or 0)
     max_changed_files = max(int(expected_policy.get("max_changed_files") or 0), 0)
@@ -1710,8 +1677,7 @@ def evaluate_pr_gate_readiness(
         )
 
     expected_mode = str(expected_policy.get("skills_mode") or "").strip()
-    skills = digest.get("skills")
-    skills = skills if isinstance(skills, dict) else {}
+    skills = _safe_dict(digest.get("skills"))
     actual_mode = str(skills.get("mode") or "").strip()
     missing_required = list(skills.get("missing_required") or [])
     if expected_mode and actual_mode and expected_mode != actual_mode:
