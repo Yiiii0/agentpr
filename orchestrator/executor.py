@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import tempfile
 import threading
 import time
 from dataclasses import dataclass
@@ -225,6 +226,27 @@ class ScriptExecutor:
             cmd.append("--full-auto")
         if codex_model:
             cmd.extend(["--model", codex_model])
+
+        if codex_config_override := os.environ.get("AGENTPR_CODEX_CONFIG_OVERRIDES"):
+            cmd.extend(["--config", codex_config_override])
+
+        # Forge provider: if AGENTPR_FORGE_BASE_URL + AGENTPR_FORGE_API_KEY
+        # are set, inject a custom codex provider via -c flags.
+        # When unset, codex uses its default provider (~/.codex/config.toml).
+        forge_base = os.environ.get("AGENTPR_FORGE_BASE_URL", "").strip()
+        forge_key_var = "AGENTPR_FORGE_API_KEY"
+        forge_key = os.environ.get(forge_key_var, "").strip()
+        if forge_base and forge_key:
+            cmd.extend([
+                "-c", 'model_providers.forge.name="Forge Provider"',
+                "-c", f'model_providers.forge.base_url="{forge_base}"',
+                "-c", f'model_providers.forge.env_key="{forge_key_var}"',
+                "-c", 'model_providers.forge.wire_api="responses"',
+                "-c", 'model_provider="forge"',
+            ])
+            forge_model = os.environ.get("AGENTPR_FORGE_MODEL", "").strip()
+            if forge_model and not codex_model:
+                cmd.extend(["--model", forge_model])
         cmd.extend(
             [
                 "--json",

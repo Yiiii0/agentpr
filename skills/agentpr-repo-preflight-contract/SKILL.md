@@ -49,3 +49,5 @@ Build a machine-checkable repo contract before any code edits. Favor objective r
 
 - Read `references/contract_schema.md` for required output schema.
 - Read `references/source_scan.md` for deterministic scan order.
+- Read `references/forge_scenarios.md` for Forge constants, quick-skip check, and integration scenarios A/B/C/D.
+- Read `references/analysis_checklist.md` for the full analysis checklist (1.1–1.6) to complete before any code changes.

@@ -82,7 +82,7 @@ python3.11 -m orchestrator.cli run-manager-loop \
   --run-id $RUN_ID \
   --decision-mode hybrid \
   --skills-mode agentpr_autonomous \
-  --codex-sandbox workspace-write \
+  --codex-sandbox danger-full-access \
   --interval-sec 30 \
   --max-loops 20
 
@@ -95,10 +95,14 @@ python3.11 -m orchestrator.cli run-manager-loop \
 
 **预期状态流转**：
 ```
-QUEUED → EXECUTING → PUSHED（成功）
-                  → FAILED（失败，loop 会自动重试）
+QUEUED → EXECUTING → (auto run-prepare if workspace missing) → PUSHED（成功）
+                  → FAILED（失败，loop 会自动重试，连续 3 次失败自动 PAUSE）
                   → NEEDS_HUMAN_REVIEW（需人工介入）
 ```
+
+> **注意**：`run-manager-loop` 会在 `run-agent-step` 前自动检测 workspace 是否存在。
+> 如果不存在，会先自动调用 `run-prepare`（fork + clone repo）。
+> 需要确保 `gh` CLI 已登录且对目标 repo 有 fork 权限。
 
 ### 3.3 单步手动推进（调试用）
 

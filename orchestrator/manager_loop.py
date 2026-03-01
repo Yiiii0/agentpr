@@ -43,6 +43,9 @@ class ManagerLoopConfig:
     skip_doctor_for_inner_commands: bool = True
 
 
+_CONSECUTIVE_FAIL_LIMIT = 3
+
+
 class ManagerLoopRunner:
     def __init__(self, *, service: OrchestratorService, config: ManagerLoopConfig) -> None:
         self.service = service
@@ -50,6 +53,7 @@ class ManagerLoopRunner:
         self._llm_client: ManagerLLMClient | None = None
         self._run_agent_policy: RunAgentPolicy | None = None
         self._global_stats_cache: dict[str, Any] | None = None
+        self._consecutive_failures: dict[str, int] = {}  # run_id -> count
         try:
             self._run_agent_policy = load_manager_policy(self.config.policy_file).run_agent_step
         except (OSError, ValueError):
@@ -117,6 +121,48 @@ class ManagerLoopRunner:
         attempts = 0
         seen_state_action: set[tuple[str, str]] = set()
 
+        # Check consecutive failure count before doing anything
+        fail_count = self._consecutive_failures.get(run_id, 0)
+        if fail_count >= _CONSECUTIVE_FAIL_LIMIT:
+            # Auto-escalate: transition to NEEDS_HUMAN and stop retrying
+            escalation_msg = (
+                f"Auto-escalated after {fail_count} consecutive failures. "
+                "Manual intervention required."
+            )
+            try:
+                self.service.pause_run(run_id)
+            except Exception:  # noqa: BLE001
+                pass  # Best-effort pause
+            try:
+                from .manager_tools import notify_user
+                notify_user(
+                    service=self.service,
+                    run_id=run_id,
+                    message=escalation_msg,
+                    priority="high",
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            self._consecutive_failures.pop(run_id, None)
+            actions.append({
+                "state": "ESCALATED",
+                "action": "auto_pause",
+                "reason": escalation_msg,
+                "result": "consecutive_failure_limit",
+            })
+            errors.append(escalation_msg)
+            final_snapshot = self.service.get_run_snapshot(run_id)
+            return {
+                "ok": False,
+                "run_id": run_id,
+                "owner": final_snapshot["run"]["owner"],
+                "repo": final_snapshot["run"]["repo"],
+                "state": final_snapshot["state"],
+                "actions_executed": 0,
+                "actions": actions,
+                "errors": errors,
+            }
+
         while attempts < max(self.config.max_actions_per_run, 1):
             facts = self._build_run_facts(run_id)
             action, decision_source = self._decide_action(facts)
@@ -157,8 +203,12 @@ class ManagerLoopRunner:
 
             attempts += 1
             if not outcome["ok"]:
+                self._consecutive_failures[run_id] = fail_count + 1
                 errors.append(str(outcome.get("error") or "action failed"))
                 break
+            else:
+                # Reset on success
+                self._consecutive_failures.pop(run_id, None)
 
         final_snapshot = self.service.get_run_snapshot(run_id)
         executed_count = sum(1 for item in actions if "command" in item)
@@ -485,6 +535,12 @@ class ManagerLoopRunner:
                     "output": "",
                     "error": "prompt_file is required for run-agent-step",
                 }
+            # Auto-prepare: if workspace doesn't exist, run-prepare first
+            workspace_dir = self.config.workspace_root / facts.repo
+            if not workspace_dir.exists():
+                prep = self._run_cli(["run-prepare", "--run-id", run_id])
+                if not prep["ok"]:
+                    return prep
             argv = [
                 "run-agent-step",
                 "--run-id",
@@ -501,6 +557,16 @@ class ManagerLoopRunner:
             return self._run_cli(argv)
 
         if action.kind == ManagerActionKind.RUN_FINISH:
+            # run-finish needs workspace (git commit/push)
+            workspace_dir = self.config.workspace_root / facts.repo
+            if not workspace_dir.exists():
+                return {
+                    "ok": False,
+                    "command": "run-finish",
+                    "returncode": 1,
+                    "output": "",
+                    "error": f"Workspace not found: {workspace_dir}. Run run-prepare first.",
+                }
             argv = [
                 "run-finish",
                 "--run-id",

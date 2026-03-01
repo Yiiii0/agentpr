@@ -38,3 +38,4 @@ Handle post-push failures incrementally: identify root cause, patch minimally, r
 ## Resources
 
 - Read `references/ci_triage_playbook.md` for triage order.
+- Read `references/post_push_guide.md` for CI failure handling, reviewer comment handling, and what NOT to do.

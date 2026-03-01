@@ -556,8 +556,6 @@ def build_task_packet(
             "contract_text": contract_text,
         },
         "docs": {
-            "workflow": str(integration_root / "workflow.md"),
-            "prompt_template": str(integration_root / "prompt_template.md"),
             "pr_template": str(integration_root / "pr_description_template.md"),
         },
         "skills": skill_plan.to_dict(),

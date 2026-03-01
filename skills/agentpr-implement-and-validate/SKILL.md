@@ -56,3 +56,6 @@ Return a compact structured summary with:
 ## Resources
 
 - Read `references/validation_requirements.md` for acceptance checks.
+- Read `references/forge_rules.md` for hard rules, important rules, and common pitfalls.
+- Read `references/example_mem0.diff` for a Python reference integration (env var detection pattern).
+- Read `references/example_dexter.diff` for a TypeScript reference integration (prefix routing pattern).
