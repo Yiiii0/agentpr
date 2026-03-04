@@ -406,12 +406,33 @@ class RuntimeDoctor:
             )
         except OSError as exc:
             return CheckResult("gh.auth", False, str(exc))
-        if completed.returncode == 0:
-            return CheckResult("gh.auth", True, "authenticated")
-        detail = completed.stderr.strip() or completed.stdout.strip() or "gh auth status failed"
-        lines = [line.strip() for line in detail.splitlines() if line.strip()]
-        meaningful = " | ".join(lines[:3]) if lines else "gh auth status failed"
-        return CheckResult("gh.auth", False, meaningful[:240])
+        if completed.returncode != 0:
+            detail = completed.stderr.strip() or completed.stdout.strip() or "gh auth status failed"
+            lines = [line.strip() for line in detail.splitlines() if line.strip()]
+            meaningful = " | ".join(lines[:3]) if lines else "gh auth status failed"
+            return CheckResult("gh.auth", False, meaningful[:240])
+        # Verify token actually works with a lightweight API call
+        try:
+            api_check = subprocess.run(  # noqa: S603
+                ["gh", "api", "user", "--jq", ".login"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=15,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            # Network issue — gh auth status passed, treat as OK with warning
+            return CheckResult("gh.auth", True, "authenticated (API verify skipped)")
+        if api_check.returncode != 0:
+            stderr = api_check.stderr.strip()
+            if "401" in stderr or "token" in stderr.lower():
+                return CheckResult(
+                    "gh.auth", False,
+                    f"token expired or invalid: {stderr[:200]}",
+                )
+            return CheckResult("gh.auth", True, "authenticated (API verify failed, non-auth)")
+        login = api_check.stdout.strip()
+        return CheckResult("gh.auth", True, f"authenticated as {login}")
 
     @staticmethod
     def _check_secret_env(env_name: str, *, required: bool) -> CheckResult:

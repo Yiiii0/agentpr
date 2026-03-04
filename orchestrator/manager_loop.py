@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import fcntl
 import json
+import logging
 import subprocess
 import sys
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from .manager_agent import ManagerAgent, ManagerAgentConfig
 from .manager_decision import ManagerAction, ManagerActionKind, ManagerRunFacts
@@ -42,6 +45,8 @@ class ManagerLoopConfig:
     manager_api_key_env: str
     skip_doctor_for_inner_commands: bool = True
 
+
+logger = logging.getLogger("agentpr.manager_loop")
 
 _CONSECUTIVE_FAIL_LIMIT = 3
 
@@ -115,7 +120,47 @@ class ManagerLoopRunner:
             out.append(run_id)
         return out
 
+    @contextmanager
+    def _run_lock(self, run_id: str) -> Iterator[bool]:
+        """File-based per-run lock. Yields True if acquired, False if busy."""
+        lock_dir = self.config.db_path.parent / ".locks"
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        lock_path = lock_dir / f"run_{run_id}.lock"
+        fd = None
+        try:
+            fd = open(lock_path, "w")  # noqa: SIM115
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            yield True
+        except OSError:
+            if fd is not None:
+                fd.close()
+                fd = None
+            yield False
+        finally:
+            if fd is not None:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+                fd.close()
+
     def _process_run(self, run_id: str) -> dict[str, Any]:
+        with self._run_lock(run_id) as acquired:
+            if not acquired:
+                logger.warning("run=%s already locked by another process, skipping", run_id)
+                return {
+                    "ok": True,
+                    "run_id": run_id,
+                    "owner": "",
+                    "repo": "",
+                    "state": "",
+                    "actions_executed": 0,
+                    "actions": [{"action": "skip", "reason": "run locked by another process"}],
+                    "errors": [],
+                }
+            return self._process_run_inner(run_id)
+
+    def _process_run_inner(self, run_id: str) -> dict[str, Any]:
         actions: list[dict[str, Any]] = []
         errors: list[str] = []
         attempts = 0
@@ -171,6 +216,13 @@ class ManagerLoopRunner:
                 "action": action.kind.value,
                 "reason": action.reason,
                 "decision_source": decision_source,
+                "facts_snapshot": {
+                    "state": facts.state.value,
+                    "latest_worker_grade": facts.latest_worker_grade,
+                    "latest_worker_confidence": facts.latest_worker_confidence,
+                    "has_prompt": facts.has_prompt,
+                    "worker_autonomous": facts.worker_autonomous,
+                },
             }
 
             signature = (facts.state.value, action.kind.value)
@@ -203,6 +255,49 @@ class ManagerLoopRunner:
 
             attempts += 1
             if not outcome["ok"]:
+                # Auto-recovery: dirty workspace with PASS grade → run-finish
+                payload = outcome.get("payload")
+                reason_code = (
+                    str(payload.get("reason_code") or "")
+                    if isinstance(payload, dict)
+                    else ""
+                )
+                if (
+                    action.kind == ManagerActionKind.RUN_AGENT_STEP
+                    and reason_code == "dirty_workspace_pass_grade"
+                ):
+                    logger.info(
+                        "auto_recovery: dirty_workspace_pass_grade for run=%s, "
+                        "executing run-finish instead",
+                        run_id,
+                    )
+                    recovery_action = ManagerAction(
+                        kind=ManagerActionKind.RUN_FINISH,
+                        reason="auto-recovery: dirty workspace with PASS grade",
+                    )
+                    recovery_outcome = self._execute_action(
+                        run_id=run_id, facts=facts, action=recovery_action,
+                    )
+                    recovery_record: dict[str, Any] = {
+                        "state": facts.state.value,
+                        "action": recovery_action.kind.value,
+                        "reason": recovery_action.reason,
+                        "decision_source": "auto_recovery_dirty_workspace",
+                        "command": recovery_outcome["command"],
+                        "returncode": recovery_outcome["returncode"],
+                        "ok": recovery_outcome["ok"],
+                        "output": recovery_outcome["output"],
+                    }
+                    actions.append(recovery_record)
+                    if recovery_outcome["ok"]:
+                        self._consecutive_failures.pop(run_id, None)
+                        continue
+                    else:
+                        errors.append(
+                            str(recovery_outcome.get("error") or "recovery failed")
+                        )
+                        break
+
                 self._consecutive_failures[run_id] = fail_count + 1
                 errors.append(str(outcome.get("error") or "action failed"))
                 break
@@ -383,6 +478,9 @@ class ManagerLoopRunner:
                 retry_should_retry = strategy.should_retry
                 retry_target_state = strategy.target_state or None
 
+        # Use run updated_at as proxy for state_entered_at
+        state_entered_at = str(run.get("updated_at") or "") or None
+
         return ManagerRunFacts(
             run_id=run_id,
             owner=str(run["owner"]),
@@ -399,6 +497,7 @@ class ManagerLoopRunner:
             review_triage_action=review_triage_action,
             retry_should_retry=retry_should_retry,
             retry_target_state=retry_target_state,
+            state_entered_at=state_entered_at,
         )
 
     def _latest_worker_grade(self, run_id: str) -> tuple[str | None, str | None]:
@@ -581,7 +680,21 @@ class ManagerLoopRunner:
         if action.kind == ManagerActionKind.RETRY:
             target_state = str(
                 action.metadata.get("target_state") or RunState.EXECUTING.value
-            )
+            ).strip().upper()
+            # Validate target_state before executing
+            valid_targets = {"QUEUED", "EXECUTING", "ITERATING", "DISCOVERY", "IMPLEMENTING"}
+            if target_state not in valid_targets:
+                return {
+                    "ok": False,
+                    "command": "retry",
+                    "returncode": 1,
+                    "output": "",
+                    "error": (
+                        f"Invalid retry target_state '{target_state}'. "
+                        f"Valid values: {sorted(valid_targets)}. "
+                        f"Defaulting is handled by rules; this indicates a bug in action metadata."
+                    ),
+                }
             return self._run_cli(
                 [
                     "retry",
@@ -719,6 +832,20 @@ class ManagerLoopRunner:
                 err = str(payload["error"]).strip()
             if not err:
                 err = output
+            # Enrich error with actionable context (ACI explicit feedback)
+            if payload is not None:
+                if payload.get("duplicate"):
+                    err = (
+                        f"Duplicate action blocked by idempotency. "
+                        f"Current state: {payload.get('state', 'unknown')}. "
+                        f"No action needed — the previous request is already in effect."
+                    )
+                elif payload.get("invalid_transition"):
+                    err = (
+                        f"State transition not allowed: {err}. "
+                        f"Current state: {payload.get('state', 'unknown')}. "
+                        f"Check allowed transitions for this state."
+                    )
 
         return {
             "ok": ok,
@@ -741,24 +868,30 @@ class ManagerLoopRunner:
     def _compact_payload_for_output(
         value: Any,
         *,
-        list_limit: int = 10,
-        str_limit: int = 1200,
+        list_limit: int = 5,
+        str_limit: int = 500,
+        dict_key_limit: int = 20,
     ) -> Any:
         if isinstance(value, dict):
-            return {
-                str(key): ManagerLoopRunner._compact_payload_for_output(
-                    item,
+            keys = list(value.keys())
+            out: dict[str, Any] = {}
+            for key in keys[:dict_key_limit]:
+                out[str(key)] = ManagerLoopRunner._compact_payload_for_output(
+                    value[key],
                     list_limit=list_limit,
                     str_limit=str_limit,
+                    dict_key_limit=dict_key_limit,
                 )
-                for key, item in value.items()
-            }
+            if len(keys) > dict_key_limit:
+                out["..."] = f"({len(keys) - dict_key_limit} more keys)"
+            return out
         if isinstance(value, list):
             items = [
                 ManagerLoopRunner._compact_payload_for_output(
                     item,
                     list_limit=list_limit,
                     str_limit=str_limit,
+                    dict_key_limit=dict_key_limit,
                 )
                 for item in value[:list_limit]
             ]

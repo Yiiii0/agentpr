@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Any
 
@@ -13,6 +14,8 @@ from .manager_decision import (
 from .manager_llm import ManagerLLMClient, ManagerLLMError
 from .manager_tools import analyze_worker_output, get_global_stats
 from .service import OrchestratorService
+
+logger = logging.getLogger("agentpr.manager_agent")
 
 
 @dataclass(frozen=True)
@@ -58,6 +61,10 @@ class ManagerAgent:
         global_stats: dict[str, Any] | None,
     ) -> tuple[ManagerAction, str]:
         rules_action = decide_next_action(facts)
+        logger.info(
+            "rules_action: state=%s kind=%s reason=%s",
+            facts.state.value, rules_action.kind.value, rules_action.reason,
+        )
         mode = self.config.normalized_mode()
         if mode == "rules":
             return rules_action, "rules"
@@ -99,6 +106,10 @@ class ManagerAgent:
                 allowed_actions=allowed,
             )
             kind = ManagerActionKind(selection.action)
+            logger.info(
+                "llm_action: kind=%s reason=%s allowed=%s",
+                kind.value, selection.reason, allowed,
+            )
             if kind.value not in allowed:
                 raise ManagerLLMError(
                     f"selected action not allowed in current state: {kind.value}"
@@ -109,7 +120,26 @@ class ManagerAgent:
                 and rules_action.kind
                 not in {ManagerActionKind.WAIT_HUMAN, ManagerActionKind.NOOP}
             ):
+                logger.warning(
+                    "guardrail: llm_wait_human_overridden_by_rules "
+                    "llm_wanted=%s rules_override=%s",
+                    kind.value, rules_action.kind.value,
+                )
                 return rules_action, "llm_wait_human_overridden_by_rules"
+            # Guardrail: when both sides pick active actions but disagree,
+            # defer to rules (e.g. rules=RUN_FINISH, llm=RUN_AGENT_STEP).
+            _PASSIVE = {ManagerActionKind.NOOP, ManagerActionKind.WAIT_HUMAN}
+            if (
+                kind not in _PASSIVE
+                and rules_action.kind not in _PASSIVE
+                and kind != rules_action.kind
+            ):
+                logger.warning(
+                    "guardrail: llm_active_overridden_by_rules "
+                    "llm_wanted=%s rules_override=%s",
+                    kind.value, rules_action.kind.value,
+                )
+                return rules_action, "llm_active_overridden_by_rules"
             metadata: dict[str, Any] = {}
             if kind == ManagerActionKind.RETRY and selection.target_state:
                 metadata["target_state"] = selection.target_state
@@ -122,6 +152,7 @@ class ManagerAgent:
                 "llm",
             )
         except (ManagerLLMError, ValueError) as exc:
+            logger.warning("llm_error_fallback: %s", exc)
             if mode == "llm":
                 return (
                     ManagerAction(

@@ -355,12 +355,13 @@ def collect_repo_diff_summary(*, repo_dir: Path) -> dict[str, Any]:
         if del_raw.isdigit():
             deleted_lines += int(del_raw)
 
+    _FILE_LIST_CAP = 16
     return {
-        "changed_files": sorted(changed_files),
+        "changed_files": sorted(changed_files)[:_FILE_LIST_CAP],
         "changed_files_count": len(changed_files),
-        "untracked_files": sorted(untracked_files),
+        "untracked_files": sorted(untracked_files)[:_FILE_LIST_CAP],
         "untracked_files_count": len(untracked_files),
-        "ignored_files": sorted(ignored_files),
+        "ignored_files": sorted(ignored_files)[:_FILE_LIST_CAP],
         "ignored_files_count": len(ignored_files),
         "added_lines": added_lines,
         "deleted_lines": deleted_lines,

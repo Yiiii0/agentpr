@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Any
 
@@ -37,6 +38,7 @@ class ManagerRunFacts:
     review_triage_action: str | None = None  # fix_code | reply_explain | ignore
     retry_should_retry: bool | None = None
     retry_target_state: str | None = None
+    state_entered_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -50,6 +52,14 @@ _TERMINAL: set[RunState] = {
     RunState.DONE,
     RunState.SKIPPED,
     RunState.FAILED_TERMINAL,
+}
+
+_VALID_RETRY_TARGETS: set[str] = {
+    RunState.QUEUED.value,
+    RunState.EXECUTING.value,
+    RunState.ITERATING.value,
+    RunState.DISCOVERY.value,
+    RunState.IMPLEMENTING.value,
 }
 
 
@@ -212,14 +222,40 @@ def decide_next_action(facts: ManagerRunFacts) -> ManagerAction:
                 kind=ManagerActionKind.WAIT_HUMAN,
                 reason="LLM diagnosis: retry not worthwhile",
             )
-        target = facts.retry_target_state or RunState.EXECUTING.value
+        # Validate LLM-provided target_state; default to EXECUTING
+        target_raw = (facts.retry_target_state or "").strip().upper()
+        if target_raw not in _VALID_RETRY_TARGETS:
+            target_raw = RunState.EXECUTING.value
         return ManagerAction(
             kind=ManagerActionKind.RETRY,
             reason="failed run should retry",
-            metadata={"target_state": target},
+            metadata={"target_state": target_raw},
         )
 
     if state in {RunState.CI_WAIT, RunState.REVIEW_WAIT}:
+        # Stale state detection: escalate if stuck too long.
+        _STALE_THRESHOLDS: dict[RunState, timedelta] = {
+            RunState.CI_WAIT: timedelta(hours=24),
+            RunState.REVIEW_WAIT: timedelta(hours=48),
+        }
+        threshold = _STALE_THRESHOLDS.get(state)
+        if threshold is not None and facts.state_entered_at:
+            try:
+                entered = datetime.fromisoformat(facts.state_entered_at)
+                if entered.tzinfo is None:
+                    entered = entered.replace(tzinfo=UTC)
+                age = datetime.now(UTC) - entered
+                if age > threshold:
+                    return ManagerAction(
+                        kind=ManagerActionKind.WAIT_HUMAN,
+                        reason=(
+                            f"stale {state.value}: no progress for "
+                            f"{age.total_seconds() / 3600:.1f}h "
+                            f"(threshold {threshold.total_seconds() / 3600:.0f}h)"
+                        ),
+                    )
+            except (ValueError, TypeError):
+                pass  # Unparseable timestamp — fall through to sync
         return ManagerAction(
             kind=ManagerActionKind.SYNC_GITHUB,
             reason="ci/review waiting states should sync github",

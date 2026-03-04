@@ -133,7 +133,14 @@ class ManagerLLMClient:
                         },
                         "target_state": {
                             "type": "string",
-                            "description": "Required only for retry action.",
+                            "enum": [
+                                "QUEUED",
+                                "EXECUTING",
+                                "ITERATING",
+                                "DISCOVERY",
+                                "IMPLEMENTING",
+                            ],
+                            "description": "Required only for retry action. Which state to retry from.",
                         },
                     },
                     "required": ["action", "reason"],
@@ -242,6 +249,13 @@ class ManagerLLMClient:
                         },
                         "target_state": {
                             "type": "string",
+                            "enum": [
+                                "QUEUED",
+                                "EXECUTING",
+                                "ITERATING",
+                                "DISCOVERY",
+                                "IMPLEMENTING",
+                            ],
                             "description": "Target state for resume/retry actions.",
                         },
                         "limit": {
@@ -616,7 +630,10 @@ class ManagerLLMClient:
         action = str(payload.get("action") or "").strip()
         reason = str(payload.get("reason") or "").strip()
         target_state_raw = payload.get("target_state")
-        target_state = str(target_state_raw).strip() if isinstance(target_state_raw, str) and target_state_raw.strip() else None
+        target_state = str(target_state_raw).strip().upper() if isinstance(target_state_raw, str) and target_state_raw.strip() else None
+        # Validate target_state against allowed retry targets
+        if target_state is not None and target_state not in ManagerLLMClient._VALID_RETRY_TARGETS:
+            target_state = "EXECUTING"
         if not action:
             raise ManagerLLMError("manager llm payload missing action")
         if not reason:
@@ -876,7 +893,14 @@ class ManagerLLMClient:
                         },
                         "target_state": {
                             "type": "string",
-                            "description": "State to retry from (e.g. EXECUTING).",
+                            "enum": [
+                                "QUEUED",
+                                "EXECUTING",
+                                "ITERATING",
+                                "DISCOVERY",
+                                "IMPLEMENTING",
+                            ],
+                            "description": "State to retry from.",
                         },
                         "modified_instructions": {
                             "type": "string",
@@ -944,6 +968,14 @@ class ManagerLLMClient:
             )
             return self._retry_strategy_from_payload(parsed, {"fallback_mode": "json_no_tools"})
 
+    _VALID_RETRY_TARGETS: set[str] = {
+        "QUEUED",
+        "EXECUTING",
+        "ITERATING",
+        "DISCOVERY",
+        "IMPLEMENTING",
+    }
+
     @staticmethod
     def _retry_strategy_from_payload(
         payload: Any,
@@ -952,7 +984,11 @@ class ManagerLLMClient:
         if not isinstance(payload, dict):
             raise ManagerLLMError("retry strategy payload must be object")
         should_retry = bool(payload.get("should_retry", True))
-        target_state = str(payload.get("target_state") or "EXECUTING").strip()
+        target_state_raw = str(payload.get("target_state") or "").strip().upper()
+        # Validate against allowed retry targets; default to EXECUTING
+        if target_state_raw not in ManagerLLMClient._VALID_RETRY_TARGETS:
+            target_state_raw = "EXECUTING"
+        target_state = target_state_raw
         modified_instructions = str(payload.get("modified_instructions") or "").strip()
         reason = str(payload.get("reason") or "").strip()
         confidence = str(payload.get("confidence") or "medium").strip().lower()

@@ -1521,14 +1521,32 @@ def main() -> int:
             runner = ManagerLoopRunner(service=service, config=config)
             loops = 0
             fail_count = 0
+            consecutive_idle = 0
+            _IDLE_EXIT_TICKS = 3  # exit after N consecutive all-waiting ticks
             try:
                 while True:
                     report = runner.tick()
                     print_json(report)
                     if not bool(report.get("ok", False)):
                         fail_count += 1
+                    progressed = int(report.get("progressed_count", 0))
+                    if progressed == 0 and int(report.get("run_count", 0)) > 0:
+                        consecutive_idle += 1
+                    else:
+                        consecutive_idle = 0
                     loops += 1
                     if args.max_loops is not None and loops >= max(int(args.max_loops), 1):
+                        break
+                    # Exit early if all runs are waiting/terminal for N ticks
+                    if consecutive_idle >= _IDLE_EXIT_TICKS:
+                        print_json({
+                            "idle_exit": True,
+                            "reason": (
+                                f"all runs idle for {consecutive_idle} consecutive ticks, "
+                                "exiting. Resume with /retry or /resume when ready."
+                            ),
+                            "loops_completed": loops,
+                        })
                         break
                     time.sleep(max(int(args.interval_sec), 1))
             except KeyboardInterrupt:
@@ -1763,6 +1781,48 @@ def main() -> int:
                 preexisting_diff = collect_repo_diff_summary(repo_dir=repo_dir)
                 if int(preexisting_diff.get("changed_files_count", 0)) > 0:
                     compact_diff = compact_diff_summary(preexisting_diff)
+                    # Check if the latest run_digest has a PASS grade —
+                    # if so, return a recoverable error so the manager loop
+                    # can auto-recover via run-finish instead of escalating.
+                    digest_artifact = service.latest_artifact(
+                        args.run_id, artifact_type="run_digest"
+                    )
+                    digest_grade = ""
+                    if digest_artifact:
+                        digest_uri = str(
+                            digest_artifact.get("uri") or ""
+                        ).strip()
+                        if digest_uri:
+                            digest_path = Path(digest_uri)
+                            if digest_path.exists():
+                                try:
+                                    digest_payload = json.loads(
+                                        digest_path.read_text(encoding="utf-8")
+                                    )
+                                    if isinstance(digest_payload, dict):
+                                        cls = digest_payload.get("classification")
+                                        if isinstance(cls, dict):
+                                            digest_grade = (
+                                                str(cls.get("grade") or "")
+                                                .strip()
+                                                .upper()
+                                            )
+                                except (OSError, json.JSONDecodeError):
+                                    pass
+                    if digest_grade == "PASS":
+                        # Recoverable: don't change state, let manager
+                        # loop handle via auto-recovery (run-finish).
+                        print_json(
+                            {
+                                "ok": False,
+                                "error": "workspace has pre-existing local changes",
+                                "reason_code": "dirty_workspace_pass_grade",
+                                "recovery_action": "run_finish",
+                                "diff": compact_diff,
+                            }
+                        )
+                        return 1
+                    # No PASS grade — escalate as before.
                     service.record_step_failure(
                         args.run_id,
                         step=StepName.AGENT,
@@ -2220,17 +2280,24 @@ def main() -> int:
                 duration_ms=result.duration_ms,
             )
             if result.exit_code != 0:
+                reason_code = "script_failed"
+                if result.exit_code == 2 and "No staged changes" in (
+                    result.stdout + result.stderr
+                ):
+                    reason_code = "no_staged_changes"
                 service.record_step_failure(
                     args.run_id,
                     step=StepName.FINISH,
-                    reason_code="script_failed",
-                    error_message=result.stderr.strip() or "finish.sh failed",
+                    reason_code=reason_code,
+                    error_message=result.stderr.strip() or result.stdout.strip() or "finish.sh failed",
                 )
                 print_json(
                     {
                         "ok": False,
                         "exit_code": result.exit_code,
+                        "reason_code": reason_code,
                         "stderr": result.stderr.strip(),
+                        "stdout_tail": tail(result.stdout),
                     }
                 )
                 return result.exit_code

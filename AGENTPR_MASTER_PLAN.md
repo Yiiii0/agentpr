@@ -1,7 +1,7 @@
 # AgentPR Master Plan
 
-> 更新时间：2026-02-28
-> 状态：C1-C4 + P1-P2 全部完成。缺第二轮真实验证。
+> 更新时间：2026-03-04
+> 状态：C1-C4 + P1-P2 + D1 全部完成。D1.6（Pipeline 修复 + 边界安全网）完成。**下一步：D2 真实验证**——这是距 North Star 最大的差距。
 > 归档：旧版详细记录在 `docs/AGENTPR_MASTER_PLAN_ARCHIVE_20260228_PRE_SLIM.md` 和 `docs/AGENTPR_MASTER_PLAN_ARCHIVE_20260225_PRE_REWRITE.md`
 
 ---
@@ -18,14 +18,13 @@
 
 ## 2. 当前主矛盾
 
-1. 不是缺"编排框架"，而是缺 Manager LLM 决策层闭环。
-2. 不是缺"更多日志"，而是缺"可执行决策输入"到下一步动作的自动路由。
-3. 不是缺"多 agent 并发"，而是缺"单 run 高质量稳定完成率"。
-4. 当前最直接的稳定性风险是"runtime 分级误判"会把本可继续的 run 过早打到 `NEEDS_HUMAN_REVIEW`。
-5. **复杂度分配改善中**：~15.2K 行 orchestrator 代码（C4 拆分后含子模块），~60% 是确定性控制，~12% 是 LLM 智能层。三大文件已拆分为子模块结构。
-6. **抽象层过多**：worker 最终收到的就是一个 prompt string，但经过 5 层构建（prompt → skills → task packet → safety contract → executor）。
+1. **不是缺代码，是缺真实数据。** 管线代码已足够健壮（D1.6 修复了 pipeline bug + 5 个边界情况），但只有 1 次真实测试（C1 DeepCode）。所有改进都是理论性的。
+2. **不是缺"多 agent 并发"，而是缺"单 run 高质量稳定完成率"。** 先证明单 run 能跑通再说。
+3. **不是缺 Manager 智能，是缺验证 Manager 智能有没有用。** hybrid 模式（rules + LLM）已实现，但没有 A/B 数据。
+4. **管线稳定性已显著提升**：D1.6 修复了 PASS-after-dirty-workspace 误升级（dexter 真实 bug）、加宽了 guardrail 防止 LLM 覆盖 RUN_FINISH、加了 stale state detection、run-level 互斥、CI/review 竞态修复。
+5. **复杂度分配合理**：~15.5K 行 orchestrator 代码。60% 确定性控制 + 12% LLM 智能层。进一步减少需要功能性决策（runtime grading → LLM），不是重构能解决的。
 
-结论：方向正确，不需要推翻重写；但当前优先级应从"补更多控制逻辑"转向"让 LLM 在正确的位置发挥智能"。
+**结论：代码侧已准备就绪。主矛盾从"补控制逻辑"变为"用真实数据验证整个管线"。D2 是唯一的 next step。**
 
 ---
 
@@ -40,7 +39,7 @@ Manager Agent (LLM with tools — 系统大脑)
   |-- tool: create_run / get_run_status / get_global_stats
   |-- tool: execute_worker / analyze_worker_output
   |-- tool: triage_review_comment / suggest_retry_strategy
-  |-- tool: notify_user / propose_iteration
+  |-- tool: notify_user
         |
 Orchestrator (薄层：状态持久化 + gate 执法 + 事件日志)
   |-- 硬约束：PR 创建需人工确认 / merge 永远人工
@@ -106,7 +105,7 @@ QUEUED → EXECUTING → PUSHED → CI_WAIT → REVIEW_WAIT → DONE
 9. `approve_open_pr(run_id, request_file, confirm_token, confirm=true)`
 10. `pause_run(run_id)`
 11. `resume_run(run_id, target_state)`
-12. `retry_run(run_id, target_state)`
+12. `retry_run(run_id, target_state)` — target_state 已约束为 enum：QUEUED/EXECUTING/ITERATING/DISCOVERY/IMPLEMENTING（D1 完成）
 13. `analyze_worker_output(run_id)` — 混合分级
 14. `get_global_stats()` — 全局运营统计
 15. `notify_user(message, priority)` — 主动通知
@@ -120,7 +119,7 @@ QUEUED → EXECUTING → PUSHED → CI_WAIT → REVIEW_WAIT → DONE
 3. `analyze_worker_output(run_id)` — 混合分级
 4. `run_finish(run_id, changes, commit_title)`
 5. `request_open_pr / approve_open_pr`
-6. `pause_run / resume_run / retry_run(strategy)`
+6. `pause_run / resume_run / retry_run(strategy)` — strategy 参数应为 enum 约束（D1 已在当前实现中完成）
 7. `get_global_stats() / notify_user(message, priority)`
 
 ### 4.3 约束（始终有效）
@@ -194,6 +193,18 @@ QUEUED → EXECUTING → PUSHED → CI_WAIT → REVIEW_WAIT → DONE
 - 全局统计：get_global_stats 接入 /overview（pass_rate、grade 分布、top reason_codes）
 - 通知：manager_notification artifact → Telegram 推送（含优先级标记）
 
+### D1.6 Pipeline 修复 + 边界安全网（2026-03-04）
+- **Decision audit logging**：rules/llm/guardrail 触发全记录 + facts_snapshot 字段
+- **加宽 guardrail**：rules 和 LLM 都选 active action 但不一致时，rules 优先（防止 LLM 把 RUN_FINISH 改成 RUN_AGENT_STEP）
+- **Smart dirty workspace**：PASS grade workspace 返回可恢复错误（不直接升级 NEEDS_HUMAN_REVIEW）
+- **Dirty workspace auto-recovery**：自动执行 run-finish 恢复 PASS grade 的 dirty workspace
+- **Stale state detection**：CI_WAIT >24h / REVIEW_WAIT >48h 自动升级 WAIT_HUMAN
+- **Run-level mutex**：fcntl.flock per-run 锁，防止并发 manager-tick 竞争
+- **CI/review 竞态修复**：GITHUB_CHECK_COMPLETED 仅从 CI_WAIT 触发转移，避免 review 先到时吃掉 CI 结果
+- **No-changes commit 处理**：finish.sh 检测无 staged changes（exit 2）+ cli.py 返回 `no_staged_changes` reason_code
+- **Post-push 验证**：finish.sh push 后验证 local HEAD == remote HEAD
+- **Token scope 验证**：preflight 额外调用 `gh api user` 验证 token 有效性
+
 ### Bot 交互
 - CLI 命令：/create /overview /list /show /status /pause /resume /retry /approve_pr
 - NL 路由：rules/hybrid/llm 三模，会话级 run_id 绑定
@@ -203,129 +214,118 @@ QUEUED → EXECUTING → PUSHED → CI_WAIT → REVIEW_WAIT → DONE
 - agentpr_autonomous 模式：worker 单次完成分析+实现+验证
 - Skills 系统可用（markdown 定义，worker 可访问）
 - Codex 支持 Forge provider（`.env` 配置 `AGENTPR_FORGE_BASE_URL` + `AGENTPR_FORGE_API_KEY`，不设则用默认 provider）
+- **当前临时使用 Codex 原生 provider**：Forge `/v1/responses` 端点存在 422 bug（reasoning item `id` 必填但 OpenAI 规范中可选），已反馈给 Forge 团队，等修复后切回。详见 `docs/forge_422_bug_report.md`
 
-### 代码结构（C4 瘦身后）
-- `cli.py` (2,768) + 4 子模块（cli_helpers/cli_pr/cli_inspect/cli_worker）
+### 代码结构（D1.6 后）
+- `cli.py` (~2,820) + 4 子模块（cli_helpers/cli_pr/cli_inspect/cli_worker）
 - `telegram_bot.py` (1,573) + telegram_bot_helpers (568)
 - `runtime_analysis.py` (1,712)
-- orchestrator 总计 ~15.2K 行（27 个 .py 文件）
+- orchestrator 总计 ~15.5K 行（27 个 .py 文件）
 
 ---
 
-## 7. 系统级验收对照
+## 7. 系统级验收对照（距 North Star 差距分析）
 
 ### 目标能力 A：NL 下发任务 → 自动推进到 PUSHED/PR gate
 
-**当前状态：大部分达成。** NL 触发 `create_runs` → auto-prepare → manager loop 自动推进 → PUSHED/gate。V2 状态机简化了推进路径。
-**缺口**：常驻 loop 仍需手动启动（`run-manager-loop`），未做 systemd/cron 常驻化。
+**代码侧：✅ 已达成。** NL → create_run → auto-prepare → manager loop → PUSHED/gate 全通路。D1.6 修复了 dirty workspace 误升级和 guardrail 问题。
+**运维侧：❌ 未验证。** 仅 1 次真实测试（C1 DeepCode）。D2 是验证入口。
+**常驻化：❌ 未做。** loop 仍需手动启动 `run-manager-loop`。
 
 ### 目标能力 B：问"现在什么情况"→ 全局态势 + 下一步
 
-**当前状态：部分达成。** `/overview` + `/show` + Decision Card 双层展示。`get_global_stats` 已实现。
-**缺口**：缺"下一步优先级队列"。
+**当前状态：部分达成。** `/overview` + `/show` + Decision Card 双层展示。
+**缺口**：缺"下一步优先级队列"——自动告诉用户"最值得关注的 3 件事"。
 
 ### 目标能力 C：状态变更时主动通知
 
-**当前状态：已达成。** Bot 有关键状态主动通知 + `manager_notification` artifact 推送到 Telegram（含优先级标记）。
+**当前状态：✅ 已达成。** Bot 关键状态通知 + manager_notification 推送。D1.6 加了 stale state 检测（CI_WAIT >24h / REVIEW_WAIT >48h 自动升级）。
 
 ### 目标能力 D：PR review comments → 主动问"人工还是自动修复"
 
-**当前状态：基础具备。** Webhook/Sync → `ITERATING`。`triage_review_comment` LLM 分流（fix_code/reply_explain/ignore）。
-**缺口**：bot 端尚未做主动决策对话层（目前 triage 结果直接影响 manager 决策，不经过用户确认）。
+**当前状态：基础具备。** CI/review 竞态已修复（D1.6 EC3）。triage_review_comment 分流已实现。
+**缺口**：triage 结果直接影响 manager 决策，不经过用户确认对话。
 
 ### 目标能力 E：manager 自我迭代提案 → 人审批
 
-**当前状态：基础具备。** 已有 `skills-metrics/skills-feedback`。
-**缺口**：缺"自动提案 → 审批 → 应用"闭环执行器。
+**当前状态：基础具备。** 有 `skills-metrics/skills-feedback`。
+**缺口**：缺"自动提案 → 审批 → 应用"闭环。这是 D3+ 的事。
 
 ---
 
 ## 8. 实事求是：当前差距
 
-### 8.1 最大的缺口：缺真实验证数据
+### 8.1 最大的缺口：缺真实验证数据（不变，仍是 #1）
 
-**只有 1 次真实测试**（C1: HKUDS/DeepCode），结果 NEEDS_HUMAN_REVIEW/missing_test_evidence。所有 C2-C4 改进都是理论上的改进，没有第二个数据点验证。
+**只有 1 次真实测试**（C1: HKUDS/DeepCode），结果 NEEDS_HUMAN_REVIEW/missing_test_evidence。D1-D1.6 所有改进都基于理论分析和 dexter 单次失败的 post-mortem。没有第二个完整成功的数据点。
 
-这是当前最高优先级。在没有更多真实数据前，不应继续堆新功能。
+**D1.6 修复了 dexter 测试暴露的 pipeline bug**（Worker PASS 但 Manager 误走 RUN_AGENT_STEP → dirty workspace → NEEDS_HUMAN_REVIEW）。但修复后还没重新验证。
 
-### 8.2 Orchestrator 不是"薄层"
+**这仍然是最高优先级。** 管线代码已足够健壮。下一步只有一个：跑 D2。
 
-目标：orchestrator < 8K 行。实际：15.2K 行。
+### 8.2 Orchestrator 不是"薄层"（不变，接受现实）
 
-原因分析：
-- `runtime_analysis.py` (1,712 行)：1,700 行 regex/rules 做的事情，一个 LLM 调用（带结构化证据包）可能做得更好。但迁移是功能性变更，不是纯重构。
-- `cli.py` (2,768 行)：CLI 入口本身就承载了 15+ 命令的参数解析和执行逻辑，这是必要的复杂度。
-- `cli_inspect.py` (966 行)：inspection/feedback 报告生成，大量 dict 拼接。
-- `manager_llm.py` (968 行)：4 个 LLM 工具的 prompt 构建 + 响应解析。
+目标：orchestrator < 8K 行。实际：~15.5K 行。
 
-**判断**：15K 不是"膨胀"，是当前功能集的真实复杂度。要真正降到 <10K 需要：(a) runtime grading 迁移到 LLM，(b) 精简 CLI 命令集，(c) 减少报告生成代码。这些都是功能性决策，不是重构能解决的。
+**判断不变**：15.5K 是当前功能集的真实复杂度。D1.6 增加了 ~200 行（audit logging + guardrails + mutex + edge cases），但每行都有明确的 bug fix / safety net 价值。要降到 <10K 需要功能性决策（runtime grading → LLM），不是重构。
 
-### 8.3 Manager LLM 角色定位
+### 8.3 Manager LLM 角色定位（进展：guardrail 加宽）
 
 **目标**：Manager 是真正的 LLM 大脑，orchestrator 只是执行层。
-**现实**：Manager LLM 参与 6 个决策点（grading、confidence routing、triage、retry strategy、explain、NL routing），但 orchestrator 仍然承担大量规则决策。
+**现实**：D1.6 加宽了 guardrail——rules 和 LLM 都选 active action 时 rules 优先。这意味着当前 LLM 在 hybrid 模式下的自由度是：
+- ✅ 可以把 rules 的 active action 降级为 WAIT_HUMAN（保守路线，由 LLM 判断）
+- ❌ 不可以把 rules 的 RUN_FINISH 改成 RUN_AGENT_STEP（激进路线，被 guardrail 阻止）
 
-**实质进展**：从"LLM 只做选择题"升级到"LLM 参与语义判断 + confidence routing"。这是正确的中间态，不需要激进地全面替换 rules。
+这是正确的中间态。进一步松绑需要 D2 数据证明 LLM 判断可靠。
 
-### 8.4 其他未完成项
+### 8.4 进度总览
 
 | 项目 | 状态 | 优先级 |
 |------|------|--------|
-| C1 第二轮真实验证 | **未做** | **P0** |
-| Manager loop 常驻化（systemd/cron） | 未做 | P1 |
-| Bot 会话上下文持久化（当前内存态） | 未做 | P2 |
-| skills-feedback → prompt/policy patch 草案闭环 | 未做 | P3 |
-| runtime grading 迁移到 LLM 层 | 未做 | P3 |
+| D1：Manager 工具接口 ACI 优化 | **✅ 已完成** | — |
+| D1.6：Pipeline 修复 + 边界安全网 | **✅ 已完成** | — |
+| **D2：真实验证（mem0 + dexter）** | **❌ 未做** | **⭐ 最高** |
+| D3：基于验证数据迭代 | 未做 | D2 之后 |
+| D-forge：Forge 切回 | 等外部修复 | D2 之后 |
+| Manager loop 常驻化（systemd/cron） | 未做 | D3 之后 |
+| Bot 会话上下文持久化（当前内存态） | 未做 | D3 之后 |
+| Review triage 用户确认对话 | 未做 | D3 之后 |
+| 优先级队列（"最值得关注的事"） | 未做 | D3 之后 |
+| skills-feedback → 自动提案闭环 | 未做 | D3 之后 |
+| runtime grading 迁移到 LLM 层 | 未做 | D3+ |
 
 ---
 
 ## 9. 下一步（按优先级）
 
-### P0：第二轮真实验证
+> 详细行动计划见 Section 18。以下是优先级摘要。
 
-选 1 个新 repo（建议 mem0ai/mem0），完整跑通 QUEUED → PUSHED → PR 创建。
+### D2（⭐ 最高优先 — 唯一的 next step）：真实验证
 
-验证重点：
-1. V2 状态机走通（无 V1 状态出现）
-2. auto-prepare 自动 fork/clone workspace
-3. hybrid_llm 分级给出合理 confidence（需 API key）
-4. review triage + retry strategy 是否在真实场景有效
-5. 通知是否在 bot 模式下正常推送
-6. 连续失败保护是否正常触发
+**所有代码侧工作已完成。** D1 + D1.6 让管线足够健壮。现在需要数据。
 
-基于 2+ 次真实数据建立基线指标：
-- 首次成功率（目标 ≥ 50%）
-- 平均 worker attempt 数（目标 ≤ 2）
-- NEEDS_HUMAN_REVIEW 中误升级率（目标 ≤ 30%）
+用 Codex 原生 provider 跑 mem0 + dexter 两个完整 run。验证 D1.6 的 pipeline 修复（特别是 dexter 的 dirty workspace 场景）。建立基线指标。
 
-### P1：Manager loop 运营化
+### D3：基于 D2 数据迭代
 
-- 常驻进程（systemd service 或后台 daemon）
-- 异常自恢复（crash → 自动重启）
-- 日志轮转
+D2 数据驱动。可能方向（优先级由数据决定）：
+- Manager 决策准确率不够 → 调 guardrail 松紧度 / prompt
+- Worker 完成质量不够 → 补 skills references / 调 grading
+- 管线仍有 edge case → 修 pipeline
+- 一切顺利 → 进入常驻化 + 运维阶段
 
-### P2：Bot 会话持久化
+### D-forge：Forge 切回（等外部修复）
 
-当前 run_id 绑定是内存态（bot 重启丢失）。改为 SQLite 或 JSON 文件持久化。
+Forge 422 修复后验证并切回。
 
-### P3：自我迭代闭环
+### 后续（D3 之后再排优先级）
 
-输入源：
-1. `run_digest`（机器真值）
-2. `manager_insight`（解释层）
-3. `skills-metrics` / `skills-feedback`
-4. CI/review 反馈
-
-输出目标：
-1. prompt 迭代建议（不直接盲改）
-2. skill 迭代建议
-3. policy 迭代建议（timeout/diff/retry/allowlist）
-
-落地原则：
-1. 默认"建议→审批→应用"。
-2. 仅允许 manager 自动改写候选草案（`data/prompts/*`、`data/contracts/*`、`skills/*`）。
-3. 核心策略文件仍需人工审批合并。
-4. 迭代不是每次 run 都触发；由 manager 基于收益判断触发（失败模式重复、成本异常时才提案）。
+1. **Manager loop 常驻化**（systemd/daemon + 自恢复 + 日志轮转）
+2. **Bot 会话持久化**（run_id 绑定从内存态改为 SQLite）
+3. **Review triage 用户确认**（triage 结果先问用户，再执行）
+4. **优先级队列**（"你最应该关注的 3 件事"）
+5. **自我迭代闭环**（skills-feedback → prompt/policy patch 草案 → 人审批）
+6. **runtime grading → LLM**（砍掉 1,700 行 regex，降低 orchestrator 总行数）
 
 ---
 
@@ -347,6 +347,11 @@ QUEUED → EXECUTING → PUSHED → CI_WAIT → REVIEW_WAIT → DONE
 保护机制：
 - 同一 run 连续 3 次 action 失败 → 自动 PAUSE + 高优先级通知。
 - workspace 不存在 → 自动 run-prepare（fork + clone），prepare 失败则计入连续失败。
+- Dirty workspace + PASS grade → 自动 run-finish 恢复（D1.6），不误升级 NEEDS_HUMAN。
+- CI_WAIT >24h / REVIEW_WAIT >48h → 自动升级 WAIT_HUMAN（stale state detection，D1.6）。
+- 并发 manager-tick → per-run fcntl 文件锁互斥（D1.6），重复处理时 skip。
+- CI/review 事件竞态 → 状态感知转移（D1.6），避免 review 先到时吃掉 CI 结果。
+- Post-push 验证 → finish.sh 比对 local/remote HEAD，防止 push 失败但状态误报 PUSHED（D1.6）。
 
 ---
 
@@ -386,7 +391,7 @@ QUEUED → EXECUTING → PUSHED → CI_WAIT → REVIEW_WAIT → DONE
 2. Worker 固定 `codex exec`。
 3. 默认模式 `push_only`，`merge` 永远人工。
 4. `create PR` 必须二次确认。
-5. Manager 默认走 API function-calling（Forge provider 优先）。
+5. Manager 默认走 API function-calling。Provider：Forge 422 修复前用 Codex 原生，修复后切回 Forge。
 6. 混合策略：Rules 负责硬护栏 + 证据提取，LLM 负责语义判断 + 建议。不做全量替换。
 7. baseline 仓库固定 `mem0` 与 `dexter`。
 
@@ -435,6 +440,21 @@ QUEUED → EXECUTING → PUSHED → CI_WAIT → REVIEW_WAIT → DONE
 22. **通知"最后一公里"容易被忽略。** 产生 artifact 只是一半，推送到用户才是闭环。这类"看似完成实则断链"的问题需要端到端验证发现。
 23. **如果做的不对，再大的代价也是最小的代价。** 先跑通第一个 PR 再说。
 
+**文档重构 + Forge 调试 + ACI 对标后：**
+24. **工具接口设计 > 模型能力。** SWE-agent 论文核心结论：ACI 设计对 agent 性能的影响大于模型选择。`retry --target-state retry` 不是"LLM 太蠢"，是工具参数类型太松。用 enum + 自动推导 + 显式反馈修工具，不要加"意图抽象层"。
+25. **不要过度设计分层。** 初始的"CEO+COO"模型是过度架构化。OpenHands、SWE-agent、Claude Code、GitHub Copilot Agent——没有一个用"意图层"隔离 LLM 和工具。正确做法：单 agent + 好的工具 + 安全拦截器。
+26. **给 LLM 精简的信息比给它更多信息效果好。** Worker 文档重构（8 文件 → 3 skills 按需读）验证了这一点。SWE-agent 的"信息窗口化"原则一致。
+27. **Skills 即单一来源。** Worker 的执行指南应收敛到 skills（按需检索），不应散布在多个重叠文件中。slim entry + skill references 优于 everything-in-one-prompt。
+28. **外部依赖的 bug 要尽早隔离，不阻塞核心流程。** Forge 422 调试有价值（暴露了 Responses API schema 细节），但立刻切到原生 provider 继续前进。
+29. **先纠偏认知再写代码。** Section 17 初版的"CEO+COO"看着合理但经不起对标检验。花时间对标 OpenHands/SWE-agent 比直接实现"意图层"省了更多时间。
+
+**D1.6 Pipeline 修复后：**
+30. **一次真实测试胜过十次代码审查（再次验证）。** dexter run 暴露的 dirty workspace bug 是纯静态分析不可能发现的——Worker PASS 了但 Manager 决定再跑一次 RUN_AGENT_STEP，这是 guardrail 设计缺陷 + dirty workspace 处理过于激进的组合问题。
+31. **Guardrail 的正确策略是"rules 优先但 LLM 可降级"。** 不是"rules 全覆盖"也不是"LLM 全权"。LLM 可以把 active action 降为 WAIT_HUMAN（保守），但不可以把 RUN_FINISH 改为 RUN_AGENT_STEP（激进覆盖）。松紧度需要数据验证后调整。
+32. **边界情况的修复成本远低于出问题的代价。** CI/review 竞态、concurrent tick、push 验证——每个修复只有 10-20 行代码，但对应的 bug 一旦触发就是"Worker 工作白费"或"状态污染"。
+33. **审计日志不是可选项。** facts_snapshot 让 post-mortem 从"猜测发生了什么"变成"直接读 action_record"。decision_source 字段让每个决策可追溯。这 20 行代码的 ROI 是最高的。
+34. **不要继续堆代码。去跑真实测试。** D1.6 之后管线代码已经足够健壮（5 个 pipeline fix + 5 个边界 fix = 10 个安全网）。继续加 feature 是逃避验证。
+
 ---
 
 ## 15. 参考资料
@@ -444,6 +464,9 @@ QUEUED → EXECUTING → PUSHED → CI_WAIT → REVIEW_WAIT → DONE
 3. OpenHands：<https://docs.all-hands.dev/modules/usage/how-to/github-action>
 4. OpenAI Function Calling：<https://platform.openai.com/docs/guides/function-calling>
 5. SWE-agent：<https://github.com/SWE-agent/SWE-agent>
+6. SWE-agent ACI 论文（ICLR 2025）：<https://arxiv.org/abs/2405.15793> — "Agent-Computer Interfaces Enable Automated Software Engineering"
+7. OpenHands V1 SDK 论文：<https://arxiv.org/abs/2511.03690> — "A Composable and Extensible Foundation for Production Agents"
+8. SWE-agent ACI 设计原则：<https://github.com/SWE-agent/SWE-agent/blob/main/docs/background/aci.md>
 
 ---
 
@@ -477,39 +500,185 @@ QUEUED → EXECUTING → PUSHED → CI_WAIT → REVIEW_WAIT → DONE
 
 ---
 
-## 17. 附录：关于 AI Manager 智能边界的思考（C2 轮测试驱动）
+## 16.1 Worker 文档重构记录（2026-03-01）
 
-在对 `run_4a2896afee3b` 进行手动测试的过程中，我们遇到了两个关键的失败场景：
-1.  **LLM 决策错误**：Manager 在判断需要重试后，生成了无效的命令 `retry --target-state retry`。
-2.  **幂等性机制介入**：人类专家在修正了上述错误命令后，连续的 `retry` 请求被系统的幂等性保护机制拦截，返回 `duplicate: true`。
+### 问题
 
-这两个场景暴露了让 AI Manager 直接操作低阶工具的内在风险和复杂性，并引发了关于其“智能边界”的深入思考。
+Worker 接触到的文档体系存在三个核心问题：
+1. **大量冗余**：同一条规则在 4 个不同文件中重复出现
+2. **claude_code_prompt.md 过时**：包含 Legacy 手动批量模式、硬编码绝对路径
+3. **Skills 与 prompt_template.md 职责不清**：autonomous 模式下 worker 自主调用 skills，但 prompt_template.md 又包含了 skills 已覆盖的全部内容
 
-### AI Manager 面临的“三重门”
+### 重构结果
 
-一个纯粹的 LLM 在尝试进行自我诊断和修复时，面临着三个难以逾越的障碍：
+| 维度 | 重构前 | 重构后 |
+|------|--------|--------|
+| Worker 需读文件数 | 8+ (prompt + workflow + prompt_template + 2 diffs + 3 skills + refs) | 3 skills + 各自的 refs（按需读） |
+| 内嵌 prompt 大小 | 84 行 | 27 行 |
+| 冗余指令 | 同一规则 3-4 处重复 | 每条规则只在一个地方 |
+| Forge 上下文 | 散布在 4 个文件 | 集中在 skills 的 references 中 |
 
-1.  **上下文窗口的“窄门”**：LLM 的记忆力仅限于当前 Prompt。它不知道自己之前的操作历史，因此难以理解“重复请求”这类需要时间线上下文的状态。要使其理解，就必须在 Prompt 中构建复杂的历史摘要，这会极大地消耗 Token 和成本。
-2.  **工具抽象的“幻门”**：对 LLM 而言，`retry` 只是一个被告知可以使用的符号。它不理解其背后连接的状态机、数据库和幂等性校验逻辑。让它直接生成完整的、带所有参数的 CLI 命令，无异于让它“猜测”一个复杂工具的所有内部规则。
-3.  **经济成本的“铁门”**：让 LLM 自由“试错”的成本是高昂的。每一次无效的尝试都是一次昂贵的 API 调用。相比之下，一个确定性的规则（“凡是重试，状态就是 EXECUTING”）成本极低。
+### 具体变更
 
-### 设计模式反思：从“万能的 CEO”到“CEO + COO”模式
+- `claude_code_prompt.md`：84 → 27 行精简入口（角色 + 核心指令 + 指向 skills）
+- Skill-1 新增：`forge_scenarios.md`（常量+场景）、`analysis_checklist.md`（分析清单 1.1-1.6）
+- Skill-2 新增：`forge_rules.md`（8 hard + 5 important rules + pitfalls）、移入 `example_mem0.diff` + `example_dexter.diff`
+- Skill-3 新增：`post_push_guide.md`（CI failure + reviewer comment 处理）
+- `prompt_template.md` → `archive/prompt_template_v1.md`
+- `workflow.md` → `archive/workflow_v1.md`
+- `orchestrator/skills.py`：task_packet docs 字段移除 workflow/prompt_template 引用
 
-这次实践证明，将 AI Manager 设计成一个无所不能、直接操作一切的“万能 CEO”是脆弱且昂贵的。一个更健壮、更实事求是的设计模式是**“CEO + COO”的职责分离模式**：
+### 16.2 Forge 422 Bug 记录
 
-*   **AI Manager (CEO - 首席执行官)**: 负责**战略和意图**。它的核心价值在于理解模糊的自然语言、分析非结构化的错误日志、并做出**高级别的决策**（例如：“看起来是临时故障，我们应该重试”或“这个问题我没见过，需要人类专家介入”）。
-*   **Orchestrator (COO - 首席运营官)**: 负责**战术和执行**。它的职责是接收 CEO 的战略意图，并将其翻译成**绝对安全、100% 有效**的具体动作。它负责处理幂等性、校验状态转换、执行命令、保障安全“护栏”。
+详见 `docs/forge_422_bug_report.md`。核心问题：Forge `/v1/responses` 端点在多轮工具调用时返回 422，因为 `ResponsesItemReasoning.id` 被定义为必填但 OpenAI 规范中可选。一行修复（`id: str` → `id: str | None = None`）。已反馈 Forge 团队，等修复后切回。临时方案：使用 Codex 原生 provider。
 
-### 未来改进方向：从“命令生成”到“意图表达”
+---
 
-为了更好地赋能 AI Manager，我们不应期望它能完美生成每一个 CLI 命令的参数。未来的改进方向应该是，将提供给 AI Manager 的工具从**低阶的、命令式的**（如 `retry`）升级为**高阶的、意图式的**。
+## 17. 附录：Agent-Computer Interface 设计原则（C2 测试 + 行业对标驱动）
 
-例如，设计一个新工具 `propose_remediation(intent: str, justification: str)`。
+### 17.1 原始事件
 
-在未来的工作流中：
-1.  AI Manager 在分析失败后，不再生成 `retry` 命令，而是调用 `propose_remediation(intent="RETRY", justification="The failure seems temporary.")`。
-2.  Orchestrator (COO) 收到这个结构化的**意图**。
-3.  Orchestrator 内部的**确定性规则**开始工作：它根据 `RETRY` 的意图，自行构造并执行一个 100% 正确的命令，包括处理 `idempotency-key` 的逻辑。
-4.  Orchestrator 甚至可以在执行前，将这个“意图和理由”通过 Bot 呈报给人类“董事长”进行最终审批。
+`run_4a2896afee3b` 手动测试中的两个失败：
+1. Manager 生成了无效命令 `retry --target-state retry`（`target_state` 是自由文本，LLM 填了无效值）
+2. 人工修正后，幂等性机制拦截连续 retry 请求
 
-这种模式既给了 AI **思考和形成意图的空间**，又用**确定性的规则**保证了最终执行的**绝对可靠**，是实现高级别人机协同智能的必由之路。
+### 17.2 初始诊断（已修正）
+
+最初我们将此归因于”LLM 不应直接操作工具”，提出了”CEO+COO”模式和”意图表达层”（`propose_remediation(intent, justification)`）。经过与行业最佳实践对标后，**发现初始诊断偏了**。
+
+**偏了的部分：**
+
+- **”CEO+COO” 双层分离是过度设计。** 看看表现最好的 agent 系统：OpenHands V1（单 agent + event loop + SecurityAnalyzer）、SWE-agent（单 agent + ACI）、Claude Code（单 agent + tools + permission mode）、GitHub Copilot Agent（单 agent + sandbox）。**没有一个用 “意图抽象层” 隔离 LLM 和工具**。
+- **`propose_remediation` 本质就是 function calling。** 它和一个参数设计合理的 `retry_run(run_id)` 没有区别，多了一层不必要的间接。
+- **”三重门”低估了当前 LLM 能力。** 128K+ 上下文窗口足够容纳操作历史；function calling 已经成熟；Haiku 级模型做 routing 决策成本很低。
+
+### 17.3 正确的诊断：工具接口设计差
+
+`retry --target-state retry` 的根因不是”LLM 不该直接调工具”，而是 **`retry` 工具的接口设计有问题**：
+
+```python
+# 当时：target_state 是自由文本，LLM 可以填任何值
+retry_run(run_id: str, target_state: str)  # → LLM 写了 “retry”
+
+# 应该：target_state 由 orchestrator 自动推导，或用 enum 约束
+retry_run(run_id: str)  # orchestrator 根据当前状态自动决定
+# 或
+retry_run(run_id: str, strategy: Literal[“rerun”, “iterate”, “escalate”])
+```
+
+这正是 SWE-agent 的核心发现——**Agent-Computer Interface (ACI) 设计对 agent 性能的影响，大于模型选择本身**。
+
+### 17.4 ACI 设计原则（来自 SWE-agent + OpenHands V1）
+
+SWE-agent 论文（ICLR 2025）的核心假设：”We assume a fixed LM and focus on designing the ACI to improve its performance.” 四个原则：
+
+1. **语法验证**：工具执行前先 validate，不让错误传播。
+   - AgentPR 应用：Manager 工具参数用 JSON schema + enum 约束，无效调用在执行前就被拒绝并返回清晰错误。
+2. **信息窗口化**：一次只给 agent 它需要的信息量，不做信息洪流。
+   - AgentPR 应用：Worker 文档重构（slim entry + skill references 按需读取）已经做了这一步。Manager 工具返回值也应精简——返回”下一步建议”而非裸 JSON dump。
+3. **搜索结果精简**：只返回关键信息，不返回完整上下文。
+   - AgentPR 应用：`show_run` 返回结构化摘要 + 建议动作，不是整个 run 的所有事件。
+4. **显式反馈**：空输出、成功、失败都要有明确反馈。
+   - AgentPR 应用：幂等拦截不应只返回 `duplicate: true`，应返回 “This run was already retried 2 minutes ago, current state is EXECUTING. No action needed.”
+
+OpenHands V1 SDK（2025）的架构选择：
+- Agent 是**无状态的 event processor**
+- 所有状态在 ConversationState（event log）
+- 安全层是**拦截器**（execute 前检查），不是独立决策层
+- **没有 “意图层” vs “执行层” 的分离——只有好的工具设计 + 安全拦截**
+
+### 17.5 AgentPR 的正确定位
+
+对比行业实践，AgentPR 当前架构其实没有根本性错误：
+
+| 组件 | 行业做法 | AgentPR 当前 | 差距 |
+|------|---------|-------------|------|
+| Agent loop | 单 agent + structured tools | Manager LLM + action contract | ✅ 方向对 |
+| 安全层 | 拦截器（execute 前检查） | safety contract + gate 执法 | ✅ 已有 |
+| 工具接口 | 严格类型 + enum + 显式反馈 | 部分自由文本 + 裸错误返回 | **← 这是要改的** |
+| 信息管理 | 精简上下文 + 按需检索 | Worker 已做（skills），Manager 未做 | **← 这也是要改的** |
+
+**结论：不需要新的架构层，需要打磨现有工具接口。**
+
+### 17.6 保留的正确认知
+
+初始思考中有几点是对的，应保留：
+
+1. **Orchestrator 负责确定性执行**（幂等性、状态转换、diff budget）——这和 OpenHands 的 SecurityAnalyzer + ConversationState 角色一致。
+2. **LLM 做语义判断，rules 做硬约束**——混合策略是行业共识。
+3. **信息架构影响 agent 质量**——Worker 文档重构已验证，给 LLM 精简、无冗余的信息比给它更多信息效果更好。
+
+---
+
+## 18. 下一步行动计划（2026-03-04 更新）
+
+### Phase D1：Manager 工具接口 ACI 优化 — ✅ 已完成
+
+**完成内容**：
+- target_state enum 约束 + 自动推导
+- 幂等拦截返回上下文（duplicate action 错误信息）
+- retry target_state 校验 + 人话错误消息
+
+### Phase D1.6：Pipeline 修复 + 边界安全网 — ✅ 已完成（2026-03-04）
+
+**修复的 Pipeline Bug（D2 测试暴露）：**
+1. Decision audit logging（rules_action + llm_action + guardrail + facts_snapshot）
+2. 加宽 guardrail（LLM active action 与 rules 不一致时 → rules 优先）
+3. Smart dirty workspace（PASS grade → 可恢复错误，不直接 NEEDS_HUMAN_REVIEW）
+4. Dirty workspace auto-recovery（自动执行 run-finish）
+5. Stale state detection（CI_WAIT >24h / REVIEW_WAIT >48h → WAIT_HUMAN）
+
+**修复的边界情况：**
+6. No-changes commit 处理（finish.sh exit 2 + cli.py reason_code）
+7. Run-level mutex（fcntl.flock per-run 锁）
+8. CI/review 竞态（状态感知 event 转移）
+9. Token scope 验证（preflight `gh api user`）
+10. Post-push 验证（local HEAD == remote HEAD）
+
+### Phase D2：真实验证 — ⭐ 下一步（唯一优先）
+
+**目标**：用 Codex 原生 provider 跑完整 run，验证 D1+D1.6 全部修复。
+
+**具体任务：**
+
+1. **dexter-oss/dexter 重跑**（验证 D1.6 核心修复）
+   - D1.6 的修复直接来自 dexter run 的 post-mortem
+   - 预期：Worker PASS → 自动 run-finish → PUSHED（不再误升级）
+   - 重点验证：dirty workspace auto-recovery、guardrail 加宽
+
+2. **mem0ai/mem0 全新 run**
+   - 全流程 QUEUED → PUSHED
+   - 验证 V2 状态机 + auto-prepare + hybrid_llm 分级
+   - Python 项目，对比 dexter（TypeScript）
+
+3. **建立基线指标**
+   - 首次成功率（目标 ≥ 50%）
+   - 平均 worker attempt 数（目标 ≤ 2）
+   - D1.6 guardrail 触发率（action_record 中 decision_source 统计）
+   - 审计日志质量（facts_snapshot 是否提供了足够的调试信息）
+
+### Phase D3：基于验证数据迭代
+
+**依赖**：D2 完成并有 2+ 个数据点。
+
+**可能方向**（D2 数据决定优先级）：
+
+| D2 结果 | D3 方向 |
+|---------|---------|
+| Worker 频繁失败 | 检查 skills references 完整性，补充项目类型特定指导 |
+| Manager 决策出错 | 调 guardrail 松紧度 / 优化 manager prompt |
+| hybrid_llm 分级不准 | 调证据包结构或评分标准 |
+| 一切顺利 | 进入常驻化 + 运维阶段（下面的 D4） |
+
+### Phase D4：运维化（D3 之后）
+
+1. **Manager loop 常驻化**：systemd unit + 自恢复 + 日志轮转 + 健康检查
+2. **Bot 会话持久化**：run_id 绑定从内存态改为 SQLite
+3. **Review triage 用户确认对话**：triage 结果先问用户，再执行（当前直接走 manager 决策）
+4. **优先级队列**：`/overview` 加”最值得关注的 3 件事”
+5. **自我迭代闭环**：skills-feedback → prompt/policy patch 草案 → 人审批
+6. **runtime grading → LLM**：砍掉 `runtime_analysis.py` 的 1,700 行 regex
+
+### Phase D-forge：Forge 切回（等外部修复）
+
+**触发条件**：Forge 团队确认 `/v1/responses` 422 bug 已修复。

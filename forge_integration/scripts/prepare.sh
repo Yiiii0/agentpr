@@ -68,5 +68,11 @@ else
   git checkout -b "$FEATURE_BRANCH"
 fi
 
+# Exclude .agentpr_runtime from git (local-only, doesn't modify repo files)
+EXCLUDE_FILE=".git/info/exclude"
+if [ -d ".git/info" ] && ! grep -qF '.agentpr_runtime/' "$EXCLUDE_FILE" 2>/dev/null; then
+  echo '.agentpr_runtime/' >> "$EXCLUDE_FILE"
+fi
+
 echo "✅ Ready: $BASE_DIR/$REPO (branch: $FEATURE_BRANCH, base: $DEFAULT_BRANCH)"
 echo "⚠️  IMPORTANT: Verify this base branch matches CONTRIBUTING.md requirements!"

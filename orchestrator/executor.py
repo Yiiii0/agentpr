@@ -82,6 +82,23 @@ PATH_ENV_KEYS: set[str] = {
 FILE_PATH_ENV_KEYS: set[str] = {"COVERAGE_FILE"}
 
 
+def _ensure_git_exclude(exclude_path: Path, pattern: str) -> None:
+    """Append *pattern* to .git/info/exclude if not already present."""
+    try:
+        existing = exclude_path.read_text(encoding="utf-8") if exclude_path.exists() else ""
+    except OSError:
+        return
+    if pattern in existing:
+        return
+    try:
+        with exclude_path.open("a", encoding="utf-8") as fh:
+            if existing and not existing.endswith("\n"):
+                fh.write("\n")
+            fh.write(f"{pattern}\n")
+    except OSError:
+        pass  # best-effort
+
+
 class ScriptExecutor:
     def __init__(self, integration_root: Path) -> None:
         self.integration_root = integration_root
@@ -344,6 +361,12 @@ class ScriptExecutor:
         cache_dir = runtime_dir / "cache"
         data_dir = runtime_dir / "data"
         tmp_dir = runtime_dir / "tmp"
+
+        # Ensure .agentpr_runtime is excluded from git in the target repo
+        # Uses .git/info/exclude (local-only, doesn't modify the repo's files)
+        git_info_exclude = repo_dir / ".git" / "info" / "exclude"
+        if git_info_exclude.parent.is_dir():
+            _ensure_git_exclude(git_info_exclude, ".agentpr_runtime/")
 
         templates, loaded = self._load_runtime_env_templates()
         context = {

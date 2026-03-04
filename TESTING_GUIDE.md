@@ -1,7 +1,7 @@
 # AgentPR 测试操作手册
 
-> 更新时间：2026-02-28
-> 适用范围：C1-C4 + P1-P2 全部落地后的第二轮验证
+> 更新时间：2026-03-04
+> 适用范围：D1 + D1.6（Pipeline 修复 + 边界安全网）完成后的 D2 真实验证
 
 ---
 
@@ -13,7 +13,16 @@
 | `rerun_dexter_20260224_clean1` | virattt/dexter | **PUSHED** | 已到达 PR gate，无 pr_number（PR 未正式创建） |
 | `rerun_mem0_20260224_clean1` | mem0ai/mem0 | **PUSHED** | 同上，pr_open_request 存在但 token 已过期 |
 
-**本次测试目标**：选 1-2 个新 repo（建议先跑 mem0），全流程验证 V2 + 混合分级 + review triage + retry strategy。
+**本次测试目标（D2）**：选 dexter + mem0 两个 repo，全流程验证：
+- **D1.6 Pipeline 修复**：特别是 dexter 的 dirty workspace auto-recovery（Worker PASS → 自动 run-finish）
+- **Guardrail 加宽**：rules=RUN_FINISH 时 LLM 不能改为 RUN_AGENT_STEP
+- Worker 文档重构后的新 skills 结构（slim entry + 3 skills + references）
+- V2 状态机 + auto-prepare + hybrid_llm 分级
+- D1 ACI 优化（retry target_state enum 约束、改善的错误反馈）
+- 建立基线指标：首次成功率 ≥ 50%，avg attempts ≤ 2
+- **新增验证点**：action_record 中 facts_snapshot / decision_source 字段存在且有用
+
+> **Forge 422 临时方案**：当前使用 Codex 原生 provider（不设 `AGENTPR_FORGE_*` 变量）。Forge `/v1/responses` 有 422 bug，等修复后切回。详见 `docs/forge_422_bug_report.md`。
 
 ---
 
@@ -38,10 +47,12 @@ python3.11 -m orchestrator.cli doctor
 
 | 变量 | 说明 | 当前推荐值 |
 |------|------|-----------|
-| `AGENTPR_MANAGER_API_KEY` | Manager LLM API key | 填 Forge/OpenAI key |
+| `AGENTPR_MANAGER_API_KEY` | Manager LLM API key | OpenAI key |
 | `AGENTPR_MANAGER_MODEL` | Manager LLM 模型 | `gpt-4o-mini` |
-| `AGENTPR_MANAGER_API_BASE` | Manager LLM API base | `https://api.openai.com/v1` 或 Forge URL |
+| `AGENTPR_MANAGER_API_BASE` | Manager LLM API base | `https://api.openai.com/v1` |
 | `AGENTPR_TELEGRAM_BOT_TOKEN` | Bot token（仅 bot 模式需要） | 可先不填，用 CLI 测试 |
+| `AGENTPR_FORGE_BASE_URL` | Forge provider URL（可选） | **暂不设置**（Forge 422 bug 未修复） |
+| `AGENTPR_FORGE_API_KEY` | Forge API key（可选） | **暂不设置** |
 
 ---
 
@@ -228,13 +239,20 @@ python3.11 -m orchestrator.cli manager-tick \
 
 ## 7. 场景 E：验证 retry strategy（FAILED 状态）
 
-```bash
-# 把 run 手动打到 FAILED
-python3.11 -m orchestrator.cli retry \
-  --run-id $RUN_ID \
-  --target-state FAILED
+要测试 retry strategy，需要让 run 自然进入 FAILED（worker 执行失败），或手动更新 DB 状态。
 
-# Dry-run tick
+```bash
+# 方式一：等 run 自然失败（worker 返回非零 exit code）
+# 方式二：用 SQL 手动设置状态到 FAILED（仅测试用）
+python3.11 -c "
+import sqlite3
+conn = sqlite3.connect('orchestrator/data/agentpr.db')
+conn.execute(\"UPDATE runs SET state='FAILED' WHERE run_id=?\", ('$RUN_ID',))
+conn.commit()
+print('Set to FAILED')
+"
+
+# Dry-run tick：观察 retry strategy 决策
 python3.11 -m orchestrator.cli manager-tick \
   --run-id $RUN_ID \
   --decision-mode hybrid \
@@ -242,8 +260,15 @@ python3.11 -m orchestrator.cli manager-tick \
 
 # 有 LLM 时：会调用 suggest_retry_strategy
 # should_retry=false → wait_human
-# should_retry=true → retry + target_state
+# should_retry=true → retry + target_state（D1 后 target_state 已约束为 enum）
+
+# 手动 retry（注意：target_state 只接受有效值）
+python3.11 -m orchestrator.cli retry \
+  --run-id $RUN_ID \
+  --target-state EXECUTING
 ```
+
+> **D1 验证点**：retry 的 `target_state` 参数现已约束为 enum（QUEUED/EXECUTING/ITERATING/DISCOVERY/IMPLEMENTING）。Manager LLM 生成无效值时会被自动纠正为 EXECUTING。
 
 ---
 
@@ -393,7 +418,13 @@ python3.11 -m orchestrator.cli run-finish --run-id $RUN_ID
 - Retry strategy = None → 默认 retry 到 EXECUTING
 - 不影响系统基本功能，只是缺少 LLM 增强
 
-### 12.4 通知 scan 频率
+### 12.4 Forge 422 Bug（临时使用 Codex 原生 provider）
+
+- Forge `/v1/responses` 端点在多轮工具调用时返回 422（`ResponsesItemReasoning.id` 必填但 OpenAI 规范中可选）
+- **临时方案**：不设置 `AGENTPR_FORGE_BASE_URL` 和 `AGENTPR_FORGE_API_KEY`，让 codex 使用原生 provider（`~/.codex/config.toml`）
+- 已反馈给 Forge 团队，等修复后切回。详见 `docs/forge_422_bug_report.md`
+
+### 12.5 通知 scan 频率
 
 - Bot loop 默认每 30 秒扫描一次（`AGENTPR_TELEGRAM_NOTIFY_SCAN_SEC=30`）
 - CLI 测试不启动 bot，通知 artifact 会写入 DB 但不会推送到 Telegram
@@ -413,9 +444,11 @@ Step 5: 若 PUSHED → 人工 approve PR；若 NEEDS_HUMAN_REVIEW → 分析原�
 
 **验证重点**：
 1. V2 状态机是否走通（无 V1 状态出现）
-2. `hybrid_llm` 分级是否给出合理 confidence（需 API key）
-3. `/overview` 统计是否正常更新
-4. 通知是否在 bot 模式下推送
+2. Worker 新 skills 结构是否正确执行（slim entry 27 行 + 3 skills 按需读取）
+3. `hybrid_llm` 分级是否给出合理 confidence（需 API key）
+4. D1 ACI 优化：retry target_state 无效值是否被拦截/自动纠正
+5. `/overview` 统计是否正常更新
+6. 通知是否在 bot 模式下推送
 
 ---
 
@@ -435,4 +468,4 @@ python3.11 -m orchestrator.cli run-telegram-bot
 
 ---
 
-*文档由 Claude Code 基于代码审计和运行状态生成，2026-02-28*
+*文档由 Claude Code 基于代码审计和运行状态生成，2026-03-03 更新*

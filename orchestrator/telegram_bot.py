@@ -1398,7 +1398,12 @@ def handle_natural_language_rules(
     if contains_any(lowered, ["help", "规则", "命令", "commands"]):
         return "自然语言模式已启用。你可以直接描述需求，manager 会路由到对应动作。"
 
-    if contains_any(lowered, ["create", "new run", "创建", "新建", "跑这个repo", "跑这个仓库"]):
+    if contains_any(lowered, [
+        "create", "new run",
+        "创建", "新建", "跑这个repo", "跑这个仓库",
+        "做这个", "帮我跑", "帮我做", "集成", "接入",
+        "跑一下", "试一下", "run this",
+    ]):
         repo_refs = extract_repo_refs_text(normalized)
         if repo_refs:
             prompt_version = extract_prompt_version_from_text(normalized) or resolve_default_prompt_version()
@@ -1463,9 +1468,13 @@ def handle_natural_language_rules(
         )
     return (
         "收到自然语言请求，但未识别可执行意图。"
-        "你可以说：'创建 run mem0ai/mem0'、'create https://github.com/a/b https://github.com/c/d'、"
-        "'目前什么情况'、'列出运行'、'查看 <run_id> 状态'、"
-        "'暂停 <run_id>'、'恢复 <run_id> 到 EXECUTING/IMPLEMENTING'、'重试 <run_id>'、'推进一次'。"
+        "你可以说：\n"
+        "• '做这个 https://github.com/a/b' — 创建 run\n"
+        "• '帮我跑 mem0ai/mem0' — 创建 run\n"
+        "• '目前什么情况' — 全局概览\n"
+        "• '查看 <run_id> 状态' — 查看详情\n"
+        "• '暂停/恢复/重试 <run_id>' — 控制 run\n"
+        "• '推进一次' — 执行 manager tick"
     )
 
 

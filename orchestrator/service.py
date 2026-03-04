@@ -573,6 +573,11 @@ class OrchestratorService:
         if event_type == EventType.GITHUB_CHECK_COMPLETED:
             conclusion = str(payload.get("conclusion", "")).lower()
             success = {"success", "neutral", "skipped"}
+            # Only apply CI transitions from CI_WAIT (the expected state).
+            # If state already moved on (e.g. review arrived first → ITERATING),
+            # record the event but skip the transition to avoid InvalidTransitionError.
+            if current_state != RunState.CI_WAIT:
+                return None, None
             if conclusion in success:
                 return RunState.REVIEW_WAIT, None
             return RunState.ITERATING, None
@@ -580,7 +585,11 @@ class OrchestratorService:
         if event_type == EventType.GITHUB_REVIEW_SUBMITTED:
             review_state = str(payload.get("state", "")).lower()
             if review_state == "changes_requested":
-                return RunState.ITERATING, None
+                # Only transition to ITERATING from states where review is expected.
+                if current_state in {RunState.CI_WAIT, RunState.REVIEW_WAIT}:
+                    return RunState.ITERATING, None
+                # Already in ITERATING or other state — record event, skip transition.
+                return None, None
             return None, None
 
         if event_type == EventType.COMMAND_MARK_DONE:

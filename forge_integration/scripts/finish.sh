@@ -47,6 +47,13 @@ echo "=== Files staged for commit ==="
 git diff --cached --name-only
 echo ""
 
+# Check if there are any staged changes before attempting commit
+if git diff --cached --quiet; then
+    echo "❌ No staged changes to commit."
+    echo "Hint: If changes are in untracked files, stage them with 'git add <file>' first."
+    exit 2
+fi
+
 echo "=== Commit title ==="
 echo "$COMMIT_TITLE"
 echo ""
@@ -86,6 +93,15 @@ EOF
 )"
 
 # Push
-git push origin "$(git branch --show-current)"
+BRANCH="$(git branch --show-current)"
+git push origin "$BRANCH"
 
-echo "✅ Pushed to origin/$(git branch --show-current)"
+# Verify push succeeded by comparing local and remote HEAD
+LOCAL_HEAD="$(git rev-parse HEAD)"
+REMOTE_HEAD="$(git ls-remote origin "refs/heads/$BRANCH" 2>/dev/null | cut -f1)"
+if [ -n "$REMOTE_HEAD" ] && [ "$LOCAL_HEAD" != "$REMOTE_HEAD" ]; then
+    echo "❌ Push verification failed: local=$LOCAL_HEAD remote=$REMOTE_HEAD"
+    exit 3
+fi
+
+echo "✅ Pushed to origin/$BRANCH (verified: $LOCAL_HEAD)"
