@@ -1,7 +1,7 @@
 {
   "run_agent_step": {
     "codex_sandbox": "danger-full-access",
-    "skills_mode": "off",
+    "skills_mode": "agentpr",
     "max_agent_seconds": 900,
     "max_changed_files": 6,
     "max_added_lines": 120,
@@ -15,26 +15,18 @@
     "on_human_review_state": "NEEDS_HUMAN_REVIEW",
     "repo_overrides": {
       "mem0ai/mem0": {
-        "skills_mode": "agentpr",
-        "max_agent_seconds": 780,
         "max_changed_files": 3,
         "max_added_lines": 45,
-        "max_retryable_attempts": 2,
-        "min_test_commands": 2,
-        "success_event_stream_sample_pct": 8
+        "max_retryable_attempts": 2
       },
       "virattt/dexter": {
-        "skills_mode": "agentpr",
-        "max_agent_seconds": 780,
         "max_changed_files": 4,
         "max_added_lines": 70,
         "max_retryable_attempts": 2,
-        "min_test_commands": 2,
         "known_test_failure_allowlist": [
           "\\.dexter/gateway-debug\\.log",
           "No such file or directory.*gateway-debug\\.log"
-        ],
-        "success_event_stream_sample_pct": 8
+        ]
       }
     }
   },

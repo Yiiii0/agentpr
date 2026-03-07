@@ -456,52 +456,112 @@ def render_skill_chain_prompt(
 
     if plan.mode == "agentpr_autonomous":
         return (
-            "AgentPR manager instruction: skills-mode is enabled (worker-autonomous).\n"
-            "Use the installed AgentPR skills below as reusable tools; worker decides invocation order.\n"
-            "Suggested internal flow: analyze contract/governance -> implement+validate -> optional ci/review fix.\n"
+            "AgentPR worker task: integrate Forge LLM provider into this repository.\n"
             "\n"
-            "Installed core skills for this run:\n"
-            f"{chr(10).join(required_lines)}\n"
+            "You have two phases. Execute BOTH in this single session.\n"
+            "\n"
+            "## Phase 1 — Analyze (INTERNAL, no output)\n"
+            "Read the skill instructions at $agentpr-repo-preflight-contract for details.\n"
+            "Analyze the repo: governance files, CI commands, provider patterns, target files.\n"
+            "IMPORTANT: Do NOT output the contract JSON as your response.\n"
+            "Keep your analysis in working memory and proceed directly to Phase 2.\n"
+            "\n"
+            "## Phase 2 — Implement and Validate (THIS is the deliverable)\n"
+            "Read the skill instructions at $agentpr-implement-and-validate for details.\n"
+            "- Write the integration code (minimal diff, follow nearest provider pattern)\n"
+            "- Install dependencies as repo CI requires\n"
+            "- Run test/lint commands from CI config\n"
+            "- Report validation results with concrete command outputs\n"
             f"{optional_block}"
-            "Autonomous execution rules:\n"
-            "- Keep minimal diff and follow repository contribution rules.\n"
-            "- Reuse task packet governance evidence first, then do secondary search only when needed.\n"
-            "- Governance paths in task packet are direct file paths; read them explicitly even under hidden dirs like .github/.\n"
-            "- Run required install/test/lint commands exactly as repo docs/CI require.\n"
-            "- If blocked by environment or policy, stop and report NEEDS REVIEW with concrete evidence.\n"
+            "\n"
+            "## Expected output\n"
+            "Your ONLY response should be the Phase 2 validation results:\n"
+            "- status: PASS | NEEDS_REVIEW | FAIL\n"
+            "- files_changed: [list]\n"
+            "- validation: [{command, exit_code, summary}]\n"
+            "- notes: blockers or warnings\n"
+            "\n"
+            "If you output the contract JSON and stop without writing code, "
+            "you have NOT completed the task.\n"
+            "\n"
+            "## Environment\n"
+            "- Write access: repo directory + .agentpr_runtime/ + /tmp only.\n"
+            "- Install deps locally: pip install -e, npm install, bun install, uv sync — all available.\n"
+            "- Do NOT use sudo. CI configs with 'sudo apt-get' are for Linux CI, not local.\n"
+            "- If a system package is missing, skip that step, continue validation, note it in output.\n"
+            "\n"
+            "## Rules\n"
+            "- Stay within diff budget from task packet.\n"
+            "- Reuse task packet governance evidence first, secondary search only when needed.\n"
+            "- Governance paths in task packet are direct file paths; read them explicitly.\n"
+            "- If genuinely blocked (missing API key, hardware dependency), report NEEDS_REVIEW.\n"
             "- Respect manager push policy from task packet.\n"
+            "- CRITICAL: You MUST run at least one validation command (test/lint/typecheck). "
+            "If install fails, still try running pytest/ruff/pre-commit. "
+            "Zero validation commands = automatic NEEDS_REVIEW from grading system.\n"
             "\n"
             "Task packet (JSON):\n"
             "```json\n"
             f"{task_packet_json}\n"
             "```\n"
             "\n"
-            "Base integration prompt (must still be followed):\n"
+            "Base integration prompt:\n"
             "---\n"
             f"{base_prompt.strip()}\n"
         )
 
     return (
-        "AgentPR manager instruction: skills-mode is enabled.\n"
-        "Execute one stage for the current run state using the required skill(s) below.\n"
-        "Do not skip required skill(s).\n"
+        "AgentPR worker task: integrate Forge LLM provider into this repository.\n"
         "\n"
-        "Required skill invocation order for this stage:\n"
-        f"{chr(10).join(required_lines)}\n"
+        "You have two phases. Execute BOTH in this single session.\n"
+        "\n"
+        "## Phase 1 — Analyze (INTERNAL, no output)\n"
+        "Read the skill instructions at $agentpr-repo-preflight-contract for details.\n"
+        "Analyze the repo: governance files, CI commands, provider patterns, target files.\n"
+        "IMPORTANT: Do NOT output the contract JSON as your response.\n"
+        "Keep your analysis in working memory and proceed directly to Phase 2.\n"
+        "\n"
+        "## Phase 2 — Implement and Validate (THIS is the deliverable)\n"
+        "Read the skill instructions at $agentpr-implement-and-validate for details.\n"
+        "- Write the integration code (minimal diff, follow nearest provider pattern)\n"
+        "- Install dependencies as repo CI requires\n"
+        "- Run test/lint commands from CI config\n"
+        "- Report validation results with concrete command outputs\n"
         f"{optional_block}"
-        "Stage execution rules:\n"
-        "- Keep minimal diff and follow repository contribution rules.\n"
-        "- Governance paths in task packet are direct file paths; read them explicitly even under hidden dirs like .github/.\n"
-        "- Run required install/test/lint commands exactly as repo docs/CI require.\n"
-        "- If blocked by environment or policy, stop and report NEEDS REVIEW with concrete evidence.\n"
+        "\n"
+        "## Expected output\n"
+        "Your ONLY response should be the Phase 2 validation results:\n"
+        "- status: PASS | NEEDS_REVIEW | FAIL\n"
+        "- files_changed: [list]\n"
+        "- validation: [{command, exit_code, summary}]\n"
+        "- notes: blockers or warnings\n"
+        "\n"
+        "If you output the contract JSON and stop without writing code, "
+        "you have NOT completed the task.\n"
+        "\n"
+        "## Environment\n"
+        "- Write access: repo directory + .agentpr_runtime/ + /tmp only.\n"
+        "- Install deps locally: pip install -e, npm install, bun install, uv sync — all available.\n"
+        "- Do NOT use sudo. CI configs with 'sudo apt-get' are for Linux CI, not local.\n"
+        "- If a system package is missing, skip that step, continue validation, note it in output.\n"
+        "- All shell commands work. Do NOT skip validation due to assumed limitations — run the commands.\n"
+        "\n"
+        "## Rules\n"
+        "- Stay within diff budget from task packet.\n"
+        "- Reuse task packet governance evidence first, secondary search only when needed.\n"
+        "- Governance paths in task packet are direct file paths; read them explicitly.\n"
+        "- If genuinely blocked (missing API key, hardware dependency), report NEEDS_REVIEW.\n"
         "- Respect manager push policy from task packet.\n"
+        "- CRITICAL: You MUST run at least one validation command (test/lint/typecheck). "
+        "If install fails, still try running pytest/ruff/pre-commit. "
+        "Zero validation commands = automatic NEEDS_REVIEW from grading system.\n"
         "\n"
         "Task packet (JSON):\n"
         "```json\n"
         f"{task_packet_json}\n"
         "```\n"
         "\n"
-        "Base integration prompt (must still be followed):\n"
+        "Base integration prompt:\n"
         "---\n"
         f"{base_prompt.strip()}\n"
     )
@@ -596,6 +656,19 @@ def list_local_skill_dirs(*, source_root: Path) -> list[Path]:
     return out
 
 
+def _dir_newest_mtime(directory: Path) -> float:
+    newest = 0.0
+    for root, _dirs, files in os.walk(directory):
+        for f in files:
+            try:
+                mt = (Path(root) / f).stat().st_mtime
+                if mt > newest:
+                    newest = mt
+            except OSError:
+                pass
+    return newest
+
+
 def install_local_skills(
     *,
     source_root: Path,
@@ -627,18 +700,24 @@ def install_local_skills(
         dest = skills_root / name
         if dest.exists():
             if not force:
-                results.append(
-                    {
-                        "name": name,
-                        "status": "already_exists",
-                        "source": str(src),
-                        "dest": str(dest),
-                    }
-                )
-                continue
+                # Auto-upgrade: compare newest file mtime in source vs dest
+                src_mtime = _dir_newest_mtime(src)
+                dest_mtime = _dir_newest_mtime(dest)
+                if src_mtime <= dest_mtime:
+                    results.append(
+                        {
+                            "name": name,
+                            "status": "up_to_date",
+                            "source": str(src),
+                            "dest": str(dest),
+                        }
+                    )
+                    continue
+                # Source is newer — auto-upgrade
             shutil.rmtree(dest)
 
         shutil.copytree(src, dest)
+        status = "upgraded" if dest.exists() is False and not force else "installed"
         results.append(
             {
                 "name": name,

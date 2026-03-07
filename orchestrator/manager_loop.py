@@ -58,7 +58,6 @@ class ManagerLoopRunner:
         self._llm_client: ManagerLLMClient | None = None
         self._run_agent_policy: RunAgentPolicy | None = None
         self._global_stats_cache: dict[str, Any] | None = None
-        self._consecutive_failures: dict[str, int] = {}  # run_id -> count
         try:
             self._run_agent_policy = load_manager_policy(self.config.policy_file).run_agent_step
         except (OSError, ValueError):
@@ -82,6 +81,26 @@ class ManagerLoopRunner:
             ),
         )
 
+    def _get_failure_count(self, run_id: str) -> int:
+        artifact = self.service.latest_artifact(run_id, artifact_type="manager_failure_count")
+        if artifact is None:
+            return 0
+        metadata = artifact.get("metadata")
+        if not isinstance(metadata, dict):
+            return 0
+        return int(metadata.get("count") or 0)
+
+    def _set_failure_count(self, run_id: str, count: int) -> None:
+        self.service.add_artifact(
+            run_id,
+            artifact_type="manager_failure_count",
+            uri=f"inline://failure_count/{run_id}",
+            metadata={"count": count},
+        )
+
+    def _reset_failure_count(self, run_id: str) -> None:
+        self._set_failure_count(run_id, 0)
+
     def tick(self) -> dict[str, Any]:
         started_at = datetime.now(UTC)
         run_ids = self._resolve_run_ids()
@@ -91,7 +110,8 @@ class ManagerLoopRunner:
         results: list[dict[str, Any]] = []
 
         for run_id in run_ids:
-            results.append(self._process_run(run_id))
+            result = self._process_run(run_id)
+            results.append(result)
 
         failed = sum(1 for item in results if not bool(item.get("ok", False)))
         progressed = sum(1 for item in results if int(item.get("actions_executed", 0)) > 0)
@@ -167,7 +187,7 @@ class ManagerLoopRunner:
         seen_state_action: set[tuple[str, str]] = set()
 
         # Check consecutive failure count before doing anything
-        fail_count = self._consecutive_failures.get(run_id, 0)
+        fail_count = self._get_failure_count(run_id)
         if fail_count >= _CONSECUTIVE_FAIL_LIMIT:
             # Auto-escalate: transition to NEEDS_HUMAN and stop retrying
             escalation_msg = (
@@ -188,7 +208,7 @@ class ManagerLoopRunner:
                 )
             except Exception:  # noqa: BLE001
                 pass
-            self._consecutive_failures.pop(run_id, None)
+            self._reset_failure_count(run_id)
             actions.append({
                 "state": "ESCALATED",
                 "action": "auto_pause",
@@ -220,6 +240,7 @@ class ManagerLoopRunner:
                     "state": facts.state.value,
                     "latest_worker_grade": facts.latest_worker_grade,
                     "latest_worker_confidence": facts.latest_worker_confidence,
+                    "latest_failure_reason_code": facts.latest_failure_reason_code,
                     "has_prompt": facts.has_prompt,
                     "worker_autonomous": facts.worker_autonomous,
                 },
@@ -290,7 +311,7 @@ class ManagerLoopRunner:
                     }
                     actions.append(recovery_record)
                     if recovery_outcome["ok"]:
-                        self._consecutive_failures.pop(run_id, None)
+                        self._reset_failure_count(run_id)
                         continue
                     else:
                         errors.append(
@@ -298,15 +319,19 @@ class ManagerLoopRunner:
                         )
                         break
 
-                self._consecutive_failures[run_id] = fail_count + 1
+                self._set_failure_count(run_id, fail_count + 1)
                 errors.append(str(outcome.get("error") or "action failed"))
                 break
             else:
                 # Reset on success
-                self._consecutive_failures.pop(run_id, None)
+                self._reset_failure_count(run_id)
 
         final_snapshot = self.service.get_run_snapshot(run_id)
         executed_count = sum(1 for item in actions if "command" in item)
+
+        # Post-processing: detect skill improvement proposals from grading results
+        self._check_skill_proposals(run_id, actions)
+
         return {
             "ok": not errors,
             "run_id": run_id,
@@ -439,7 +464,7 @@ class ManagerLoopRunner:
             )
         )
 
-        grade, confidence = self._latest_worker_grade(run_id)
+        grade, confidence, failure_reason_code = self._latest_worker_grade(run_id)
 
         # When LLM is available and we have a grade but no confidence,
         # ask the LLM for a semantic assessment.
@@ -494,34 +519,38 @@ class ManagerLoopRunner:
             worker_autonomous=(resolved_skills_mode == "agentpr_autonomous"),
             latest_worker_grade=grade,
             latest_worker_confidence=confidence,
+            latest_failure_reason_code=failure_reason_code,
             review_triage_action=review_triage_action,
             retry_should_retry=retry_should_retry,
             retry_target_state=retry_target_state,
             state_entered_at=state_entered_at,
         )
 
-    def _latest_worker_grade(self, run_id: str) -> tuple[str | None, str | None]:
-        """Return (grade, confidence) from the latest worker digest."""
+    def _latest_worker_grade(
+        self, run_id: str
+    ) -> tuple[str | None, str | None, str | None]:
+        """Return (grade, confidence, reason_code) from the latest worker digest."""
         artifact = self.service.latest_artifact(run_id, artifact_type="run_digest")
         if artifact is None:
             artifact = self.service.latest_artifact(run_id, artifact_type="agent_runtime_report")
         if artifact is None:
-            return None, None
+            return None, None, None
         raw_path = str(artifact.get("uri") or "").strip()
         if not raw_path:
-            return None, None
+            return None, None, None
         path = Path(raw_path)
         if not path.exists():
-            return None, None
+            return None, None, None
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
-            return None, None
+            return None, None, None
         if not isinstance(payload, dict):
-            return None, None
+            return None, None, None
         classification = payload.get("classification")
         classification = classification if isinstance(classification, dict) else {}
         grade = str(classification.get("grade") or "").strip().upper() or None
+        reason_code = str(classification.get("reason_code") or "").strip() or None
         # Confidence from semantic grading (hybrid_llm mode) or classification
         confidence: str | None = None
         semantic = classification.get("semantic")
@@ -529,7 +558,7 @@ class ManagerLoopRunner:
             confidence = str(semantic.get("confidence") or "").strip().lower() or None
         if confidence is None:
             confidence = str(classification.get("confidence") or "").strip().lower() or None
-        return grade, confidence
+        return grade, confidence, reason_code
 
     def _triage_iterating_review(self, run_id: str) -> str | None:
         """Best-effort LLM triage of the latest review comment. Returns action or None."""
@@ -789,6 +818,70 @@ class ManagerLoopRunner:
                 )
         except Exception:  # noqa: BLE001
             pass  # Notification is best-effort; never block the loop
+
+    def _check_skill_proposals(
+        self, run_id: str, actions: list[dict[str, Any]]
+    ) -> None:
+        """Detect and store skill improvement proposals based on run grading results.
+
+        This is the self-improvement loop: each run's failures are analyzed for
+        patterns that should be encoded back into skill instructions.
+        """
+        try:
+            from .manager_tools import (
+                detect_skill_improvement_proposals,
+                propose_skill_improvement,
+            )
+
+            # Extract grading info from the latest action that has classification data
+            reason_code = ""
+            grade = ""
+            evidence: dict[str, Any] = {}
+            for action in reversed(actions):
+                output_raw = action.get("output", "")
+                if not output_raw:
+                    continue
+                try:
+                    output = json.loads(output_raw) if isinstance(output_raw, str) else output_raw
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                if not isinstance(output, dict):
+                    continue
+                classification = output.get("classification")
+                if isinstance(classification, dict):
+                    reason_code = str(classification.get("reason_code") or "")
+                    grade = str(classification.get("grade") or "")
+                    evidence = classification.get("evidence") or {}
+                    break
+
+            if not reason_code:
+                return
+
+            proposals = detect_skill_improvement_proposals(
+                run_id=run_id,
+                reason_code=reason_code,
+                grade=grade,
+                evidence=evidence,
+            )
+            for proposal in proposals:
+                propose_skill_improvement(
+                    service=self.service,
+                    run_id=proposal["run_id"],
+                    proposal_key=proposal["proposal_key"],
+                    skill_name=proposal["skill_name"],
+                    target_file=proposal["target_file"],
+                    lesson=proposal["lesson"],
+                    suggestion=proposal["suggestion"],
+                    evidence=proposal.get("evidence"),
+                )
+                logger.info(
+                    "skill_improvement_proposal: run=%s key=%s skill=%s",
+                    run_id,
+                    proposal["proposal_key"],
+                    proposal["skill_name"],
+                )
+        except Exception:  # noqa: BLE001
+            pass  # Proposals are best-effort; never block the loop
 
     def _run_cli(self, argv: list[str]) -> dict[str, Any]:
         cmd = [

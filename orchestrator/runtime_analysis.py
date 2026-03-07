@@ -35,6 +35,13 @@ LINT_OR_VALIDATION_COMMAND_PATTERNS: tuple[str, ...] = (
     r"\bpre-commit\b",
 )
 
+READ_COMMAND_PATTERNS: tuple[str, ...] = (
+    r"^\s*(rg|grep|egrep|fgrep|ag)\s",
+    r"^\s*(cat|head|tail|less|more)\s",
+    r"^\s*(find|fd)\s",
+    r"^\s*(ls|tree|wc)\s",
+)
+
 TEST_INFRA_DEPENDENCY_PATTERNS: tuple[str, ...] = (
     r"\bpytest\b",
     r"\btox\b",
@@ -158,17 +165,17 @@ def summarize_command_categories(commands: list[str]) -> dict[str, int]:
         if contains_any_pattern(normalized, install_patterns):
             counts["dependency_install"] += 1
             continue
-        if contains_any_pattern(normalized, test_patterns):
-            counts["tests"] += 1
-            continue
-        if contains_any_pattern(normalized, lint_patterns):
-            counts["lint_or_typecheck"] += 1
-            continue
         if contains_any_pattern(normalized, git_patterns):
             counts["git_ops"] += 1
             continue
         if contains_any_pattern(normalized, read_patterns):
             counts["repo_reading"] += 1
+            continue
+        if contains_any_pattern(normalized, test_patterns):
+            counts["tests"] += 1
+            continue
+        if contains_any_pattern(normalized, lint_patterns):
+            counts["lint_or_typecheck"] += 1
             continue
         counts["other"] += 1
     return counts
@@ -211,13 +218,18 @@ def detect_commands_by_patterns(
     *,
     commands: list[str],
     patterns: tuple[str, ...],
+    exclude_patterns: tuple[str, ...] = (),
     limit: int = 40,
 ) -> list[str]:
-    matched = [
-        command
-        for command in commands
-        if str(command).strip() and contains_any_pattern(str(command), patterns)
-    ]
+    matched = []
+    for command in commands:
+        cmd = str(command).strip()
+        if not cmd:
+            continue
+        if exclude_patterns and contains_any_pattern(cmd, exclude_patterns):
+            continue
+        if contains_any_pattern(cmd, patterns):
+            matched.append(cmd)
     return dedupe_strings(matched, limit=limit)
 
 
@@ -304,12 +316,17 @@ def _semantic_override_heuristic(
     test_infra: dict[str, Any],
     diff_summary: dict[str, Any],
 ) -> dict[str, Any]:
-    has_test_infra = bool(
-        test_infra.get("has_test_directory")
-        or test_infra.get("has_test_files")
-        or test_infra.get("has_test_dependencies")
-        or test_infra.get("has_test_ci_workflow")
-    )
+    # Require ≥2 of 4 signals to declare test infrastructure present.
+    # Single signal (e.g. pytest in requirements.txt as app dependency) is not
+    # sufficient — it causes false positives for repos like Paper2Poster that
+    # list pytest as an application dependency, not test infrastructure.
+    _test_infra_signals = sum([
+        bool(test_infra.get("has_test_directory")),
+        bool(test_infra.get("has_test_files")),
+        bool(test_infra.get("has_test_dependencies")),
+        bool(test_infra.get("has_test_ci_workflow")),
+    ])
+    has_test_infra = _test_infra_signals >= 2
     has_alternative_validation = bool(lint_signals)
     changed_files_count = int(diff_summary.get("changed_files_count") or 0)
     added_lines = int(diff_summary.get("added_lines") or 0)
@@ -804,6 +821,22 @@ def classify_agent_runtime(
             }
         changed_files_count = int(diff_summary.get("changed_files_count", 0))
         added_lines = int(diff_summary.get("added_lines", 0))
+        if (
+            run_state in {RunState.EXECUTING, RunState.IMPLEMENTING}
+            and changed_files_count == 0
+            and added_lines == 0
+        ):
+            return {
+                "grade": AgentRuntimeGrade.HUMAN_REVIEW.value,
+                "reason_code": "no_changes_detected",
+                "next_action": "escalate",
+                "evidence": {
+                    "expected_state": run_state.value,
+                    "changed_files_count": 0,
+                    "added_lines": 0,
+                    "test_commands": test_signals[:12],
+                },
+            }
         if (max_changed_files > 0 and changed_files_count > max_changed_files) or (
             max_added_lines > 0 and added_lines > max_added_lines
         ):
@@ -839,6 +872,23 @@ def classify_agent_runtime(
                 "allowlisted_test_failure_matches": allowlisted_failure_matches[:12],
                 "recovered_failed_test_commands": recovered_failed_test_commands[:12],
                 "recovered_failed_test_command_count": len(recovered_failed_test_commands),
+            },
+        }
+
+    # Timeout with partial changes: don't discard work blindly
+    changed_files_count = int(diff_summary.get("changed_files_count", 0))
+    added_lines = int(diff_summary.get("added_lines", 0))
+    if result.exit_code == 124 and (changed_files_count > 0 or added_lines > 0):
+        return {
+            "grade": AgentRuntimeGrade.HUMAN_REVIEW.value,
+            "reason_code": "timeout_with_partial_changes",
+            "next_action": "escalate",
+            "evidence": {
+                "exit_code": result.exit_code,
+                "changed_files_count": changed_files_count,
+                "added_lines": added_lines,
+                "test_commands": test_signals[:12],
+                "changed_files": diff_summary.get("changed_files", [])[:16],
             },
         }
 
@@ -968,11 +1018,13 @@ def build_agent_runtime_report(
     test_signals = detect_commands_by_patterns(
         commands=commands,
         patterns=TEST_COMMAND_PATTERNS,
+        exclude_patterns=READ_COMMAND_PATTERNS,
         limit=40,
     )
     lint_signals = detect_commands_by_patterns(
         commands=commands,
         patterns=LINT_OR_VALIDATION_COMMAND_PATTERNS,
+        exclude_patterns=READ_COMMAND_PATTERNS,
         limit=40,
     )
     git_signals = sorted(

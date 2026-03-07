@@ -1,7 +1,7 @@
 # AgentPR Master Plan
 
-> 更新时间：2026-03-04
-> 状态：C1-C4 + P1-P2 + D1 全部完成。D1.6（Pipeline 修复 + 边界安全网）完成。**下一步：D2 真实验证**——这是距 North Star 最大的差距。
+> 更新时间：2026-03-07
+> 状态：D3 边界修复完成。Test Run 7: 4/5 PASS+PUSHED tick 1。**下一步：D3.5 自我改进 + D4 运维化。**
 > 归档：旧版详细记录在 `docs/AGENTPR_MASTER_PLAN_ARCHIVE_20260228_PRE_SLIM.md` 和 `docs/AGENTPR_MASTER_PLAN_ARCHIVE_20260225_PRE_REWRITE.md`
 
 ---
@@ -18,13 +18,13 @@
 
 ## 2. 当前主矛盾
 
-1. **不是缺代码，是缺真实数据。** 管线代码已足够健壮（D1.6 修复了 pipeline bug + 5 个边界情况），但只有 1 次真实测试（C1 DeepCode）。所有改进都是理论性的。
-2. **不是缺"多 agent 并发"，而是缺"单 run 高质量稳定完成率"。** 先证明单 run 能跑通再说。
-3. **不是缺 Manager 智能，是缺验证 Manager 智能有没有用。** hybrid 模式（rules + LLM）已实现，但没有 A/B 数据。
-4. **管线稳定性已显著提升**：D1.6 修复了 PASS-after-dirty-workspace 误升级（dexter 真实 bug）、加宽了 guardrail 防止 LLM 覆盖 RUN_FINISH、加了 stale state detection、run-level 互斥、CI/review 竞态修复。
-5. **复杂度分配合理**：~15.5K 行 orchestrator 代码。60% 确定性控制 + 12% LLM 智能层。进一步减少需要功能性决策（runtime grading → LLM），不是重构能解决的。
+1. **管线端到端已验证且改进中。** D3 Test Run 7: 4/5 PASS+PUSHED tick 1（vs D2 Run 6: 3/5 tick 1 + 2/5 tick 2）。不再需要 auto-recovery。
+2. **主矛盾从"grading 架构"变为"Worker 自我改进"。** Grading 架构迁移已确认不需要（hybrid 是正确中间态）。真正的差距是 Worker 行为一致性：Paper2Poster 在 pip 失败后放弃验证，dexter/mem0 文档更新缺失。
+3. **自我改进机制是核心。** 每次测试发现的问题应该编码回 skill instructions，让 Worker 下次不犯同样错误。D3.5 完成了这一闭环：self_review_checklist 加强、validation_requirements 加强、forge_rules 增加新 pitfalls。
+4. **基础设施修复完成。** skills 自动升级（不再需要手动 --force），test infra 检测 ≥2 信号（防止 false positive）。Manager skill improvement proposal 系统已就位。
+5. **Forge 422 仍阻塞**：使用 Codex 原生 provider，不影响核心管线。
 
-**结论：代码侧已准备就绪。主矛盾从"补控制逻辑"变为"用真实数据验证整个管线"。D2 是唯一的 next step。**
+**结论：自我改进闭环初步建立。下一步是验证改进效果 + D4 运维化。**
 
 ---
 
@@ -112,14 +112,17 @@ QUEUED → EXECUTING → PUSHED → CI_WAIT → REVIEW_WAIT → DONE
 16. `suggest_retry_strategy(run_id, diagnosis)` — LLM 失败诊断
 17. `triage_review_comment(run_id, comment_body)` — LLM review 分流
 
-### 4.2 目标动作集（进一步简化后）
+### 4.2 目标动作集（延期 — 当前 17 动作集工作正常）
 
+> **状态**：D1 已完成 ACI 优化（enum 约束、自动推导、显式反馈）。当前 17 动作集在 D2/D3 验证中工作良好，进一步简化延期到需求驱动时再做。
+
+原设想的 7 动作简化版（备忘）：
 1. `create_run(owner, repo, task_description)`
 2. `execute_worker(run_id, instructions)` — 替代 start_discovery/run_prepare/run_agent_step
 3. `analyze_worker_output(run_id)` — 混合分级
 4. `run_finish(run_id, changes, commit_title)`
 5. `request_open_pr / approve_open_pr`
-6. `pause_run / resume_run / retry_run(strategy)` — strategy 参数应为 enum 约束（D1 已在当前实现中完成）
+6. `pause_run / resume_run / retry_run(strategy)`
 7. `get_global_stats() / notify_user(message, priority)`
 
 ### 4.3 约束（始终有效）
@@ -216,11 +219,14 @@ QUEUED → EXECUTING → PUSHED → CI_WAIT → REVIEW_WAIT → DONE
 - Codex 支持 Forge provider（`.env` 配置 `AGENTPR_FORGE_BASE_URL` + `AGENTPR_FORGE_API_KEY`，不设则用默认 provider）
 - **当前临时使用 Codex 原生 provider**：Forge `/v1/responses` 端点存在 422 bug（reasoning item `id` 必填但 OpenAI 规范中可选），已反馈给 Forge 团队，等修复后切回。详见 `docs/forge_422_bug_report.md`
 
-### 代码结构（D1.6 后）
-- `cli.py` (~2,820) + 4 子模块（cli_helpers/cli_pr/cli_inspect/cli_worker）
+### 代码结构（D3.5 后）
+- `cli.py` (~2,845) + 4 子模块（cli_helpers/cli_pr/cli_inspect/cli_worker）
 - `telegram_bot.py` (1,573) + telegram_bot_helpers (568)
-- `runtime_analysis.py` (1,712)
-- orchestrator 总计 ~15.5K 行（27 个 .py 文件）
+- `runtime_analysis.py` (~1,764)
+- `manager_tools.py` (~354) — 含 skill improvement proposal 系统
+- `manager_loop.py` (~580) — 含 post-processing 自我改进检测
+- orchestrator 总计 ~16.1K 行（26 个 .py 文件）
+- skills 总计 ~438 行（3 skills × entry + references）
 
 ---
 
@@ -229,8 +235,8 @@ QUEUED → EXECUTING → PUSHED → CI_WAIT → REVIEW_WAIT → DONE
 ### 目标能力 A：NL 下发任务 → 自动推进到 PUSHED/PR gate
 
 **代码侧：✅ 已达成。** NL → create_run → auto-prepare → manager loop → PUSHED/gate 全通路。D1.6 修复了 dirty workspace 误升级和 guardrail 问题。
-**运维侧：❌ 未验证。** 仅 1 次真实测试（C1 DeepCode）。D2 是验证入口。
-**常驻化：❌ 未做。** loop 仍需手动启动 `run-manager-loop`。
+**运维侧：✅ 已验证。** D2 Test Run 6: 5/5 PASS+PUSHED。D3 Test Run 7: 4/5 PASS+PUSHED tick 1。涵盖 Python + TypeScript + 混合项目。
+**常驻化：❌ 未做。** loop 仍需手动启动 `run-manager-loop`。→ D4 运维化。
 
 ### 目标能力 B：问"现在什么情况"→ 全局态势 + 下一步
 
@@ -248,20 +254,34 @@ QUEUED → EXECUTING → PUSHED → CI_WAIT → REVIEW_WAIT → DONE
 
 ### 目标能力 E：manager 自我迭代提案 → 人审批
 
-**当前状态：基础具备。** 有 `skills-metrics/skills-feedback`。
-**缺口**：缺"自动提案 → 审批 → 应用"闭环。这是 D3+ 的事。
+**当前状态：✅ 初步闭环。** D3.5 完成：`propose_skill_improvement` 系统自动检测失败模式 → 生成 proposal artifact → `list-skill-proposals` CLI 可查。Skill instructions 已编码 Test Run 7 全部教训。
+**缺口**：proposal → 自动 apply skill patch 尚未实现（当前需人工编辑 skill files）。Telegram 审批流程待 D4。
 
 ---
 
 ## 8. 实事求是：当前差距
 
-### 8.1 最大的缺口：缺真实验证数据（不变，仍是 #1）
+### 8.1 ~~缺真实验证数据~~ → ✅ 已解决（D2 完成）
 
-**只有 1 次真实测试**（C1: HKUDS/DeepCode），结果 NEEDS_HUMAN_REVIEW/missing_test_evidence。D1-D1.6 所有改进都基于理论分析和 dexter 单次失败的 post-mortem。没有第二个完整成功的数据点。
+**D2 Test Run 6 结果：5/5 PASS + PUSHED。** 5 个仓库（pipecat/DeepCode/mem0/Paper2Poster/dexter），涵盖 Python + TypeScript + 混合项目：
+- pipecat: 6 files, pytest 703 passed → PUSHED tick 1
+- DeepCode: 3 files, pre-commit → PUSHED tick 1
+- mem0: 3 files, make test 537 passed → PUSHED tick 1
+- Paper2Poster: 2 files → PUSHED tick 2 (auto_recovery)
+- dexter: 4 files, bun test → PUSHED tick 2 (auto_recovery)
 
-**D1.6 修复了 dexter 测试暴露的 pipeline bug**（Worker PASS 但 Manager 误走 RUN_AGENT_STEP → dirty workspace → NEEDS_HUMAN_REVIEW）。但修复后还没重新验证。
+**D2.5 修复了 commit 质量问题：** finish.sh 新文件未 stage（pipecat/mem0 PR 实际不完整）、lock files 被 commit、test command false positive。
 
-**这仍然是最高优先级。** 管线代码已足够健壮。下一步只有一个：跑 D2。
+**D3 Test Run 7 结果：4/5 PASS+PUSHED tick 1。**
+- pipecat: 3 files (all new), pytest 874 passed → PUSHED tick 1. 优秀代码质量。
+- DeepCode: 3 files, pre-commit ran → PUSHED tick 1. env_key 沿用 repo 既有模式。
+- dexter: 4 files, bun test 23 passed + typecheck → PUSHED tick 1. 缺 env.example 条目。
+- mem0: 3 files, pytest 537 passed → PUSHED tick 1. auto-stage 修复验证！forge.py 被正确 staged。
+- Paper2Poster: NEEDS_HUMAN_REVIEW (missing_test_evidence). Worker 在 pip 失败后放弃验证。
+
+**D3.5 自我改进修复完成：** skills 自动升级、test infra ≥2 信号、skill instructions 加强、manager skill improvement proposal 系统。
+
+**当前最大缺口：Worker 行为一致性（验证不可跳过）和运维化（D4）。**
 
 ### 8.2 Orchestrator 不是"薄层"（不变，接受现实）
 
@@ -284,15 +304,12 @@ QUEUED → EXECUTING → PUSHED → CI_WAIT → REVIEW_WAIT → DONE
 |------|------|--------|
 | D1：Manager 工具接口 ACI 优化 | **✅ 已完成** | — |
 | D1.6：Pipeline 修复 + 边界安全网 | **✅ 已完成** | — |
-| **D2：真实验证（mem0 + dexter）** | **❌ 未做** | **⭐ 最高** |
-| D3：基于验证数据迭代 | 未做 | D2 之后 |
-| D-forge：Forge 切回 | 等外部修复 | D2 之后 |
-| Manager loop 常驻化（systemd/cron） | 未做 | D3 之后 |
-| Bot 会话上下文持久化（当前内存态） | 未做 | D3 之后 |
-| Review triage 用户确认对话 | 未做 | D3 之后 |
-| 优先级队列（"最值得关注的事"） | 未做 | D3 之后 |
-| skills-feedback → 自动提案闭环 | 未做 | D3 之后 |
-| runtime grading 迁移到 LLM 层 | 未做 | D3+ |
+| D2：真实验证（5 repos × 6 runs） | **✅ 已完成（5/5 PASS + PUSHED）** | — |
+| D2.5：Commit 质量修复 | **✅ 已完成** | — |
+| D3：边界修复 + Test Run 7 验证 | **✅ 已完成（4/5 PASS+PUSHED tick 1）** | — |
+| D3.5：自我改进闭环 | **✅ 已完成** | — |
+| **D4：运维化（常驻 + 持久化 + UX）** | **未做** | **⭐ 最高** |
+| D-forge：Forge 切回 | 等外部修复 | 独立 |
 
 ---
 
@@ -300,32 +317,40 @@ QUEUED → EXECUTING → PUSHED → CI_WAIT → REVIEW_WAIT → DONE
 
 > 详细行动计划见 Section 18。以下是优先级摘要。
 
-### D2（⭐ 最高优先 — 唯一的 next step）：真实验证
+### D3 + D3.5（✅ 已完成）：边界修复 + 自我改进
 
-**所有代码侧工作已完成。** D1 + D1.6 让管线足够健壮。现在需要数据。
+**D3.1** — 边界修复（✅）：timeout partial changes → HUMAN_REVIEW, failure count 持久化
+**D3.2** — Test Run 7 验证（✅）：4/5 PASS+PUSHED tick 1. finish.sh auto-stage 验证通过。
+**D3.5** — 自我改进闭环（✅）：
+- Skills 自动升级：`install_local_skills` 比较源/目标 mtime，源更新自动覆盖（不再需要 --force）
+- Test infra 检测：≥2/4 信号才算有 test infrastructure（防止 pytest 作为 app 依赖的 false positive）
+- manager skill improvement proposal 系统（`propose_skill_improvement` + `detect_skill_improvement_proposals` + `list-skill-proposals` CLI）
+- Skill instructions 加强：validation 不可跳过、env.example 必须更新、unbound method call 警告、default model 要求
 
-用 Codex 原生 provider 跑 mem0 + dexter 两个完整 run。验证 D1.6 的 pipeline 修复（特别是 dexter 的 dirty workspace 场景）。建立基线指标。
+### D4（⭐ 最高优先）：运维化
 
-### D3：基于 D2 数据迭代
+| 优先级 | 项目 | North Star |
+|--------|------|------------|
+| ⭐ | Manager loop daemonization (systemd) | #2: Manager always online |
+| 高 | Bot session persistence (SQLite) | #2: Manager always online |
+| 高 | Review triage user confirmation | #1: Human in Telegram |
+| 中 | Priority queue ("top 3 focus items") | #1: Human in Telegram |
+| 中 | Self-iteration closed loop | #3: Worker autonomous |
+| 低 | Grading → LLM (only if data shows need) | Infrastructure optimization |
 
-D2 数据驱动。可能方向（优先级由数据决定）：
-- Manager 决策准确率不够 → 调 guardrail 松紧度 / prompt
-- Worker 完成质量不够 → 补 skills references / 调 grading
-- 管线仍有 edge case → 修 pipeline
-- 一切顺利 → 进入常驻化 + 运维阶段
+**Grading 架构迁移延期**：当前 hybrid grading 对 5/5 repos 判断正确。"混合策略是正确的中间态"（insight #18）。LLM grading 引入非确定性 + 延迟 + 故障模式。仅在数据证明当前 grading 不足时再迁移。
 
-### D-forge：Forge 切回（等外部修复）
+### D4：运维化（D3 之后）
 
-Forge 422 修复后验证并切回。
-
-### 后续（D3 之后再排优先级）
-
-1. **Manager loop 常驻化**（systemd/daemon + 自恢复 + 日志轮转）
+1. **Manager loop 常驻化**（systemd/daemon + 自恢复 + 日志轮转 + 健康检查）
 2. **Bot 会话持久化**（run_id 绑定从内存态改为 SQLite）
 3. **Review triage 用户确认**（triage 结果先问用户，再执行）
 4. **优先级队列**（"你最应该关注的 3 件事"）
 5. **自我迭代闭环**（skills-feedback → prompt/policy patch 草案 → 人审批）
-6. **runtime grading → LLM**（砍掉 1,700 行 regex，降低 orchestrator 总行数）
+
+### D-forge：Forge 切回（等外部修复）
+
+Forge 422 修复后验证并切回。独立于 D3/D4。
 
 ---
 
@@ -373,15 +398,16 @@ Forge 422 修复后验证并切回。
 
 核心原则："The hard problem in personal AI agents is not the agent loop itself, but everything around it."
 
-| 设计点 | OpenClaw 做法 | AgentPR 当前 | AgentPR 应借鉴 |
-|--------|-------------|-------------|---------------|
-| 谁是大脑 | LLM agent（Pi runtime） | Rules engine + LLM 辅助 | Manager 应是真正的 LLM agent with tools |
-| Gateway 角色 | 薄层：消息路由 + 会话管理 | 厚层：状态机 + 规则决策 + regex 分析 | Orchestrator 应退化为薄层 |
-| Skills | Markdown 文件，agent 自己决定调用 | Worker 自主调用（autonomous 模式已实现） | ✅ 已对齐 |
-| 主动性 | Heartbeat 模式：定时检查 | 定时巡检 + 状态通知（已实现） | ✅ 已对齐 |
-| 状态 | append-only 事件日志 | SQLite + 10 状态机 | 保留 SQLite，状态已简化 |
+| 设计点 | OpenClaw 做法 | AgentPR 当前（D3.5） | 状态 |
+|--------|-------------|---------------------|------|
+| 谁是大脑 | LLM agent（Pi runtime） | Manager LLM agent with tools（hybrid 决策） | ✅ 已转变（D1） |
+| Gateway 角色 | 薄层：消息路由 + 会话管理 | Orchestrator 薄层化进行中（~16K 行仍含 grading 逻辑） | ⚠️ 部分达成 |
+| Skills | Markdown 文件，agent 自己决定调用 | Worker 自主调用 + skills 自动升级 + 自我改进 | ✅ 已对齐 |
+| 主动性 | Heartbeat 模式：定时检查 | 定时巡检 + 状态通知 + manager 主动通知 | ✅ 已对齐 |
+| 状态 | append-only 事件日志 | SQLite + 10 状态机 + decision audit logging | ✅ 保留 SQLite |
+| 自我改进 | — | propose_skill_improvement → skill patch（D3.5） | ✅ 新增 |
 
-**核心转变**：从 `Rules (大脑) → LLM (橡皮章) → Worker (手脚)` 转为 `LLM (大脑) → Rules (安全护栏) → Worker (自主执行)`。当前处于中间态——LLM 已有实质性决策参与，但 rules 仍承担大量决策。
+**当前定位**：`LLM (大脑 + hybrid 决策) → Rules (安全护栏 + 证据提取) → Worker (自主执行 + skills)`。Hybrid 是验证后的正确中间态（#18 + #46）。
 
 ---
 
@@ -420,7 +446,7 @@ Forge 422 修复后验证并切回。
 6. 系统应该简单，但不应过于简单。度的把握：安全和持久化不能简化，决策逻辑应交给 LLM。
 7. **"精密工厂管理聪明工人"是反模式。** 应该是"轻量生产线 + 自主工人 + 关键检查点"。
 8. 复杂度应该投资在"智能"上（失败分析、策略生成、运营汇报），而不是在"控制"上（每个状态的合法动作列表）。
-9. OpenClaw 的核心启示：LLM 应该是大脑（with tools），不是规则引擎的附属品。
+9. OpenClaw 的核心启示：LLM 应该是大脑（with tools），不是规则引擎的附属品。**（注：#46 进一步明确——"大脑"不等于"所有东西都用 LLM"。基础设施应确定性，LLM 做语义决策。）**
 10. Skills 的正确用法是 worker 自主调用（保护上下文），不是 orchestrator 外部注入。
 
 **C1 测试后：**
@@ -454,6 +480,22 @@ Forge 422 修复后验证并切回。
 32. **边界情况的修复成本远低于出问题的代价。** CI/review 竞态、concurrent tick、push 验证——每个修复只有 10-20 行代码，但对应的 bug 一旦触发就是"Worker 工作白费"或"状态污染"。
 33. **审计日志不是可选项。** facts_snapshot 让 post-mortem 从"猜测发生了什么"变成"直接读 action_record"。decision_source 字段让每个决策可追溯。这 20 行代码的 ROI 是最高的。
 34. **不要继续堆代码。去跑真实测试。** D1.6 之后管线代码已经足够健壮（5 个 pipeline fix + 5 个边界 fix = 10 个安全网）。继续加 feature 是逃避验证。
+
+**D2 真实验证后（5/5 PASS + PUSHED）：**
+35. **codex 的 turn.completed 是隐形断点。** Worker 输出 contract JSON 后 codex 视为完成——skill-1 SKILL.md 说"输出 JSON"，worker 忠实执行后停止。修复：2-phase prompt（Phase 1 分析=内部不输出，Phase 2 实现=唯一交付物）。"不输出"比"输出后继续"更可靠。
+36. **LLM 对 error 字段过度反应。** `analyze_worker_output` 返回 `{"error": "missing_artifact"}` 时 LLM 立即判断 WAIT_HUMAN，即使 hint 说"正常情况"。修复：改 error 为语义更中性的 `"no_prior_worker_execution"` + 显式 hint。**给 LLM 的错误信息的措辞直接影响决策质量。**
+37. **`git add -u` 是新文件的隐形杀手。** Worker 创建新 .py 文件但 finish.sh 的 `git add -u` 只 stage 已 tracked 文件修改。PR 看起来 PUSHED 成功但实际缺少核心文件。修复：白名单 auto-stage 新源码/文档文件 + 黑名单排除 lock files。
+38. **test command 检测需要排除 read commands。** `rg -n "pytest|test" README.md` 被 `\bpytest\b` 匹配为 test execution。修复：先检查 read command patterns 再匹配 test patterns。**分类顺序即优先级。**
+39. **Self-review checklist 是提升 worker 质量的最低成本手段。** DeepCode 用了 OPENAI_API_KEY 而非 FORGE_API_KEY，base_url 为空。一个 checklist 文件（20 行）让 worker 在输出前自检。效果待 D3 验证。
+40. **Commit 质量审计必须检查实际 pushed 内容，不只看 grade。** Grade=PASS 但 PR 缺文件、包含 lock files、commit message 硬编码——这些都是 PASS 之后的质量问题。管线成功 ≠ 产出质量达标。
+
+**D3 Test Run 7 + D3.5 自我改进后：**
+41. **Skills 部署 ≠ Skills 更新。** D2.5 创建了 self_review_checklist.md 但未重新部署。Worker 从未看到。系统必须自动检测源比部署新并自动升级（mtime 比较），不依赖人工 `--force`。
+42. **单信号 false positive 是分类问题的通病。** Paper2Poster 的 pytest 在 requirements.txt 里是应用依赖（评估海报质量），不是测试基础设施。≥2/4 信号阈值消除了这类误判。**分类器要求多重佐证，不要单点判断。**
+43. **Worker 在失败后放弃是最危险的行为模式。** pip install 失败 → worker 直接报告 NEEDS_REVIEW 而不尝试任何验证。对比 DeepCode：worker 发现没有 test runner → 主动找 pre-commit 作为替代验证 → PASS。**Instructions 必须编码"永不放弃验证"作为硬规则。**
+44. **Metrics 有局限但可接受。** `git diff --numstat HEAD` 不包含新 untracked 文件（added_lines=0），但 changed_files_count 和 changed_files 列表已足够支撑 grading 决策。不需要额外计入 untracked 文件行数。
+45. **自我改进闭环 = 测试发现问题 → 编码回 skill instructions → 下次不犯。** 这是 AI centric 的核心：不是人写更多规则，而是每次运行的经验自动改善下一次的 worker 行为。Skills 是经验的持久化载体。
+46. **Grading 架构迁移不需要做（至少现在不需要）。** Hybrid grading（rules 提取证据 + heuristic 语义覆盖）在 5/5 repos 上正确工作。AI centric ≠ 所有东西都用 LLM。基础设施应该是确定性的，Agent 应该是智能的。
 
 ---
 
@@ -635,40 +677,51 @@ OpenHands V1 SDK（2025）的架构选择：
 9. Token scope 验证（preflight `gh api user`）
 10. Post-push 验证（local HEAD == remote HEAD）
 
-### Phase D2：真实验证 — ⭐ 下一步（唯一优先）
+### Phase D2：真实验证 — ✅ 已完成（2026-03-05）
 
-**目标**：用 Codex 原生 provider 跑完整 run，验证 D1+D1.6 全部修复。
+**结果：5/5 PASS + PUSHED。** 6 轮测试迭代，5 个仓库全部成功。
 
-**具体任务：**
+| Repo | Grade | Files Changed | Tests | Push Tick | Notes |
+|------|-------|---------------|-------|-----------|-------|
+| pipecat | PASS | 6 | pytest 703 passed | tick 1 | PR 不完整：新 .py 文件未 stage（D2.5 修复） |
+| DeepCode | PASS | 3 | pre-commit | tick 1 | env_key=OPENAI_API_KEY（质量问题，D2.5 checklist 覆盖） |
+| mem0 | PASS | 3 | make test 537 passed | tick 1 | PR 不完整：forge.py 未 stage（D2.5 修复） |
+| Paper2Poster | PASS | 2 | — | tick 2 auto_recovery | Clean |
+| dexter | PASS | 4 | bun test | tick 2 auto_recovery | Clean |
 
-1. **dexter-oss/dexter 重跑**（验证 D1.6 核心修复）
-   - D1.6 的修复直接来自 dexter run 的 post-mortem
-   - 预期：Worker PASS → 自动 run-finish → PUSHED（不再误升级）
-   - 重点验证：dirty workspace auto-recovery、guardrail 加宽
+**D2 关键发现与修复：**
+- Test Run 1-4：Worker 停在 skill-1 contract JSON 输出 → codex 视为 turn.completed。修复：2-phase prompt（分析=内部，实现=交付物）
+- Test Run 5：stale runs（Paper2Poster/DeepCode/dexter）LLM 误判 WAIT_HUMAN。修复：error message + system prompt
+- Test Run 6：5/5 PASS。auto_recovery 正确触发（Paper2Poster/dexter dirty workspace → auto run-finish）
 
-2. **mem0ai/mem0 全新 run**
-   - 全流程 QUEUED → PUSHED
-   - 验证 V2 状态机 + auto-prepare + hybrid_llm 分级
-   - Python 项目，对比 dexter（TypeScript）
+**基线指标：**
+- 首次成功率：60%（3/5 tick 1 PUSHED）
+- Auto-recovery 成功率：100%（2/2 dirty workspace → run-finish → PUSHED）
+- 平均 worker attempt：1.0（每个 repo 仅 1 次 worker execution）
+- Guardrail 触发率：0%（Test Run 6 无 guardrail override，所有 decision 由 rules 直接产生）
 
-3. **建立基线指标**
-   - 首次成功率（目标 ≥ 50%）
-   - 平均 worker attempt 数（目标 ≤ 2）
-   - D1.6 guardrail 触发率（action_record 中 decision_source 统计）
-   - 审计日志质量（facts_snapshot 是否提供了足够的调试信息）
+### Phase D2.5：Commit 质量修复 — ✅ 已完成（2026-03-06）
 
-### Phase D3：基于验证数据迭代
+**修复内容：**
+1. `finish.sh`：auto-stage 白名单新文件（.py .ts .md 等）+ 黑名单排除 lock files + 参数化 commit message
+2. `runtime_analysis.py`：READ_COMMAND_PATTERNS 过滤（`rg -n “pytest”` 不再误判为 test execution）
+3. `self_review_checklist.md`（NEW）：worker 完成前必查清单（git/代码质量/docs/验证）
+4. `analysis_checklist.md`：must_update_docs CRITICAL 指令（CONTRIBUTING 要求 doc → 必须 true）
+5. `manager_tools.py`：enriched evidence（test_command_samples + changed_files）
 
-**依赖**：D2 完成并有 2+ 个数据点。
+### Phase D3 + D3.5：边界修复 + 自我改进 — ✅ 已完成
 
-**可能方向**（D2 数据决定优先级）：
+**D3.1 — 边界修复** ✅：timeout partial changes → HUMAN_REVIEW, failure count artifact 持久化。
+**D3.2 — Test Run 7 验证** ✅：4/5 PASS+PUSHED tick 1。finish.sh auto-stage 验证通过。
+**D3.5 — 自我改进闭环** ✅：
+- `skills.py`：`install_local_skills` 比较 mtime，源更新自动覆盖（解决 self_review_checklist 未部署问题）
+- `runtime_analysis.py`：test infra 检测从 OR（任一信号）改为 ≥2/4 信号（解决 Paper2Poster pytest-as-app-dep false positive）
+- `manager_tools.py`：skill improvement proposal 系统（pattern detection → artifact storage → CLI review）
+- `skills.py` 入口 prompt：CRITICAL 规则"zero validation = NEEDS_REVIEW"
+- Skill-2 references 全面加强：self_review_checklist（+8 items）、validation_requirements（+resilience section）、forge_rules（+5 pitfalls）
+- Skill-1 analysis_checklist：env.example + changelog convention 检查
 
-| D2 结果 | D3 方向 |
-|---------|---------|
-| Worker 频繁失败 | 检查 skills references 完整性，补充项目类型特定指导 |
-| Manager 决策出错 | 调 guardrail 松紧度 / 优化 manager prompt |
-| hybrid_llm 分级不准 | 调证据包结构或评分标准 |
-| 一切顺利 | 进入常驻化 + 运维阶段（下面的 D4） |
+**Grading 架构迁移延期**：hybrid grading 是正确中间态。AI centric ≠ all LLM，基础设施应确定性。
 
 ### Phase D4：运维化（D3 之后）
 
@@ -677,7 +730,6 @@ OpenHands V1 SDK（2025）的架构选择：
 3. **Review triage 用户确认对话**：triage 结果先问用户，再执行（当前直接走 manager 决策）
 4. **优先级队列**：`/overview` 加”最值得关注的 3 件事”
 5. **自我迭代闭环**：skills-feedback → prompt/policy patch 草案 → 人审批
-6. **runtime grading → LLM**：砍掉 `runtime_analysis.py` 的 1,700 行 regex
 
 ### Phase D-forge：Forge 切回（等外部修复）
 

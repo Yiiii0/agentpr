@@ -16,6 +16,7 @@ Complete ALL items before any code changes.
    - What code style rules?
    - **Integration-specific steps?** (e.g., "Adding a New LLM: 1. code 2. tests 3. tox target") — List ALL steps explicitly. Every one is mandatory.
    - PR template checklist items? List them — these become hard gates.
+   - **CRITICAL for `must_update_docs`**: If CONTRIBUTING or PR template mentions ANY of: "update docs", "add documentation", "update README", "update provider list", "docs required" → set `must_update_docs: true` in contract. Err on the side of true when doc requirements exist.
 
 2. **CI workflows (`.github/workflows/`):**
    - Exact commands for: install deps, run tests, run lint/format?
@@ -53,3 +54,5 @@ Which scenario (A/B/C/D) from `forge_scenarios.md`? Which files to modify (targe
 - Where are docs? What format? How long is a similar provider's doc?
 - Does a similar provider have dedicated tests? If no → Forge doesn't need them either.
 - **If CI enforces coverage:** what branches need test coverage? Plan tests for all code paths.
+- **Does the repo have `env.example` or `.env.example`?** If yes, `FORGE_API_KEY` must be added there.
+- **Does the repo have a changelog convention?** (towncrier, CHANGELOG.md, release notes) If yes, an entry is required.

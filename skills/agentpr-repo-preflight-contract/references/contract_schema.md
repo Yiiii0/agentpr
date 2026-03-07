@@ -13,7 +13,7 @@ Return one JSON object:
   "rules": {
     "commit_format": "string",
     "pr_checklist": ["string"],
-    "must_update_docs": true,
+    "must_update_docs": "true if CONTRIBUTING/PR template requires doc updates (default true — err on side of requiring docs)",
     "forbidden_changes": ["string"]
   },
   "toolchain": {

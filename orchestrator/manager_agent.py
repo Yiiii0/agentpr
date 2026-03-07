@@ -98,6 +98,7 @@ class ManagerAgent:
                     "pr_number": facts.pr_number,
                     "latest_worker_grade": facts.latest_worker_grade,
                     "latest_worker_confidence": facts.latest_worker_confidence,
+                    "latest_failure_reason_code": facts.latest_failure_reason_code,
                     "review_triage_action": facts.review_triage_action,
                     "retry_should_retry": facts.retry_should_retry,
                     "run_digest": digest_context,
@@ -114,18 +115,26 @@ class ManagerAgent:
                 raise ManagerLLMError(
                     f"selected action not allowed in current state: {kind.value}"
                 )
-            # Guardrail: keep throughput when LLM is overly conservative.
+            # LLM is allowed to downgrade any active action to WAIT_HUMAN.
+            # This is the conservative path — LLM sees context rules can't
+            # (global failure rates, missing artifacts, systemic issues).
+            # Master Plan Section 8.3: "LLM can downgrade to WAIT_HUMAN".
             if (
                 kind == ManagerActionKind.WAIT_HUMAN
                 and rules_action.kind
                 not in {ManagerActionKind.WAIT_HUMAN, ManagerActionKind.NOOP}
             ):
-                logger.warning(
-                    "guardrail: llm_wait_human_overridden_by_rules "
-                    "llm_wanted=%s rules_override=%s",
-                    kind.value, rules_action.kind.value,
+                logger.info(
+                    "llm_downgrade_to_wait_human: rules_wanted=%s llm_reason=%s",
+                    rules_action.kind.value, selection.reason,
                 )
-                return rules_action, "llm_wait_human_overridden_by_rules"
+                return (
+                    ManagerAction(
+                        kind=ManagerActionKind.WAIT_HUMAN,
+                        reason=selection.reason,
+                    ),
+                    "llm",
+                )
             # Guardrail: when both sides pick active actions but disagree,
             # defer to rules (e.g. rules=RUN_FINISH, llm=RUN_AGENT_STEP).
             _PASSIVE = {ManagerActionKind.NOOP, ManagerActionKind.WAIT_HUMAN}
@@ -162,6 +171,21 @@ class ManagerAgent:
                     "llm_error",
                 )
             return rules_action, "rules_fallback_llm_error"
+
+    @staticmethod
+    def _global_stats_show_failures(global_stats: dict[str, Any] | None) -> bool:
+        """Check if global stats indicate recent systemic failures."""
+        if not isinstance(global_stats, dict):
+            return False
+        # Check state_counts for NEEDS_HUMAN_REVIEW or FAILED runs
+        state_counts = global_stats.get("state_counts")
+        if isinstance(state_counts, dict):
+            human_review = int(state_counts.get("NEEDS_HUMAN_REVIEW", 0))
+            failed = int(state_counts.get("FAILED", 0))
+            total = int(global_stats.get("sampled_runs", 0))
+            if total > 0 and (human_review + failed) > total * 0.3:
+                return True
+        return False
 
     def _build_tool_context(
         self,

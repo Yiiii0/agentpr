@@ -36,6 +36,7 @@ Execute contract-driven code changes with strict minimal-diff discipline, then r
 - Capture command + outcome clearly.
 
 5. Final self-check.
+- Run through `references/self_review_checklist.md` — every item must pass.
 - Ensure diff stays within budget and only intentional files changed.
 - Ensure no commit/push when manager policy disallows push.
 
@@ -55,6 +56,7 @@ Return a compact structured summary with:
 
 ## Resources
 
+- Read `references/self_review_checklist.md` for the mandatory pre-completion checklist.
 - Read `references/validation_requirements.md` for acceptance checks.
 - Read `references/forge_rules.md` for hard rules, important rules, and common pitfalls.
 - Read `references/example_mem0.diff` for a Python reference integration (env var detection pattern).

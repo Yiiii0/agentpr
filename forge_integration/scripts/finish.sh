@@ -1,6 +1,7 @@
 #!/bin/bash
-# Usage: ./finish.sh "CHANGES_DESCRIPTION" [PROJECT_NAME] [COMMIT_TITLE]
+# Usage: ./finish.sh "CHANGES_DESCRIPTION" [PROJECT_NAME] [COMMIT_TITLE] [COMMIT_BODY]
 # Example: ./finish.sh "Added FORGE supplier enum and ChatOpenAI elif branch in from_config()" "Quivr" "feat(llm): add forge provider"
+# If COMMIT_BODY is omitted, a default body listing changes and files is generated.
 # Run from inside the repo directory after changes are made.
 # Non-interactive — safe for automated use by Claude Code.
 
@@ -28,19 +29,41 @@ echo "=== Changed files ==="
 git diff --name-only
 echo ""
 
-# Check for untracked new files that should be staged
-UNTRACKED=$(git ls-files --others --exclude-standard)
-if [ -n "$UNTRACKED" ]; then
-    echo "⚠️  Untracked files detected (not auto-staged):"
-    echo "$UNTRACKED"
-    echo ""
-    echo "If these are intentional new files, stage them with 'git add <file>' before running finish.sh."
-    echo "Proceeding with only tracked file changes..."
-    echo ""
-fi
-
 # Stage tracked changes
 git add -u
+
+# Unstage lock files (should never be committed)
+LOCK_FILES="uv.lock package-lock.json bun.lockb yarn.lock poetry.lock pnpm-lock.yaml Cargo.lock go.sum Gemfile.lock composer.lock"
+for lockfile in $LOCK_FILES; do
+    if git diff --cached --name-only | grep -qx "$lockfile"; then
+        git reset HEAD "$lockfile" 2>/dev/null
+        echo "🔒 Unstaged lock file: $lockfile"
+    fi
+done
+
+# Auto-stage whitelisted new source/doc files
+SOURCE_EXT_PATTERN='\.(py|pyi|ts|tsx|js|jsx|mjs|md|mdx|rst)$'
+UNTRACKED=$(git ls-files --others --exclude-standard)
+if [ -n "$UNTRACKED" ]; then
+    STAGED_NEW=""
+    SKIPPED=""
+    while IFS= read -r f; do
+        if echo "$f" | grep -qE "$SOURCE_EXT_PATTERN"; then
+            git add "$f"
+            STAGED_NEW="${STAGED_NEW}  ${f}\n"
+        else
+            SKIPPED="${SKIPPED}  ${f}\n"
+        fi
+    done <<< "$UNTRACKED"
+    if [ -n "$STAGED_NEW" ]; then
+        echo "✅ Auto-staged new source/doc files:"
+        echo -e "$STAGED_NEW"
+    fi
+    if [ -n "$SKIPPED" ]; then
+        echo "ℹ️  Skipped non-source untracked files:"
+        echo -e "$SKIPPED"
+    fi
+fi
 
 # Safety check: list what will be committed
 echo "=== Files staged for commit ==="
@@ -58,37 +81,23 @@ echo "=== Commit title ==="
 echo "$COMMIT_TITLE"
 echo ""
 
-# Commit with full PR description in body
+# Build commit body
+CHANGED_FILES=$(git diff --cached --name-only)
+if [ -n "${4:-}" ]; then
+    COMMIT_BODY="$4"
+else
+    COMMIT_BODY="## Changes
+
+- ${CHANGES}
+
+Files modified:
+${CHANGED_FILES}"
+fi
+
 git commit -m "$(cat <<EOF
 $COMMIT_TITLE
 
-## Changes
-
-- ${CHANGES}
-- Environment variable: FORGE_API_KEY
-- Base URL: https://api.forge.tensorblock.co/v1
-- Model format: Provider/model-name (e.g., OpenAI/gpt-4o)
-- Non-breaking: purely additive, existing providers are untouched
-
-## About Forge
-
-Forge (https://github.com/TensorBlock/forge) is an open-source middleware that routes inference across 40+ upstream providers (including OpenAI, Anthropic, Gemini, DeepSeek, and OpenRouter). It is OpenAI API compatible — works with the standard OpenAI SDK by changing base_url and api_key.
-
-## Motivation
-
-We have seen growing interest from users who standardize on Forge for their model management and want to use it natively with ${PROJECT}. This integration aims to bridge that gap.
-
-## Key Benefits
-
-- Self-Hosted & Privacy-First: Forge is open-source and designed to be self-hosted, critical for users who require data sovereignty
-- Future-Proofing: acts as a decoupling layer — instead of maintaining individual adapters for every new provider, Forge users can access them immediately
-- Compatibility: supports established aggregators (like OpenRouter) as well as direct provider connections (BYOK)
-
-## References
-
-- Repo: https://github.com/TensorBlock/forge
-- Docs: https://www.tensorblock.co/api-docs/overview
-- Main Page: https://www.tensorblock.co/
+$COMMIT_BODY
 EOF
 )"
 

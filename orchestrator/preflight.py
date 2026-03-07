@@ -321,6 +321,7 @@ class RuntimeDoctor:
         checks.append(self._check_command("gh"))
         if self.require_codex:
             checks.append(self._check_codex_binary())
+            checks.append(self._check_codex_auth())
         if self.require_gh_auth:
             checks.append(self._check_gh_auth())
         if self.require_telegram_token:
@@ -383,6 +384,35 @@ class RuntimeDoctor:
         if resolved:
             return CheckResult("cmd.codex", True, f"{resolved} ({source})")
         return CheckResult("cmd.codex", False, source)
+
+    @staticmethod
+    def _check_codex_auth() -> CheckResult:
+        """Verify codex is authenticated (token not expired)."""
+        try:
+            completed = subprocess.run(  # noqa: S603
+                ["codex", "login", "status"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=15,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return CheckResult("codex.auth", False, f"codex login status failed: {exc}")
+        output = (completed.stdout.strip() + " " + completed.stderr.strip()).strip()
+        if completed.returncode != 0:
+            return CheckResult(
+                "codex.auth", False,
+                f"not authenticated: {output[:200]}. Run: codex login",
+            )
+        lowered = output.lower()
+        if "logged in" in lowered:
+            return CheckResult("codex.auth", True, output[:200])
+        if "not logged in" in lowered or "no auth" in lowered:
+            return CheckResult(
+                "codex.auth", False,
+                f"not authenticated: {output[:200]}. Run: codex login",
+            )
+        return CheckResult("codex.auth", True, f"status: {output[:200]}")
 
     def _check_workspace_write(self) -> CheckResult:
         try:

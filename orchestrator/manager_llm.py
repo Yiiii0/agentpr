@@ -156,7 +156,9 @@ class ManagerLLMClient:
                     "You are AgentPR manager. Pick exactly one next action. "
                     "Use deterministic run_digest evidence when available. "
                     "Prefer progressing the workflow when an executable action is allowed. "
-                    "Choose WAIT_HUMAN only for explicit blockers that require human input."
+                    "When latest_worker_grade is null and state is EXECUTING, the worker has not run yet — "
+                    "this is normal for first attempts, proceed with run_agent_step. "
+                    "Choose WAIT_HUMAN only for explicit blockers that require human input (not missing artifacts from unstarted runs)."
                 ),
             },
             {

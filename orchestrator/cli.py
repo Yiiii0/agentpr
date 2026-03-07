@@ -297,6 +297,9 @@ def build_parser() -> argparse.ArgumentParser:
     l = sub.add_parser("list-runs", help="List recent runs")
     l.add_argument("--limit", type=int, default=50)
 
+    lsp = sub.add_parser("list-skill-proposals", help="List pending skill improvement proposals")
+    lsp.add_argument("--limit", type=int, default=100)
+
     s = sub.add_parser("show-run", help="Show single run snapshot")
     s.add_argument("--run-id", required=True)
 
@@ -1570,6 +1573,13 @@ def main() -> int:
 
         if args.command == "list-runs":
             print_json({"runs": service.list_runs(limit=args.limit)})
+            return 0
+
+        if args.command == "list-skill-proposals":
+            from .manager_tools import list_skill_proposals
+
+            proposals = list_skill_proposals(service=service, limit=args.limit)
+            print_json({"proposals": proposals, "count": len(proposals)})
             return 0
 
         if args.command == "show-run":

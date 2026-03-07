@@ -36,6 +36,7 @@ class ManagerRunFacts:
     latest_worker_grade: str | None = None
     latest_worker_confidence: str | None = None
     review_triage_action: str | None = None  # fix_code | reply_explain | ignore
+    latest_failure_reason_code: str | None = None
     retry_should_retry: bool | None = None
     retry_target_state: str | None = None
     state_entered_at: str | None = None

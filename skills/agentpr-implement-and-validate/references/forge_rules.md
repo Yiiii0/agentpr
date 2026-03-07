@@ -30,3 +30,7 @@ These are distilled from 8+ repo integrations. Each one cost significant debuggi
 - **Aggregator `model_profile` needs delegation** — Router providers (like Forge, OpenRouter) must parse `Provider/model-name` and delegate to provider-specific profile functions, not return a generic profile.
 - **Type alias registration** — Only register capabilities you've verified (e.g., Chat Completions support ≠ Responses API support).
 - **False SKIP from surface-level analysis** — "Forge uses OpenAI SDK, already instrumented" is wrong if the project has a provider registry with entries for OpenRouter/Azure/etc. Always search for how similar routers are integrated before deciding SKIP.
+- **Giving up validation after install failure** — `pip install -r requirements.txt` failing does NOT mean you can skip tests. Try `pytest` directly, try `ruff check`, try `pre-commit`. The grading system requires evidence of attempted validation. Zero commands = automatic NEEDS_REVIEW.
+- **Missing env.example entries** — If a repo has `env.example` or `.env.example` with API keys for each provider, you MUST add `FORGE_API_KEY=your-api-key-here`. Forgetting this is a documentation gap.
+- **Unbound method calls** — Never call `OtherClass.method(self, args)` as a shortcut. Either properly subclass the provider or define the method locally. Fragile method binding is a code quality issue.
+- **Missing default model** — If every existing provider in the repo defines a default model, Forge should too. Use `openai/gpt-4o-mini` as the safe default.
