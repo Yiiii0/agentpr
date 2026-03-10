@@ -93,6 +93,16 @@ class CodeReviewResult:
     raw: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class PRReadinessResult:
+    verdict: str  # APPROVE | NEEDS_HUMAN
+    code_ok: bool
+    body_ok: bool
+    reasons: list[str]
+    summary: str
+    raw: dict[str, Any]
+
+
 class ManagerLLMClient:
     def __init__(self, config: ManagerLLMConfig) -> None:
         self.config = config
@@ -293,7 +303,10 @@ class ManagerLLMClient:
                 "role": "system",
                 "content": (
                     "You are AgentPR Telegram manager router. "
-                    "Select exactly one action. Be conservative and safe."
+                    "Select exactly one action. Be conservative and safe. "
+                    "The context may include 'recent_messages' — the last few "
+                    "messages in this conversation. Use them to resolve ambiguous "
+                    "references like 'that repo', 'retry it', 'the last one'."
                 ),
             },
             {
@@ -1087,7 +1100,10 @@ class ManagerLLMClient:
                     "Criteria: environment/transient errors → retry. "
                     "Fundamental misunderstanding of task → do not retry. "
                     "Test failures with clear fix path → retry with specific guidance. "
-                    "If uncertain, recommend retry with low confidence."
+                    "If uncertain, recommend retry with low confidence. "
+                    "The evidence may include 'previous_attempts' (number of prior retries). "
+                    "If previous_attempts >= 2, be more skeptical about retrying — "
+                    "the same approach is likely to fail again."
                 ),
             },
             {
@@ -1198,6 +1214,7 @@ class ManagerLLMClient:
         changed_files_content: dict[str, str],
         sibling_files_content: dict[str, str],
         checklist: str,
+        previous_review: dict[str, Any] | None = None,
     ) -> CodeReviewResult:
         """Deep code review of worker-produced changes.
 
@@ -1228,6 +1245,14 @@ class ManagerLLMClient:
         for fpath, content in sibling_files_content.items():
             user_parts.append(f"\n--- {fpath} ---")
             user_parts.append(content[:6000])
+
+        if previous_review:
+            user_parts.append("\n=== PREVIOUS REVIEW (this is a re-review after fixes) ===")
+            user_parts.append(json.dumps(previous_review, indent=2, default=str)[:3000])
+            user_parts.append(
+                "\nFocus on whether the previous issues were fixed. "
+                "Do not re-flag issues that have been resolved."
+            )
 
         user_content = "\n".join(user_parts)
         # Truncate to stay within reasonable token limits
@@ -1344,5 +1369,205 @@ class ManagerLLMClient:
             issues=issues,
             reference_provider=reference_provider,
             summary=summary or "Review completed.",
+            raw=raw,
+        )
+
+    # ------------------------------------------------------------------
+    # PR Readiness Assessment (final review before auto-creating PR)
+    # ------------------------------------------------------------------
+
+    _PR_READINESS_SYSTEM_PROMPT = (
+        "You are the final reviewer before a Forge integration PR is posted to {project_name}.\n\n"
+        "You have access to:\n"
+        "1. The code review result (from a prior deep code review)\n"
+        "2. The worker's grading evidence (test results, grade, changed files)\n"
+        "3. The generated PR body that will be posted\n"
+        "4. The repo's PR template (if any)\n"
+        "5. The git diff\n"
+        "6. Accumulated review principles from 17 previous integration PRs\n\n"
+        "YOUR JOB: Decide if this PR is ready to be posted as-is, or if a human should review first.\n\n"
+        "--- REVIEW PRINCIPLES (from 17 real PR reviews) ---\n"
+        "1. REFERENCE PROVIDER: The code must match the MOST SIMILAR existing provider "
+        "(Forge is an aggregator → reference OpenRouter/LiteLLM/AiHubMix, not Groq/Together).\n"
+        "2. MINIMAL DIFF: Only necessary files modified. No unnecessary refactors, no lock files, "
+        "no CI changes unless required.\n"
+        "3. NO GLOBAL POLLUTION: No os.environ mutation. API key via explicit kwargs.\n"
+        "4. DISPATCH INTEGRITY: If inserted into elif/match chain, no shadowing of existing branches. "
+        "If factory/registry exists, Forge is registered.\n"
+        "5. PR BODY QUALITY:\n"
+        "   - Summary must describe actual code changes (not generic 'adds Forge support')\n"
+        "   - Usage must be USER-FACING (env vars, CLI, config) not internal API functions\n"
+        "   - Test Evidence must be REAL commands and results, not grading system codes\n"
+        "   - About Forge must use verified facts (40+ providers, thousands of models, "
+        "open-source middleware service)\n"
+        "   - No marketing text (no Motivation/Why Forge/Key Benefits sections)\n"
+        "6. PR TEMPLATE COMPLIANCE: If the repo has a PR template, all required sections/checkboxes "
+        "must be addressed. Missing sections = NEEDS_HUMAN.\n"
+        "7. WORKER 'CREATIVITY' RULE: Additive improvements that don't break anything (extra DRY "
+        "helpers, env var fallback) are acceptable. Changes that alter types, break callers, or "
+        "shadow branches are NOT.\n"
+        "--- END PRINCIPLES ---\n\n"
+        "Evaluate and return:\n"
+        "- verdict: 'APPROVE' (safe to auto-post) or 'NEEDS_HUMAN' (human should review)\n"
+        "- code_ok: true/false — is the code quality acceptable?\n"
+        "- body_ok: true/false — is the PR body quality acceptable?\n"
+        "- reasons: array of strings explaining your decision\n"
+        "- summary: 1-2 sentence overall assessment\n\n"
+        "IMPORTANT: Err on the side of APPROVE when the code review was CLEAN and the PR body "
+        "covers all required sections. Only flag NEEDS_HUMAN for concrete issues, not hypothetical ones.\n"
+        "If the code review found no HIGH issues and the PR body is reasonable, APPROVE."
+    )
+
+    def assess_pr_readiness(
+        self,
+        *,
+        project_name: str,
+        code_review_summary: str,
+        code_review_verdict: str,
+        code_review_issues: list[dict[str, str]],
+        worker_evidence: dict[str, Any],
+        pr_body: str,
+        pr_template: str,
+        diff_text: str,
+    ) -> PRReadinessResult:
+        """Final PR readiness assessment using all accumulated context.
+
+        Args:
+            project_name: Repository name.
+            code_review_summary: Summary from the code review step.
+            code_review_verdict: CLEAN or HAS_ISSUES.
+            code_review_issues: List of issues from code review.
+            worker_evidence: Grading evidence (grade, test_commands, changed_files, etc.).
+            pr_body: The composed PR body text.
+            pr_template: The repo's PR template (empty string if none).
+            diff_text: The git diff.
+
+        Returns:
+            PRReadinessResult with verdict and detailed reasoning.
+        """
+        system_prompt = self._PR_READINESS_SYSTEM_PROMPT.format(
+            project_name=project_name,
+        )
+
+        user_parts: list[str] = []
+
+        user_parts.append("=== CODE REVIEW RESULT ===")
+        user_parts.append(f"Verdict: {code_review_verdict}")
+        user_parts.append(f"Summary: {code_review_summary}")
+        if code_review_issues:
+            user_parts.append("Issues:")
+            for issue in code_review_issues[:10]:
+                user_parts.append(
+                    f"  - [{issue.get('severity', 'MEDIUM')}] {issue.get('file', '?')}: "
+                    f"{issue.get('description', '')}"
+                )
+
+        user_parts.append("\n=== WORKER EVIDENCE ===")
+        # Filter out internal grading keys
+        _internal_keys = {
+            "reason_code", "next_action", "semantic", "grade",
+            "artifact_type", "artifact_uri", "ok", "run_id",
+        }
+        filtered_evidence = {
+            k: v for k, v in worker_evidence.items()
+            if k not in _internal_keys
+        }
+        user_parts.append(json.dumps(filtered_evidence, indent=2, default=str)[:3000])
+
+        user_parts.append("\n=== PR BODY (will be posted) ===")
+        user_parts.append(pr_body[:6000])
+
+        if pr_template.strip():
+            user_parts.append("\n=== REPO PR TEMPLATE (must comply) ===")
+            user_parts.append(pr_template[:3000])
+
+        user_parts.append("\n=== GIT DIFF ===")
+        user_parts.append(diff_text[:6000])
+
+        user_content = "\n".join(user_parts)
+        if len(user_content) > 40000:
+            user_content = user_content[:40000] + "\n... (truncated)"
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ]
+
+        tool_schema = {
+            "type": "function",
+            "function": {
+                "name": "submit_pr_readiness",
+                "description": "Submit the PR readiness assessment.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "verdict": {
+                            "type": "string",
+                            "enum": ["APPROVE", "NEEDS_HUMAN"],
+                        },
+                        "code_ok": {"type": "boolean"},
+                        "body_ok": {"type": "boolean"},
+                        "reasons": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                        "summary": {"type": "string"},
+                    },
+                    "required": ["verdict", "code_ok", "body_ok", "reasons", "summary"],
+                },
+            },
+        }
+
+        payload = {
+            "model": self.config.model,
+            "temperature": 0,
+            "messages": messages,
+            "tools": [tool_schema],
+            "tool_choice": {"type": "function", "function": {"name": "submit_pr_readiness"}},
+        }
+
+        try:
+            data = self._request_chat_completion(payload)
+            return self._pr_readiness_from_payload(self._extract_tool_call_payload(data), data)
+        except ManagerLLMError as exc:
+            if not self._should_try_json_fallback(exc):
+                raise
+            parsed = self._request_json_fallback(
+                messages=messages,
+                schema_instruction=(
+                    "Return ONLY one compact JSON object with fields: "
+                    "verdict ('APPROVE' or 'NEEDS_HUMAN'), "
+                    "code_ok (boolean), body_ok (boolean), "
+                    "reasons (array of strings), summary (string)."
+                ),
+            )
+            return self._pr_readiness_from_payload(parsed, {"fallback_mode": "json_no_tools"})
+
+    @staticmethod
+    def _pr_readiness_from_payload(
+        payload: Any,
+        raw: dict[str, Any],
+    ) -> PRReadinessResult:
+        if not isinstance(payload, dict):
+            raise ManagerLLMError("PR readiness payload must be object")
+        verdict = str(payload.get("verdict") or "NEEDS_HUMAN").strip().upper()
+        if verdict not in {"APPROVE", "NEEDS_HUMAN"}:
+            verdict = "NEEDS_HUMAN"
+        code_ok = bool(payload.get("code_ok", True))
+        body_ok = bool(payload.get("body_ok", True))
+        reasons = []
+        raw_reasons = payload.get("reasons")
+        if isinstance(raw_reasons, list):
+            reasons = [str(r) for r in raw_reasons if r]
+        # Safety: if code or body not ok, force NEEDS_HUMAN
+        if not code_ok or not body_ok:
+            verdict = "NEEDS_HUMAN"
+        summary = str(payload.get("summary") or "").strip()
+        return PRReadinessResult(
+            verdict=verdict,
+            code_ok=code_ok,
+            body_ok=body_ok,
+            reasons=reasons,
+            summary=summary or "Assessment completed.",
             raw=raw,
         )

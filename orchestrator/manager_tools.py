@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json
+import subprocess
 from collections import Counter
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from .service import OrchestratorService
@@ -351,3 +354,120 @@ def list_skill_proposals(
             })
 
     return proposals
+
+
+# ── Self-Iteration: Safety Tiers ──────────────────────────────────
+
+# Low-risk files: auto-apply (additive lesson, recoverable if wrong)
+# High-risk files: propose only, require human /approve_skill
+SKILL_FILE_SAFETY_TIERS: dict[str, str] = {
+    "references/forge_rules.md": "low",
+    "references/self_review_checklist.md": "low",
+    "references/validation_requirements.md": "low",
+    "references/code_review_checklist.md": "low",
+    "SKILL.md": "high",
+}
+
+
+def apply_skill_improvement(
+    *,
+    service: OrchestratorService,
+    run_id: str,
+    proposal: dict[str, Any],
+    skills_source_root: Path,
+    project_root: Path,
+) -> dict[str, Any]:
+    """Apply a skill improvement proposal.
+
+    Low-risk files: auto-append lesson + git commit.
+    High-risk files: store as pending proposal + notify.
+    """
+    target_file = str(proposal.get("target_file", "")).strip()
+    skill_name = str(proposal.get("skill_name", "")).strip()
+    lesson = str(proposal.get("lesson", "")).strip()
+    suggestion = str(proposal.get("suggestion", "")).strip()
+    proposal_key = str(proposal.get("proposal_key", "")).strip()
+
+    tier = SKILL_FILE_SAFETY_TIERS.get(target_file, "high")
+
+    if tier == "high":
+        # Store as pending proposal, do not auto-apply
+        propose_skill_improvement(
+            service=service,
+            run_id=run_id,
+            proposal_key=proposal_key,
+            skill_name=skill_name,
+            target_file=target_file,
+            lesson=lesson,
+            suggestion=suggestion,
+            evidence=proposal.get("evidence"),
+        )
+        notify_user(
+            service=service,
+            run_id=run_id,
+            message=(
+                f"Skill improvement proposal (HIGH risk, needs approval): "
+                f"{proposal_key} → {target_file}. "
+                f"Lesson: {lesson[:100]}. "
+                f"Use /approve_skill {run_id} {proposal_key}"
+            ),
+            priority="high",
+        )
+        return {"ok": True, "action": "proposed", "tier": "high", "proposal_key": proposal_key}
+
+    # Low-risk: auto-apply by appending to the target file
+    skill_dir = skills_source_root / skill_name
+    file_path = skill_dir / target_file
+    if not file_path.is_file():
+        return {"ok": False, "error": f"target file not found: {file_path}"}
+
+    # Append lesson as a new rule
+    append_text = (
+        f"\n\n<!-- auto-improvement: {proposal_key} -->\n"
+        f"### Lesson: {lesson}\n"
+        f"{suggestion}\n"
+    )
+    try:
+        with open(file_path, "a", encoding="utf-8") as f:
+            f.write(append_text)
+    except OSError as exc:
+        return {"ok": False, "error": f"write failed: {exc}"}
+
+    # Git commit for rollback
+    try:
+        subprocess.run(
+            ["git", "add", str(file_path)],
+            cwd=str(project_root),
+            capture_output=True,
+            timeout=10,
+        )
+        subprocess.run(
+            ["git", "commit", "-m", f"skill-improve({proposal_key}): {lesson[:60]}"],
+            cwd=str(project_root),
+            capture_output=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        pass  # Git commit is best-effort
+
+    # Mark as applied
+    service.add_artifact(
+        run_id,
+        artifact_type="skill_improvement_applied",
+        uri=f"inline://skill_applied/{run_id}/{proposal_key}",
+        metadata={
+            "proposal_key": proposal_key,
+            "skill_name": skill_name,
+            "target_file": target_file,
+            "tier": "low",
+            "applied_at": datetime.now(UTC).isoformat(),
+        },
+    )
+
+    return {
+        "ok": True,
+        "action": "applied",
+        "tier": "low",
+        "proposal_key": proposal_key,
+        "file": str(file_path),
+    }

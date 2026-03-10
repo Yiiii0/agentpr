@@ -36,6 +36,8 @@ WRITE_COMMANDS: set[str] = {
 }
 ADMIN_COMMANDS: set[str] = {
     "/approve_pr",
+    "/approve_triage",
+    "/approve_skill",
 }
 NL_DISPATCH_COMMAND = "/nl"
 WRITE_COMMANDS.add(NL_DISPATCH_COMMAND)
@@ -51,7 +53,7 @@ BOT_RULES_FOOTER = (
     "Rules:\n"
     "1) `/` 开头按命令模式执行（确定性动作）。\n"
     "2) 非 `/` 文本按自然语言模式执行（manager agent 路由）。\n"
-    "3) 高风险动作保留显式确认：`/approve_pr <run_id> <confirm_token>`。\n"
+    "3) 高风险动作保留显式确认：`/approve_pr` `/approve_triage` `/approve_skill`。\n"
     "4) 常用命令：`/create <owner/repo|github_url>... [--prompt-version vX]` "
     "`/overview` "
     "`/list` `/show <run_id>` `/status <run_id>` "

@@ -295,7 +295,16 @@ def _run_code_review(
     if not checklist:
         checklist = "No review checklist available. Use your best judgment."
 
-    # 5. Call LLM reviewer
+    # 5. Load previous review (if re-reviewing after iteration)
+    previous_review: dict[str, Any] | None = None
+    try:
+        prior_art = service.latest_artifact(run_id, artifact_type="code_review")
+        if prior_art and isinstance(prior_art.get("metadata"), dict):
+            previous_review = prior_art["metadata"]
+    except Exception:  # noqa: BLE001
+        pass  # best-effort
+
+    # 6. Call LLM reviewer
     try:
         client = ManagerLLMClient.from_runtime(
             api_base=None,
@@ -309,6 +318,7 @@ def _run_code_review(
             changed_files_content=changed_files_content,
             sibling_files_content=sibling_files_content,
             checklist=checklist,
+            previous_review=previous_review,
         )
     except (ManagerLLMError, Exception) as exc:  # noqa: BLE001
         return {
@@ -317,7 +327,7 @@ def _run_code_review(
             "fallback": "Review could not be completed. Proceed with caution.",
         }
 
-    # 6. Store review result as artifact
+    # 7. Store review result as artifact
     review_data = {
         "verdict": result.verdict,
         "issues": [
@@ -817,7 +827,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Create a pending PR-open request with confirmation token",
     )
     ro.add_argument("--run-id", required=True)
-    ro.add_argument("--title", required=True)
+    ro.add_argument("--title", help="PR title (auto-generated from repo context if omitted)")
     ro_body_group = ro.add_mutually_exclusive_group(required=False)
     ro_body_group.add_argument("--body", help="PR body text")
     ro_body_group.add_argument("--body-file", type=Path, help="PR body file path")
@@ -1299,6 +1309,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         help="Optional max loop count for testing.",
     )
+    ml.add_argument(
+        "--persistent",
+        action="store_true",
+        default=False,
+        help="Keep running even when all runs are idle (daemon mode).",
+    )
 
     return parser
 
@@ -1768,6 +1784,9 @@ def main() -> int:
             fail_count = 0
             consecutive_idle = 0
             _IDLE_EXIT_TICKS = 3  # exit after N consecutive all-waiting ticks
+            persistent = bool(getattr(args, "persistent", False))
+            wake_path = Path(args.db).parent / ".wake_manager"
+            _HIBERNATE_INTERVAL = 600  # longer sleep when idle in persistent mode
             try:
                 while True:
                     report = runner.tick()
@@ -1783,7 +1802,7 @@ def main() -> int:
                     if args.max_loops is not None and loops >= max(int(args.max_loops), 1):
                         break
                     # Exit early if all runs are waiting/terminal for N ticks
-                    if consecutive_idle >= _IDLE_EXIT_TICKS:
+                    if consecutive_idle >= _IDLE_EXIT_TICKS and not persistent:
                         print_json({
                             "idle_exit": True,
                             "reason": (
@@ -1793,7 +1812,23 @@ def main() -> int:
                             "loops_completed": loops,
                         })
                         break
-                    time.sleep(max(int(args.interval_sec), 1))
+                    # In persistent mode, hibernate when idle (longer interval)
+                    if persistent and consecutive_idle > 0:
+                        sleep_sec = min(
+                            max(int(args.interval_sec), 1) * 2,
+                            _HIBERNATE_INTERVAL,
+                        )
+                    else:
+                        sleep_sec = max(int(args.interval_sec), 1)
+                    # Check wake file: webhook or bot can signal immediate tick
+                    if wake_path.exists():
+                        try:
+                            wake_path.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+                        sleep_sec = 1  # immediate next tick
+                        consecutive_idle = 0  # reset idle counter
+                    time.sleep(sleep_sec)
             except KeyboardInterrupt:
                 return 130
             return 0 if fail_count == 0 else 1
@@ -2600,9 +2635,10 @@ def main() -> int:
             repo_dir = Path(run["workspace_dir"])
             if not repo_dir.exists():
                 raise ValueError(f"Workspace not found: {repo_dir}")
-            title = args.title.strip()
+            title = (args.title or "").strip()
             if not title:
-                raise ValueError("PR title cannot be empty.")
+                # Auto-generate title from repo context
+                title = f"feat: add Forge as LLM provider for {repo_dir.name}"
             user_body = load_optional_text(args.body, args.body_file, arg_name="PR body")
             project_name = (
                 str(args.project_name).strip()

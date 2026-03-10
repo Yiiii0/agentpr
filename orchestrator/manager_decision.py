@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -20,6 +21,8 @@ class ManagerActionKind(StrEnum):
     RETRY = "retry"
     SYNC_GITHUB = "sync_github"
     RUN_CODE_REVIEW = "run_code_review"
+    AUTO_CREATE_PR = "auto_create_pr"
+    BUMP_PR_COMMENT = "bump_pr_comment"
 
 
 @dataclass(frozen=True)
@@ -43,6 +46,10 @@ class ManagerRunFacts:
     state_entered_at: str | None = None
     has_code_review: bool = False
     code_review_verdict: str | None = None  # CLEAN | HAS_ISSUES
+    auto_pr_enabled: bool = False
+    review_triage_confirmed: bool = False
+    pr_bump_count: int = 0
+    last_pr_bump_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -94,9 +101,15 @@ def decide_next_action(facts: ManagerRunFacts) -> ManagerAction:
                 reason="code review found issues, worker should fix them",
                 metadata={"target_state": "ITERATING"},
             )
+        # Code review CLEAN — two modes
+        if facts.auto_pr_enabled:
+            return ManagerAction(
+                kind=ManagerActionKind.AUTO_CREATE_PR,
+                reason="code review passed, auto-creating PR (manager will do final assessment)",
+            )
         return ManagerAction(
             kind=ManagerActionKind.WAIT_HUMAN,
-            reason="code review passed, awaiting PR gate decision",
+            reason="code review passed, awaiting human PR gate decision",
         )
 
     if state == RunState.NEEDS_HUMAN_REVIEW:
@@ -192,6 +205,11 @@ def decide_next_action(facts: ManagerRunFacts) -> ManagerAction:
                 kind=ManagerActionKind.WAIT_HUMAN,
                 reason="review comment needs human reply (not a code fix)",
             )
+        if facts.review_triage_action == "fix_code" and not facts.review_triage_confirmed:
+            return ManagerAction(
+                kind=ManagerActionKind.WAIT_HUMAN,
+                reason="triage says fix_code, awaiting human confirmation (/approve_triage)",
+            )
         if not facts.has_prompt:
             return ManagerAction(
                 kind=ManagerActionKind.WAIT_HUMAN,
@@ -199,7 +217,7 @@ def decide_next_action(facts: ManagerRunFacts) -> ManagerAction:
             )
         return ManagerAction(
             kind=ManagerActionKind.RUN_AGENT_STEP,
-            reason="iterating: review comment requires code fix",
+            reason="iterating: review comment requires code fix (confirmed)",
         )
 
     if state == RunState.IMPLEMENTING:
@@ -248,27 +266,49 @@ def decide_next_action(facts: ManagerRunFacts) -> ManagerAction:
         )
 
     if state in {RunState.CI_WAIT, RunState.REVIEW_WAIT}:
-        # Stale state detection: escalate if stuck too long.
-        _STALE_THRESHOLDS: dict[RunState, timedelta] = {
-            RunState.CI_WAIT: timedelta(hours=24),
-            RunState.REVIEW_WAIT: timedelta(hours=48),
-        }
-        threshold = _STALE_THRESHOLDS.get(state)
-        if threshold is not None and facts.state_entered_at:
+        # Stale state detection + PR bump automation
+        if facts.state_entered_at:
             try:
                 entered = datetime.fromisoformat(facts.state_entered_at)
                 if entered.tzinfo is None:
                     entered = entered.replace(tzinfo=UTC)
                 age = datetime.now(UTC) - entered
-                if age > threshold:
+
+                # CI_WAIT: escalate after 24h
+                if state == RunState.CI_WAIT and age > timedelta(hours=24):
                     return ManagerAction(
                         kind=ManagerActionKind.WAIT_HUMAN,
                         reason=(
-                            f"stale {state.value}: no progress for "
-                            f"{age.total_seconds() / 3600:.1f}h "
-                            f"(threshold {threshold.total_seconds() / 3600:.0f}h)"
+                            f"stale CI_WAIT: no progress for "
+                            f"{age.total_seconds() / 3600:.1f}h"
                         ),
                     )
+
+                # REVIEW_WAIT: bump after 3 days, escalate after 7 days
+                if state == RunState.REVIEW_WAIT:
+                    bump_days = int(
+                        os.environ.get("AGENTPR_PR_BUMP_DAYS", "3")
+                    )
+                    if (
+                        age > timedelta(days=bump_days)
+                        and facts.pr_number is not None
+                        and facts.pr_bump_count == 0
+                    ):
+                        return ManagerAction(
+                            kind=ManagerActionKind.BUMP_PR_COMMENT,
+                            reason=(
+                                f"PR has no response for {age.days}d, "
+                                f"posting polite bump comment"
+                            ),
+                        )
+                    if age > timedelta(days=7):
+                        return ManagerAction(
+                            kind=ManagerActionKind.WAIT_HUMAN,
+                            reason=(
+                                f"stale REVIEW_WAIT: no progress for "
+                                f"{age.total_seconds() / 3600:.1f}h"
+                            ),
+                        )
             except (ValueError, TypeError):
                 pass  # Unparseable timestamp — fall through to sync
         return ManagerAction(
@@ -288,7 +328,16 @@ def allowed_action_kinds(facts: ManagerRunFacts) -> tuple[ManagerActionKind, ...
     if state in _TERMINAL:
         return (ManagerActionKind.NOOP,)
 
-    if state in {RunState.PAUSED, RunState.PUSHED, RunState.NEEDS_HUMAN_REVIEW}:
+    if state in {RunState.PAUSED, RunState.NEEDS_HUMAN_REVIEW}:
+        return (ManagerActionKind.WAIT_HUMAN,)
+
+    if state == RunState.PUSHED:
+        if not facts.has_code_review:
+            return (ManagerActionKind.RUN_CODE_REVIEW, ManagerActionKind.WAIT_HUMAN)
+        if facts.code_review_verdict == "HAS_ISSUES":
+            return (ManagerActionKind.RETRY, ManagerActionKind.WAIT_HUMAN)
+        if facts.auto_pr_enabled:
+            return (ManagerActionKind.AUTO_CREATE_PR, ManagerActionKind.WAIT_HUMAN)
         return (ManagerActionKind.WAIT_HUMAN,)
 
     if state == RunState.QUEUED:
@@ -345,6 +394,10 @@ def allowed_action_kinds(facts: ManagerRunFacts) -> tuple[ManagerActionKind, ...
         return (ManagerActionKind.RETRY, ManagerActionKind.WAIT_HUMAN)
 
     if state in {RunState.CI_WAIT, RunState.REVIEW_WAIT}:
-        return (ManagerActionKind.SYNC_GITHUB, ManagerActionKind.WAIT_HUMAN)
+        return (
+            ManagerActionKind.SYNC_GITHUB,
+            ManagerActionKind.BUMP_PR_COMMENT,
+            ManagerActionKind.WAIT_HUMAN,
+        )
 
     return (ManagerActionKind.WAIT_HUMAN,)

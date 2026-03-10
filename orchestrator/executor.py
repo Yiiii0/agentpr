@@ -222,6 +222,16 @@ class ScriptExecutor:
         ]
         return self._run(cmd, cwd=repo_dir)
 
+    def run_gh_pr_comment(
+        self,
+        *,
+        repo_dir: Path,
+        pr_number: int,
+        body: str,
+    ) -> CommandResult:
+        cmd = ["gh", "pr", "comment", str(pr_number), "--body", body]
+        return self._run(cmd, cwd=repo_dir)
+
     def run_agent_step(
         self,
         *,

@@ -107,6 +107,13 @@ class Database:
 
                 CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_received
                 ON webhook_deliveries(source, received_at);
+
+                CREATE TABLE IF NOT EXISTS bot_sessions (
+                    chat_id INTEGER PRIMARY KEY,
+                    last_run_id TEXT,
+                    recent_messages_json TEXT NOT NULL DEFAULT '[]',
+                    updated_at TEXT NOT NULL
+                );
                 """
             )
             self._ensure_runs_state_schema_column(conn)
@@ -120,6 +127,63 @@ class Database:
         conn.execute(
             "ALTER TABLE runs ADD COLUMN state_schema_version TEXT NOT NULL DEFAULT 'v1'"
         )
+
+    # ------------------------------------------------------------------
+    # Bot session persistence
+    # ------------------------------------------------------------------
+
+    def get_bot_session(
+        self, conn: sqlite3.Connection, chat_id: int
+    ) -> dict[str, Any] | None:
+        row = conn.execute(
+            "SELECT chat_id, last_run_id, recent_messages_json, updated_at "
+            "FROM bot_sessions WHERE chat_id = ?",
+            (chat_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "chat_id": row["chat_id"],
+            "last_run_id": row["last_run_id"],
+            "recent_messages": json.loads(row["recent_messages_json"]),
+            "updated_at": row["updated_at"],
+        }
+
+    def upsert_bot_session(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        chat_id: int,
+        last_run_id: str | None,
+        recent_messages: list[str],
+        updated_at: str | None = None,
+    ) -> None:
+        now = updated_at or utcnow_iso()
+        conn.execute(
+            "INSERT INTO bot_sessions (chat_id, last_run_id, recent_messages_json, updated_at) "
+            "VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(chat_id) DO UPDATE SET "
+            "last_run_id = excluded.last_run_id, "
+            "recent_messages_json = excluded.recent_messages_json, "
+            "updated_at = excluded.updated_at",
+            (chat_id, last_run_id, json.dumps(recent_messages), now),
+        )
+
+    def load_all_bot_sessions(self, conn: sqlite3.Connection) -> dict[int, dict[str, Any]]:
+        rows = conn.execute(
+            "SELECT chat_id, last_run_id, recent_messages_json, updated_at FROM bot_sessions"
+        ).fetchall()
+        result: dict[int, dict[str, Any]] = {}
+        for row in rows:
+            chat_id = int(row["chat_id"])
+            result[chat_id] = {
+                "last_run_id": row["last_run_id"],
+                "recent_messages": json.loads(row["recent_messages_json"]),
+                "updated_at": row["updated_at"],
+            }
+        return result
+
+    # ------------------------------------------------------------------
 
     def insert_run(
         self,

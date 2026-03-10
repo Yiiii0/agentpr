@@ -1,6 +1,32 @@
 # agentpr
 
-Lightweight orchestrator for Forge OSS integration runs.
+AI-powered system that autonomously creates pull requests for open-source repositories.
+
+## Architecture Overview
+
+```
+Human (Telegram)  ──→  Telegram Bot  ──→  NL routing (LLM)  ──→  create_run
+                                               │
+                                               └─ touch .wake_manager
+                                                        │
+Manager Loop (persistent daemon)  ←─ .wake_manager ←─ GitHub Webhook Server
+    │
+    │  per-tick, per-run:
+    ├─ 1. Build ManagerRunFacts (from DB + artifacts)
+    ├─ 2. Rules decide_next_action()  ←── deterministic state machine
+    ├─ 3. [hybrid] LLM decide_action()  ←── can downgrade to WAIT_HUMAN
+    ├─ 4. Execute action (subprocess → CLI command)
+    └─ 5. Log decision audit record
+             │
+             ↓
+    Worker (codex exec subprocess, stateless)
+        ├─ Skills: preflight → implement → validate
+        └─ Output: JSONL stream → Grading (rules + optional LLM)
+```
+
+**Shared layer**: SQLite DB (state + artifacts + events) + `.wake_manager` signal file.
+
+**LLM usage**: 9 methods in `manager_llm.py`, ALL single-shot (no conversation memory). Manager reads fresh facts from DB each tick. See Master Plan Section 5 for full LLM capability map.
 
 ## Quick Start
 
@@ -71,6 +97,7 @@ python3.11 -m orchestrator.cli run-manager-loop [options]
 | `--manager-model` | model string | Manager LLM model. Defaults to `AGENTPR_MANAGER_MODEL`. |
 | `--manager-timeout-sec` | integer; default `20` | Timeout for each Manager LLM call. |
 | `--policy-file` | file path; default `orchestrator/manager_policy.json` | Manager policy JSON (sandbox, diff budget, retry cap, etc.). |
+| `--persistent` | flag | Keep running even when all runs are idle (daemon mode). Without this flag, the loop exits after 3 consecutive idle ticks. In persistent mode, idle ticks use a longer hibernate interval (600s). |
 | `--dry-run` | flag | Print what the manager would do without executing. |
 | `--skip-doctor` | flag | Skip startup environment check. Use only for debugging. |
 
@@ -146,6 +173,18 @@ When either var is missing, codex falls back to `~/.codex/config.toml` (currentl
 | `AGENTPR_TELEGRAM_DECISION_MODEL` | fallback to `AGENTPR_MANAGER_MODEL` | Decision Card LLM model. |
 | `AGENTPR_TELEGRAM_DECISION_API_BASE` | fallback to `AGENTPR_MANAGER_API_BASE` | Decision Card LLM endpoint. |
 
+### PR Approval
+
+| Variable | Default | Description |
+|---|---|---|
+| `AGENTPR_AUTO_PR` | `false` | Enable auto-PR mode. When `true`/`1`/`yes`, Manager automatically assesses PR readiness after code review passes and creates PR without human confirmation. When disabled (default), human must `/approve_pr` after code review passes. |
+
+### Progress Notifications
+
+| Variable | Default | Description |
+|---|---|---|
+| `AGENTPR_TELEGRAM_PROGRESS_INTERVAL_SEC` | `300` | How often the bot sends global progress summaries (seconds). Set `0` to disable. |
+
 ### Misc
 
 | Variable | Default | Description |
@@ -167,8 +206,46 @@ process 3: run-github-webhook     # CI/review feedback ingestion
             OR sync-github --loop # fallback (polling instead of webhook)
 ```
 
+Communication between processes:
+- **SQLite DB** — shared state (runs, artifacts, events)
+- **`.wake_manager` file** — zero-dependency cross-process signal. Webhook and Telegram bot touch this file after actionable events; Manager loop checks before each sleep and wakes immediately if present.
+
+Recommended flags for daemon deployment:
+```bash
+python3.11 -m orchestrator.cli run-manager-loop \
+  --persistent \
+  --decision-mode hybrid \
+  --skills-mode agentpr_autonomous \
+  --codex-sandbox danger-full-access
+```
+
 - Without manager loop: runs won't advance automatically.
 - Without webhook/sync: CI and review feedback won't close the loop.
+
+### PR Approval Modes
+
+**Mode 1: Human Confirm (default)**
+
+```
+PUSHED → Code Review → CLEAN → [notify human] → /approve_pr → PR created
+```
+
+Human receives Telegram notification when code review passes, then manually approves.
+
+**Mode 2: Auto with Manager Assessment**
+
+```bash
+export AGENTPR_AUTO_PR=true
+```
+
+```
+PUSHED → Code Review → CLEAN → Manager PR Readiness Assessment → APPROVE → PR created
+                                                                → NEEDS_HUMAN → [notify]
+```
+
+The Manager's assessment uses: code review results, worker grade/evidence, generated PR body, repo PR template, git diff, and accumulated review principles from 17 integration PRs. If code quality or PR body quality is insufficient, the Manager escalates to human instead of auto-creating.
+
+Safety: `merge` is always manual regardless of mode.
 
 ---
 

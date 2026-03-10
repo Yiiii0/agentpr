@@ -244,6 +244,13 @@ def _build_handler_class(
                 )
                 respond(500, outcome.to_dict(), "retryable_failure")
                 return
+            # Wake manager loop if actionable events were processed
+            if outcome.processed > 0:
+                try:
+                    _wake_path = service.db.db_path.parent / ".wake_manager"
+                    _wake_path.touch(exist_ok=True)
+                except OSError:
+                    pass  # Best-effort wake signal
             respond(200, outcome.to_dict(), "processed")
 
         def do_GET(self) -> None:  # noqa: N802

@@ -185,7 +185,12 @@ def run_telegram_bot_loop(
         global_limit=rate_limit_global,
     )
     audit = TelegramAuditLogger(audit_log_file)
-    conversation_state: dict[int, dict[str, Any]] = {}
+    # Load persisted bot sessions from SQLite
+    try:
+        with service.db.transaction() as _conn:
+            conversation_state: dict[int, dict[str, Any]] = service.db.load_all_bot_sessions(_conn)
+    except Exception:  # noqa: BLE001
+        conversation_state: dict[int, dict[str, Any]] = {}
     nl_mode = resolve_telegram_nl_mode()
     llm_client = build_nl_llm_client_if_enabled(nl_mode=nl_mode)
     decision_why_mode = resolve_decision_why_mode()
@@ -202,6 +207,9 @@ def run_telegram_bot_loop(
         admin_chat_ids=admin_chat_ids,
     )
     last_notify_scan_ts = 0.0
+    progress_interval_sec = parse_positive_int_env("AGENTPR_TELEGRAM_PROGRESS_INTERVAL_SEC", 300)
+    last_progress_ts = 0.0
+    last_progress_hash = ""
 
     while True:
         try:
@@ -234,6 +242,20 @@ def run_telegram_bot_loop(
                 audit=audit,
             )
             last_notify_scan_ts = now_scan_ts
+        # Progress summary on a longer interval
+        if notify_enabled and (now_scan_ts - last_progress_ts) >= float(progress_interval_sec):
+            try:
+                last_progress_hash = maybe_emit_progress_summary(
+                    client=client,
+                    service=service,
+                    notification_chat_ids=notification_chat_ids,
+                    scan_limit=notify_scan_limit,
+                    audit=audit,
+                    last_summary_hash=last_progress_hash,
+                )
+            except Exception:  # noqa: BLE001
+                pass  # Progress summary is best-effort
+            last_progress_ts = now_scan_ts
 
         if not updates:
             time.sleep(max(idle_sleep_sec, 1))
@@ -304,6 +326,12 @@ def run_telegram_bot_loop(
                 )
                 continue
 
+            # Track recent messages for LLM conversation context
+            recent_msgs: list[str] = chat_ctx.setdefault("recent_messages", [])
+            recent_msgs.append(text)
+            if len(recent_msgs) > 10:
+                chat_ctx["recent_messages"] = recent_msgs[-10:]
+
             try:
                 if is_natural_language:
                     response = handle_natural_language(
@@ -341,6 +369,17 @@ def run_telegram_bot_loop(
                 outcome = "error"
                 detail = str(exc)
             safe_send_message(client=client, chat_id=chat_id, text=response)
+            # Persist session state to SQLite
+            try:
+                with service.db.transaction() as _conn:
+                    service.db.upsert_bot_session(
+                        _conn,
+                        chat_id=chat_id,
+                        last_run_id=get_last_run_id(chat_ctx),
+                        recent_messages=chat_ctx.get("recent_messages", [])[-10:],
+                    )
+            except Exception:  # noqa: BLE001
+                pass  # Session persistence is best-effort
             audit.append(
                 build_audit_entry(
                     update_id=update_id,
@@ -614,6 +653,121 @@ def maybe_emit_manager_notifications(
         )
 
 
+_TERMINAL_STATES = {
+    RunState.DONE.value,
+    RunState.FAILED.value,
+    RunState.FAILED_TERMINAL.value,
+    RunState.SKIPPED.value,
+}
+
+_WAITING_STATES = {
+    RunState.PUSHED.value,
+    RunState.CI_WAIT.value,
+    RunState.REVIEW_WAIT.value,
+    RunState.PAUSED.value,
+    RunState.NEEDS_HUMAN_REVIEW.value,
+}
+
+
+def maybe_emit_progress_summary(
+    *,
+    client: "TelegramClient",
+    service: OrchestratorService,
+    notification_chat_ids: list[int],
+    scan_limit: int,
+    audit: "TelegramAuditLogger",
+    last_summary_hash: str,
+) -> str:
+    """Emit a compact batch progress summary if the aggregate has changed.
+
+    Returns the new summary hash (caller should store it for next call).
+    """
+    if not notification_chat_ids:
+        return last_summary_hash
+    rows = service.list_runs(limit=max(int(scan_limit), 1))
+    if not rows:
+        return last_summary_hash
+
+    # Count states
+    counts: dict[str, int] = {}
+    total = 0
+    for row in rows:
+        state = str(row.get("display_state") or row.get("current_state") or "").strip()
+        if not state:
+            continue
+        counts[state] = counts.get(state, 0) + 1
+        total += 1
+
+    if total == 0:
+        return last_summary_hash
+
+    # Build a hash of the aggregate to detect changes
+    summary_hash = "|".join(f"{k}={v}" for k, v in sorted(counts.items()))
+    if summary_hash == last_summary_hash:
+        return last_summary_hash  # No change
+
+    # Count categories
+    done = sum(counts.get(s, 0) for s in _TERMINAL_STATES)
+    waiting = sum(counts.get(s, 0) for s in _WAITING_STATES)
+    active = total - done - waiting
+    failed = counts.get(RunState.FAILED.value, 0) + counts.get(RunState.FAILED_TERMINAL.value, 0)
+
+    # Build compact summary
+    parts: list[str] = []
+    if done > 0:
+        parts.append(f"{done} done")
+    if failed > 0:
+        parts.append(f"{failed} failed")
+    if active > 0:
+        # Break down active states
+        active_parts: list[str] = []
+        for state_name in ["EXECUTING", "IMPLEMENTING", "DISCOVERY", "ITERATING", "QUEUED"]:
+            c = counts.get(state_name, 0)
+            if c > 0:
+                active_parts.append(f"{c} {state_name.lower()}")
+        parts.append(f"{active} active ({', '.join(active_parts)})" if active_parts else f"{active} active")
+    if waiting > 0:
+        wait_parts: list[str] = []
+        for state_name in ["PUSHED", "CI_WAIT", "REVIEW_WAIT", "PAUSED", "NEEDS_HUMAN_REVIEW"]:
+            c = counts.get(state_name, 0)
+            if c > 0:
+                label = state_name.lower().replace("_", " ")
+                wait_parts.append(f"{c} {label}")
+        parts.append(f"{waiting} waiting ({', '.join(wait_parts)})" if wait_parts else f"{waiting} waiting")
+
+    # Determine if batch is complete (all terminal or waiting)
+    all_settled = active == 0
+    if all_settled and done == total:
+        header = f"[batch complete] {total} runs finished"
+    elif all_settled:
+        header = f"[batch settled] {total} runs — all waiting or done"
+    else:
+        header = f"[progress] {total} runs"
+
+    text = f"{header}: {', '.join(parts)}."
+
+    # Needs-human callout
+    needs_human = counts.get(RunState.NEEDS_HUMAN_REVIEW.value, 0)
+    if needs_human > 0:
+        text += f"\n⚠ {needs_human} run(s) need human review — use /list to see details."
+
+    for chat_id in notification_chat_ids:
+        safe_send_message(client=client, chat_id=chat_id, text=format_bot_response(text))
+
+    audit.append(
+        {
+            "ts": datetime.now(UTC).isoformat(),
+            "kind": "progress_summary",
+            "total": total,
+            "done": done,
+            "active": active,
+            "waiting": waiting,
+            "failed": failed,
+        }
+    )
+    return summary_hash
+
+
 def parse_create_command_args(args: list[str]) -> tuple[list[str], str] | None:
     if not args:
         return None
@@ -726,6 +880,12 @@ def create_runs_from_refs(
                     lines.append(f"- ... and {len(kick_failures) - 5} more")
         else:
             lines.append("Manager loop will auto-progress them on next interval.")
+        # Wake persistent manager loop to pick up new runs immediately
+        try:
+            wake_path = db_path.parent / ".wake_manager"
+            wake_path.touch(exist_ok=True)
+        except OSError:
+            pass
     if failures:
         if lines:
             lines.append("")
@@ -1202,6 +1362,65 @@ def handle_bot_command(
             return f"approve-open-pr failed: {result['text']}"
         return f"approve-open-pr done: {result['text']}"
 
+    if command == "/approve_skill":
+        if len(args) != 2:
+            return "Usage: /approve_skill <run_id> <proposal_key>"
+        skill_run_id = args[0]
+        skill_proposal_key = args[1]
+        # Find the pending proposal
+        arts = service.list_artifacts(skill_run_id, artifact_type="skill_improvement_proposal", limit=20)
+        found = None
+        for art in arts:
+            meta = art.get("metadata")
+            if isinstance(meta, dict) and meta.get("proposal_key") == skill_proposal_key:
+                found = meta
+                break
+        if found is None:
+            return f"No pending proposal '{skill_proposal_key}' for run {skill_run_id}."
+        # Force-apply the high-risk proposal
+        from .manager_tools import apply_skill_improvement, SKILL_FILE_SAFETY_TIERS
+        # Temporarily treat as low-risk for application
+        original_tier = SKILL_FILE_SAFETY_TIERS.get(found.get("target_file", ""), "high")
+        SKILL_FILE_SAFETY_TIERS[found.get("target_file", "")] = "low"
+        try:
+            result = apply_skill_improvement(
+                service=service,
+                run_id=skill_run_id,
+                proposal=found,
+                skills_source_root=Path(__file__).resolve().parent.parent / "skills",
+                project_root=Path(__file__).resolve().parent.parent,
+            )
+        finally:
+            SKILL_FILE_SAFETY_TIERS[found.get("target_file", "")] = original_tier
+        if result.get("ok"):
+            return f"Skill improvement applied: {skill_proposal_key} → {found.get('target_file')}"
+        return f"Failed to apply: {result.get('error', 'unknown')}"
+
+    if command == "/approve_triage":
+        if len(args) != 1:
+            return "Usage: /approve_triage <run_id>"
+        triage_run_id = args[0]
+        # Verify a pending triage exists
+        triage_art = service.latest_artifact(triage_run_id, artifact_type="review_triage")
+        if triage_art is None:
+            return f"No pending triage for run: {triage_run_id}"
+        triage_meta = triage_art.get("metadata")
+        if not isinstance(triage_meta, dict) or triage_meta.get("action") != "fix_code":
+            return f"Triage for {triage_run_id} is not fix_code, no confirmation needed."
+        # Store confirmation artifact
+        service.add_artifact(
+            triage_run_id,
+            artifact_type="review_triage_confirmation",
+            uri=f"inline://triage_confirm/{triage_run_id}",
+            metadata={"confirmed_at": datetime.now(UTC).isoformat()},
+        )
+        # Wake persistent manager loop
+        try:
+            (db_path.parent / ".wake_manager").touch(exist_ok=True)
+        except OSError:
+            pass
+        return f"Triage confirmed for {triage_run_id}. Worker will fix the code."
+
     if command == "/pause":
         if len(args) != 1:
             return "Usage: /pause <run_id>"
@@ -1302,6 +1521,7 @@ def handle_natural_language(
         "recent_runs": service.list_runs(limit=min(max(int(list_limit), 1), 8)),
         "commands": list(BOT_NL_ALLOWED_ACTIONS),
         "nl_mode": mode,
+        "recent_messages": conversation_state.get("recent_messages", [])[-5:],
     }
     try:
         selection = llm_client.decide_bot_action(

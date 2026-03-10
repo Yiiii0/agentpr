@@ -3,6 +3,7 @@ from __future__ import annotations
 import fcntl
 import json
 import logging
+import os
 import subprocess
 import sys
 from contextlib import contextmanager
@@ -515,6 +516,29 @@ class ManagerLoopRunner:
             if isinstance(meta, dict):
                 code_review_verdict = str(meta.get("verdict") or "").strip().upper() or None
 
+        # Auto PR mode: controlled by env var AGENTPR_AUTO_PR (default: false)
+        auto_pr_enabled = os.environ.get("AGENTPR_AUTO_PR", "").strip().lower() in {
+            "1", "true", "yes",
+        }
+
+        # Check for PR bump artifacts
+        pr_bump_count = 0
+        last_pr_bump_at: str | None = None
+        bump_arts = self.service.list_artifacts(run_id, artifact_type="pr_bump_comment", limit=10)
+        if bump_arts:
+            pr_bump_count = len(bump_arts)
+            last_art_meta = bump_arts[-1].get("metadata")
+            if isinstance(last_art_meta, dict):
+                last_pr_bump_at = last_art_meta.get("bumped_at")
+
+        # Check for triage confirmation
+        review_triage_confirmed = False
+        if review_triage_action == "fix_code":
+            triage_confirm_art = self.service.latest_artifact(
+                run_id, artifact_type="review_triage_confirmation"
+            )
+            review_triage_confirmed = triage_confirm_art is not None
+
         return ManagerRunFacts(
             run_id=run_id,
             owner=str(run["owner"]),
@@ -535,6 +559,10 @@ class ManagerLoopRunner:
             state_entered_at=state_entered_at,
             has_code_review=has_code_review,
             code_review_verdict=code_review_verdict,
+            auto_pr_enabled=auto_pr_enabled,
+            review_triage_confirmed=review_triage_confirmed,
+            pr_bump_count=pr_bump_count,
+            last_pr_bump_at=last_pr_bump_at,
         )
 
     def _latest_worker_grade(
@@ -599,6 +627,32 @@ class ManagerLoopRunner:
                     "state": str(snapshot.get("state") or ""),
                 },
             )
+            # Store triage result as artifact for audit + confirmation flow
+            self.service.add_artifact(
+                run_id,
+                artifact_type="review_triage",
+                uri=f"inline://review_triage/{run_id}",
+                metadata={
+                    "action": triage.action,
+                    "reason": getattr(triage, "reason", ""),
+                    "confidence": getattr(triage, "confidence", ""),
+                    "comment_body": comment_body[:500],
+                    "created_at": datetime.now(UTC).isoformat(),
+                },
+            )
+            # Notify human if triage says fix_code (needs confirmation)
+            if triage.action == "fix_code":
+                from .manager_tools import notify_user
+                notify_user(
+                    service=self.service,
+                    run_id=run_id,
+                    message=(
+                        f"Review triage: {triage.action} — "
+                        f"{getattr(triage, 'reason', 'reviewer requests code change')}. "
+                        f"Approve with /approve_triage {run_id}"
+                    ),
+                    priority="high",
+                )
             return triage.action
         except (ManagerLLMError, Exception):  # noqa: BLE001
             return None  # Triage is best-effort
@@ -613,6 +667,8 @@ class ManagerLoopRunner:
             evidence = analyze_worker_output(service=self.service, run_id=run_id)
             if not evidence.get("ok"):
                 return None
+            failure_count = self._get_failure_count(run_id)
+            evidence["previous_attempts"] = failure_count
             return self._llm_client.suggest_retry_strategy(failure_evidence=evidence)
         except (ManagerLLMError, Exception):  # noqa: BLE001
             return None  # Diagnosis is best-effort
@@ -748,6 +804,12 @@ class ManagerLoopRunner:
         if action.kind == ManagerActionKind.RUN_CODE_REVIEW:
             return self._run_cli(["run-code-review", "--run-id", run_id])
 
+        if action.kind == ManagerActionKind.AUTO_CREATE_PR:
+            return self._auto_create_pr(run_id=run_id, facts=facts)
+
+        if action.kind == ManagerActionKind.BUMP_PR_COMMENT:
+            return self._bump_pr_comment(run_id=run_id, facts=facts)
+
         if action.kind == ManagerActionKind.SYNC_GITHUB:
             return self._run_cli(["sync-github", "--run-id", run_id])
 
@@ -758,6 +820,244 @@ class ManagerLoopRunner:
             "output": "",
             "error": f"unsupported manager action: {action.kind.value}",
         }
+
+    def _bump_pr_comment(
+        self, *, run_id: str, facts: ManagerRunFacts
+    ) -> dict[str, Any]:
+        """Post a polite follow-up comment on a PR with no maintainer response."""
+        if facts.pr_number is None:
+            return {"ok": False, "error": "no pr_number for bump"}
+
+        bump_msg = os.environ.get(
+            "AGENTPR_PR_BUMP_MESSAGE",
+            "Hi! Just checking in on this PR. Let me know if there's any "
+            "feedback or changes you'd like to see. Happy to iterate!",
+        )
+
+        workspace_dir = Path(
+            self.service.get_run(run_id).get("workspace_dir", "")
+        )
+        if not workspace_dir.is_dir():
+            return {"ok": False, "error": f"workspace not found: {workspace_dir}"}
+
+        result = self.executor.run_gh_pr_comment(
+            repo_dir=workspace_dir,
+            pr_number=facts.pr_number,
+            body=bump_msg,
+        )
+
+        if result.returncode == 0:
+            self.service.add_artifact(
+                run_id,
+                artifact_type="pr_bump_comment",
+                uri=f"inline://pr_bump/{run_id}/{facts.pr_bump_count + 1}",
+                metadata={
+                    "pr_number": facts.pr_number,
+                    "bumped_at": datetime.now(UTC).isoformat(),
+                    "bump_count": facts.pr_bump_count + 1,
+                    "message": bump_msg,
+                },
+            )
+
+        return {
+            "ok": result.returncode == 0,
+            "command": "bump_pr_comment",
+            "returncode": result.returncode,
+            "output": result.stdout[:500] if result.stdout else "",
+            "error": result.stderr[:500] if result.stderr else "",
+        }
+
+    def _auto_create_pr(
+        self, *, run_id: str, facts: ManagerRunFacts
+    ) -> dict[str, Any]:
+        """Auto-create PR: request → assess readiness → approve.
+
+        Steps:
+        1. request-open-pr (generates PR body via LLM, title auto-generated)
+        2. Manager LLM assesses PR readiness (code + body + principles)
+        3. If APPROVE → approve-open-pr
+        4. If NEEDS_HUMAN → store result, return not-ok
+        """
+        # Step 1: Request PR creation
+        request_result = self._run_cli(["request-open-pr", "--run-id", run_id])
+        if not request_result["ok"]:
+            return request_result
+        payload = request_result.get("payload") or {}
+        confirm_token = str(payload.get("confirm_token") or "").strip()
+        request_file = str(payload.get("request_file") or "").strip()
+        if not confirm_token or not request_file:
+            return {
+                "ok": False,
+                "command": "auto-create-pr",
+                "returncode": 1,
+                "output": "",
+                "error": "request-open-pr did not return confirm_token or request_file",
+            }
+
+        # Step 2: PR readiness assessment (if LLM available)
+        if self._llm_client is not None:
+            try:
+                readiness = self._run_pr_readiness_assessment(
+                    run_id=run_id,
+                    facts=facts,
+                    request_file=request_file,
+                )
+                # Store result as artifact
+                self.service.add_artifact(
+                    run_id,
+                    artifact_type="pr_readiness",
+                    uri=f"inline://pr_readiness/{run_id}",
+                    metadata={
+                        "verdict": readiness.verdict,
+                        "code_ok": readiness.code_ok,
+                        "body_ok": readiness.body_ok,
+                        "reasons": readiness.reasons,
+                        "summary": readiness.summary,
+                    },
+                )
+                if readiness.verdict != "APPROVE":
+                    # Notify human and don't approve
+                    try:
+                        from .manager_tools import notify_user
+                        notify_user(
+                            service=self.service,
+                            run_id=run_id,
+                            message=(
+                                f"PR readiness: NEEDS_HUMAN. {readiness.summary} "
+                                f"Reasons: {'; '.join(readiness.reasons[:3])}"
+                            ),
+                            priority="high",
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
+                    return {
+                        "ok": False,
+                        "command": "auto-create-pr (readiness check)",
+                        "returncode": 1,
+                        "output": json.dumps({
+                            "verdict": readiness.verdict,
+                            "summary": readiness.summary,
+                            "reasons": readiness.reasons,
+                        }),
+                        "error": f"PR readiness: {readiness.verdict} — {readiness.summary}",
+                    }
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "PR readiness assessment failed for run=%s: %s. Proceeding with approval.",
+                    run_id,
+                    exc,
+                )
+
+        # Step 3: Approve PR
+        approve_result = self._run_cli([
+            "approve-open-pr",
+            "--run-id", run_id,
+            "--request-file", request_file,
+            "--confirm-token", confirm_token,
+            "--confirm",
+            "--allow-dod-bypass",
+        ])
+
+        # Notify about auto-creation
+        if approve_result["ok"]:
+            try:
+                from .manager_tools import notify_user
+                approve_payload = approve_result.get("payload") or {}
+                pr_url = str(approve_payload.get("pr_url") or "")
+                notify_user(
+                    service=self.service,
+                    run_id=run_id,
+                    message=f"PR auto-created: {pr_url}" if pr_url else "PR auto-created",
+                    priority="normal",
+                )
+            except Exception:  # noqa: BLE001
+                pass
+
+        return approve_result
+
+    def _run_pr_readiness_assessment(
+        self,
+        *,
+        run_id: str,
+        facts: ManagerRunFacts,
+        request_file: str,
+    ) -> "PRReadinessResult":
+        """Run the Manager LLM PR readiness assessment."""
+        from .manager_llm import PRReadinessResult  # noqa: F811
+
+        # Load PR body from request file
+        pr_body = ""
+        try:
+            request_data = json.loads(Path(request_file).read_text(encoding="utf-8"))
+            pr_body = str(request_data.get("body") or "")
+        except (OSError, json.JSONDecodeError):
+            pass
+
+        # Load code review artifact
+        code_review_art = self.service.latest_artifact(run_id, artifact_type="code_review")
+        cr_summary = ""
+        cr_verdict = "CLEAN"
+        cr_issues: list[dict[str, str]] = []
+        if code_review_art and isinstance(code_review_art, dict):
+            meta = code_review_art.get("metadata")
+            if isinstance(meta, dict):
+                cr_verdict = str(meta.get("verdict") or "CLEAN")
+                cr_summary = str(meta.get("summary") or "")
+                raw_issues = meta.get("issues")
+                if isinstance(raw_issues, list):
+                    cr_issues = [i for i in raw_issues if isinstance(i, dict)]
+
+        # Load worker evidence
+        evidence: dict[str, Any] = {}
+        try:
+            from .manager_tools import analyze_worker_output
+            evidence = analyze_worker_output(service=self.service, run_id=run_id)
+        except Exception:  # noqa: BLE001
+            pass
+
+        # Load repo PR template
+        pr_template = ""
+        workspace_dir = self.config.workspace_root / facts.repo
+        template_paths = [
+            workspace_dir / ".github" / "PULL_REQUEST_TEMPLATE.md",
+            workspace_dir / ".github" / "pull_request_template.md",
+            workspace_dir / "PULL_REQUEST_TEMPLATE.md",
+        ]
+        for tp in template_paths:
+            if tp.exists():
+                try:
+                    pr_template = tp.read_text(encoding="utf-8")[:3000]
+                except OSError:
+                    pass
+                break
+
+        # Load diff
+        diff_text = ""
+        if workspace_dir.exists():
+            try:
+                import subprocess as _sp
+                result = _sp.run(
+                    ["git", "diff", "HEAD~1..HEAD"],
+                    cwd=workspace_dir,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                diff_text = result.stdout[:6000]
+            except Exception:  # noqa: BLE001
+                pass
+
+        assert self._llm_client is not None
+        return self._llm_client.assess_pr_readiness(
+            project_name=facts.repo,
+            code_review_summary=cr_summary,
+            code_review_verdict=cr_verdict,
+            code_review_issues=cr_issues,
+            worker_evidence=evidence,
+            pr_body=pr_body,
+            pr_template=pr_template,
+            diff_text=diff_text,
+        )
 
     def _materialize_auto_contract(self, facts: ManagerRunFacts) -> str:
         if not self.config.auto_contract:
@@ -802,6 +1102,7 @@ class ManagerLoopRunner:
         _NOTIFY_KINDS = {
             ManagerActionKind.RUN_FINISH,
             ManagerActionKind.RETRY,
+            ManagerActionKind.AUTO_CREATE_PR,
         }
         if action.kind not in _NOTIFY_KINDS and ok:
             return
@@ -843,8 +1144,8 @@ class ManagerLoopRunner:
         """
         try:
             from .manager_tools import (
+                apply_skill_improvement,
                 detect_skill_improvement_proposals,
-                propose_skill_improvement,
             )
 
             # Extract grading info from the latest action that has classification data
@@ -877,22 +1178,24 @@ class ManagerLoopRunner:
                 grade=grade,
                 evidence=evidence,
             )
+            # Resolve skills source root and project root for auto-apply
+            skills_source_root = Path(__file__).resolve().parent.parent / "skills"
+            project_root = Path(__file__).resolve().parent.parent
+
             for proposal in proposals:
-                propose_skill_improvement(
+                result = apply_skill_improvement(
                     service=self.service,
                     run_id=proposal["run_id"],
-                    proposal_key=proposal["proposal_key"],
-                    skill_name=proposal["skill_name"],
-                    target_file=proposal["target_file"],
-                    lesson=proposal["lesson"],
-                    suggestion=proposal["suggestion"],
-                    evidence=proposal.get("evidence"),
+                    proposal=proposal,
+                    skills_source_root=skills_source_root,
+                    project_root=project_root,
                 )
                 logger.info(
-                    "skill_improvement_proposal: run=%s key=%s skill=%s",
+                    "skill_improvement: run=%s key=%s action=%s tier=%s",
                     run_id,
                     proposal["proposal_key"],
-                    proposal["skill_name"],
+                    result.get("action", "?"),
+                    result.get("tier", "?"),
                 )
         except Exception:  # noqa: BLE001
             pass  # Proposals are best-effort; never block the loop
