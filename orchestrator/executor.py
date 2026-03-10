@@ -163,6 +163,19 @@ class ScriptExecutor:
             return "main"
         return ref.split("/", 1)[1]
 
+    def fork_owner(self, repo_dir: Path) -> str:
+        """Extract owner from origin remote URL (e.g. 'Yiiii0' from 'https://github.com/Yiiii0/pipecat.git')."""
+        result = self._run(["git", "remote", "get-url", "origin"], cwd=repo_dir)
+        url = result.stdout.strip()
+        # Handle https://github.com/OWNER/REPO.git and git@github.com:OWNER/REPO.git
+        for prefix in ("https://github.com/", "git@github.com:"):
+            if url.startswith(prefix):
+                rest = url[len(prefix):]
+                parts = rest.rstrip("/").removesuffix(".git").split("/")
+                if parts:
+                    return parts[0]
+        return ""
+
     def run_create_pr(
         self,
         *,
@@ -172,6 +185,7 @@ class ScriptExecutor:
         base: str,
         head: str,
         draft: bool = False,
+        upstream_repo: str = "",
     ) -> CommandResult:
         cmd = [
             "gh",
@@ -186,6 +200,8 @@ class ScriptExecutor:
             "--head",
             head,
         ]
+        if upstream_repo:
+            cmd.extend(["--repo", upstream_repo])
         if draft:
             cmd.append("--draft")
         return self._run(cmd, cwd=repo_dir)

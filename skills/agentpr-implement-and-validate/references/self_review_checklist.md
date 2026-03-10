@@ -8,6 +8,11 @@ Run through EVERY item before reporting status. If any item fails, fix it before
 - [ ] No lock files modified (uv.lock, package-lock.json, bun.lockb, yarn.lock, poetry.lock, pnpm-lock.yaml) — `git checkout` to revert if so
 - [ ] No CI/workflow files modified unless explicitly required by contract
 
+## Reference Provider Check
+- [ ] Identified the **most similar** existing provider (aggregator → aggregator like OpenRouter, not random provider)
+- [ ] Read ALL similar providers before deciding which to copy
+- [ ] Used repo's extension mechanism (registry, factory, partial, config) if one exists — NOT standalone implementation
+
 ## Code Quality
 - [ ] Variable/class/function naming matches the nearest existing provider pattern in this repo
 - [ ] `base_url` default is `https://api.forge.tensorblock.co/v1` (not empty, not placeholder)
@@ -16,6 +21,16 @@ Run through EVERY item before reporting status. If any item fails, fix it before
 - [ ] If subclassing or reusing another provider class, use proper inheritance (NOT unbound method calls like `OtherClass.method(self, ...)`)
 - [ ] If similar providers define a default model, Forge should too (e.g. `openai/gpt-4o-mini`)
 - [ ] No hardcoded strings that couple to specific providers where the code should be generic
+- [ ] NOT mutating `os.environ` — pass API keys/base URLs via explicit kwargs, not environment variable assignment
+- [ ] All variables are initialized before use in ALL branches (no unbound variable risk in conditional paths)
+- [ ] Model detection uses `startswith("forge/")` prefix match, NOT `"/" in model_string`
+- [ ] If the repo uses `Literal[...]` for model names, extended to `Union[Literal[...], str]` (not just appending to Literal)
+
+## Downstream Impact Check
+- [ ] Searched for ALL callers/users of modified functions, types, and variables
+- [ ] If inserting into an `elif`/`if` dispatch chain: verified new branch does NOT shadow existing branches
+- [ ] If modifying an engine/handler class: verified the factory/router that dispatches to it is also updated
+- [ ] No parameter type or default value changes that break existing callers
 
 ## Docs & Contribution Rules
 - [ ] If CONTRIBUTING/PR template says "update docs" → docs ARE updated (README provider list, config docs, etc.)

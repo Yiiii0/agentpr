@@ -19,6 +19,7 @@ class ManagerActionKind(StrEnum):
     RUN_FINISH = "run_finish"
     RETRY = "retry"
     SYNC_GITHUB = "sync_github"
+    RUN_CODE_REVIEW = "run_code_review"
 
 
 @dataclass(frozen=True)
@@ -40,6 +41,8 @@ class ManagerRunFacts:
     retry_should_retry: bool | None = None
     retry_target_state: str | None = None
     state_entered_at: str | None = None
+    has_code_review: bool = False
+    code_review_verdict: str | None = None  # CLEAN | HAS_ISSUES
 
 
 @dataclass(frozen=True)
@@ -80,9 +83,20 @@ def decide_next_action(facts: ManagerRunFacts) -> ManagerAction:
         )
 
     if state == RunState.PUSHED:
+        if not facts.has_code_review:
+            return ManagerAction(
+                kind=ManagerActionKind.RUN_CODE_REVIEW,
+                reason="code pushed, running deep code review before PR creation",
+            )
+        if facts.code_review_verdict == "HAS_ISSUES":
+            return ManagerAction(
+                kind=ManagerActionKind.RETRY,
+                reason="code review found issues, worker should fix them",
+                metadata={"target_state": "ITERATING"},
+            )
         return ManagerAction(
             kind=ManagerActionKind.WAIT_HUMAN,
-            reason="awaiting PR gate decision",
+            reason="code review passed, awaiting PR gate decision",
         )
 
     if state == RunState.NEEDS_HUMAN_REVIEW:

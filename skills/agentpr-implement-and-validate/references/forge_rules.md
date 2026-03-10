@@ -19,9 +19,31 @@
 12. **Stop early on env issues** — 1-2 attempts max, then mark NEEDS REVIEW and move on.
 13. **Keep commit scope clean** — Never mix workflow file edits into target repo commits.
 
+## Reference Provider Selection (CRITICAL)
+
+Before writing ANY code, find the **most similar** existing provider to use as reference:
+
+- Forge is an aggregator/router (like OpenRouter, LiteLLM). Find OTHER aggregators in the repo first.
+- Do NOT pick a random provider in the same directory. Compare architectures:
+  - Aggregator → reference another aggregator (OpenRouter, LiteLLM, AiHubMix)
+  - If no aggregator exists → reference the provider with the closest base class or pattern
+- **Read ALL similar providers** before deciding which to copy. Do not stop after reading one.
+- Once you identify the reference, copy it **exactly** — same parameter order, same types, same defaults.
+
+## Repo Extension Mechanisms (prefer over standalone code)
+
+Before writing new classes or functions, check if the repo provides:
+- **Registry/factory pattern**: dict mapping, `@register` decorators, factory functions
+- **Config-driven**: YAML/JSON/env-based provider registration
+- **Subclass with base class**: `OpenAICompatibleAPI`, `BaseLLM`, etc.
+- **`functools.partial`**: parameterized wrappers
+
+If the repo has one of these → use it. Filling in a registry entry is safer than writing standalone code.
+If you MUST write standalone code → line-by-line compare with the reference provider. Add NOTHING the reference doesn't have.
+
 ## Common Pitfalls
 
-These are distilled from 8+ repo integrations. Each one cost significant debugging time.
+These are distilled from 17 repo integrations. Each one cost significant debugging time.
 
 - **"Copy the exception, not the rule"** — When a project has both a common path (litellm routing) and exceptions (dedicated functions for specific providers), ask WHY. If the common path supports Forge (it usually does), use the common path.
 - **Dependencies in unexpected places** — Some projects have deps in `requirements.txt` but not `pyproject.toml` (e.g., podcastfy + playwright). If imports fail after install, check `requirements.txt`.
@@ -34,3 +56,10 @@ These are distilled from 8+ repo integrations. Each one cost significant debuggi
 - **Missing env.example entries** — If a repo has `env.example` or `.env.example` with API keys for each provider, you MUST add `FORGE_API_KEY=your-api-key-here`. Forgetting this is a documentation gap.
 - **Unbound method calls** — Never call `OtherClass.method(self, args)` as a shortcut. Either properly subclass the provider or define the method locally. Fragile method binding is a code quality issue.
 - **Missing default model** — If every existing provider in the repo defines a default model, Forge should too. Use `openai/gpt-4o-mini` as the safe default.
+- **NEVER mutate `os.environ`** — Do not use `os.environ["OPENAI_API_KEY"] = forge_key` or `os.environ["OPENAI_API_BASE"] = forge_base`. This pollutes global process state and breaks other providers. Instead, pass credentials via explicit constructor kwargs (`api_key=`, `base_url=`) or module-level variables. If a framework requires env vars, use a context manager or subprocess.
+- **Model detection must use prefix match** — To check if a model is a Forge model, use `model.startswith("forge/")` or equivalent prefix match. NEVER use `"/" in model` — this matches ANY model string with a slash (e.g. `org/model`, `azure/gpt-4`), not just Forge models.
+- **Initialize all variables before conditional branches** — If a variable (e.g. `extra_headers`) is only set inside an `if` block but used after the block, it will be unbound when the condition is false. Always set a default value before the conditional.
+- **Extend `Literal` types to accept arbitrary strings** — If the repo defines model names as `Literal["gpt-4", "claude-3"]`, adding `"forge/xxx"` to the Literal is fragile. Use `Union[Literal[...], str]` to allow any model string while preserving existing type hints.
+- **elif chain mutual exclusivity** — When inserting a new `elif` branch into an existing dispatch chain, analyze ALL existing branches. Your new branch may shadow downstream branches. Example: `elif "/" in model_name` placed before `elif model_info` will intercept ALL models with `/` in their name, blocking 66% of known provider models. Always insert new branches AFTER more specific checks, not before.
+- **Factory/registry must be updated together with engine code** — If you add Forge detection to an engine class (e.g. `openai.py`), check whether a factory or router (e.g. `factory.py`) dispatches to that engine. If the factory doesn't know about Forge, your detection code is unreachable for most model names.
+- **Search downstream impact of all changes** — After modifying a function, type, or variable, search the entire codebase for other uses. A change to a type alias affects every function that uses it. A change to a dispatch chain affects every caller.

@@ -1,7 +1,7 @@
 # AgentPR Master Plan
 
-> 更新时间：2026-03-07
-> 状态：D3 边界修复完成。Test Run 7: 4/5 PASS+PUSHED tick 1。**下一步：D3.5 自我改进 + D4 运维化。**
+> 更新时间：2026-03-10
+> 状态：D3.9 完成（17/17 PR 深度 review + 4 代码修复 + code review gate 实装）。**下一步：D4 运维化。**
 > 归档：旧版详细记录在 `docs/AGENTPR_MASTER_PLAN_ARCHIVE_20260228_PRE_SLIM.md` 和 `docs/AGENTPR_MASTER_PLAN_ARCHIVE_20260225_PRE_REWRITE.md`
 
 ---
@@ -18,13 +18,13 @@
 
 ## 2. 当前主矛盾
 
-1. **管线端到端已验证且改进中。** D3 Test Run 7: 4/5 PASS+PUSHED tick 1（vs D2 Run 6: 3/5 tick 1 + 2/5 tick 2）。不再需要 auto-recovery。
-2. **主矛盾从"grading 架构"变为"Worker 自我改进"。** Grading 架构迁移已确认不需要（hybrid 是正确中间态）。真正的差距是 Worker 行为一致性：Paper2Poster 在 pip 失败后放弃验证，dexter/mem0 文档更新缺失。
-3. **自我改进机制是核心。** 每次测试发现的问题应该编码回 skill instructions，让 Worker 下次不犯同样错误。D3.5 完成了这一闭环：self_review_checklist 加强、validation_requirements 加强、forge_rules 增加新 pitfalls。
-4. **基础设施修复完成。** skills 自动升级（不再需要手动 --force），test infra 检测 ≥2 信号（防止 false positive）。Manager skill improvement proposal 系统已就位。
+1. **管线批量验证 + 深度 review 全部完成。** 22 repos, 19/22 PASS+PUSHED, 17 PRs submitted, 17/17 深度 review, 4 代码修复, 1 PR merged (octotools)。
+2. **Code review gate 已实装。** D3.9 发现的 code review gap 已通过 LLM code review 系统解决：`run-code-review` CLI + `review_code_changes()` manager tool + `code_review_checklist.md` 外部可迭代知识库。Manager 在 PUSHED 状态自动调用 review，发现问题 → ITERATING（Worker 修），修不好 → NEEDS_HUMAN。
+3. **Pipeline 产出质量问题已修复：** PR body 营销文本清理（pr_description_template.md）、LLM 生成 prompt 修复（用户视角 Usage、真实 Test Evidence、过滤内部 grading code）、Skill-2 编码 D3.9 全部 17 个 repo 的 review 经验。
+4. **主矛盾转向运维化（D4）。** 系统能正确产出代码和 PR，但需要常驻运行、持久化、用户交互闭环。
 5. **Forge 422 仍阻塞**：使用 Codex 原生 provider，不影响核心管线。
 
-**结论：自我改进闭环初步建立。下一步是验证改进效果 + D4 运维化。**
+**结论：Pipeline 质量链已闭环（Worker → Grading → Code Review → PR）。下一步：D4 运维化。**
 
 ---
 
@@ -148,6 +148,7 @@ QUEUED → EXECUTING → PUSHED → CI_WAIT → REVIEW_WAIT → DONE
 | **重试策略生成** | `_diagnose_failure()` → `RetryStrategy` → FAILED 决策分流 |
 | **Review comment 处理** | `triage_review_comment` → fix_code/reply_explain/ignore → ITERATING 决策分流 |
 | **全局运营汇报** | `get_global_stats` 接入 `/overview`：pass_rate、grade 分布、top reason_codes |
+| **PR Description 生成** | `generate_pr_description`：读取 repo PR template + commit diff + grading evidence → LLM 按 template 结构填充 PR body。无 template 时用默认 4 section（Summary/Changes/Usage/Test Evidence）。About Forge 固定拼接 |
 
 ### 5.2 不应使用 LLM（当前做法正确，保持）
 
@@ -195,6 +196,8 @@ QUEUED → EXECUTING → PUSHED → CI_WAIT → REVIEW_WAIT → DONE
 - 失败诊断：suggest_retry_strategy → should_retry + target_state
 - 全局统计：get_global_stats 接入 /overview（pass_rate、grade 分布、top reason_codes）
 - 通知：manager_notification artifact → Telegram 推送（含优先级标记）
+- PR Description 生成：LLM 读取 repo PR template + diff + evidence → 按 template 结构智能填充（含 checkbox）→ append About Forge
+- Code Review：`review_code_changes()` 深度 review（读 diff + changed files + sibling reference files + 外部 checklist）→ CLEAN/HAS_ISSUES verdict + structured issues
 
 ### D1.6 Pipeline 修复 + 边界安全网（2026-03-04）
 - **Decision audit logging**：rules/llm/guardrail 触发全记录 + facts_snapshot 字段
@@ -281,7 +284,33 @@ QUEUED → EXECUTING → PUSHED → CI_WAIT → REVIEW_WAIT → DONE
 
 **D3.5 自我改进修复完成：** skills 自动升级、test infra ≥2 信号、skill instructions 加强、manager skill improvement proposal 系统。
 
-**当前最大缺口：Worker 行为一致性（验证不可跳过）和运维化（D4）。**
+**D3.6 Test Run 8a 结果：7/7 PASS+PUSHED（repos #11-#34 subset）。** LLM PR Description 生成验证通过。
+- pipecat #3955, DeepCode #116, ai-gradio #28, openlit #1040, Absolute-Zero-Reasoner #34, PRIME #65, inspect_ai #3439
+
+**D3.7 Test Run 8b 结果：10/12 PASS+PUSHED（repos #35-#46）。**
+
+| Repo | Grade | Quality | PR | Notes |
+|------|-------|---------|-----|-------|
+| py-gpt | PASS | ⭐⭐⭐½ | #173 | 缺 docstrings |
+| Controllable-RAG-Agent | PASS | ⭐⭐⭐ | #26 | os.environ 污染（已本地修复） |
+| AgentFlow | PASS | ⭐⭐⭐⭐ | #37 | Clean |
+| DAMO-ConvAI | PASS | ⭐⭐½ | #226 | Literal type 硬编码（已本地修复） |
+| octotools | PASS | ⭐⭐½ | #53 | `"/" in model` 脆弱检测（已本地修复） |
+| kit | PASS | ⭐⭐⭐⭐ | #191 | Clean |
+| ragflow-plus | HUMAN_REVIEW | — | — | Worker 未写代码（branch=main） |
+| trustgraph | HUMAN_REVIEW | — | — | 212 files, 13902 insertions（upstream 污染） |
+| ScaleCUA | PASS | ⭐⭐⭐ | #18 | 代码重复但符合 repo pattern |
+| weave | PASS | ⭐⭐ | — | unbound variable bug（已本地修复） |
+| elasticsearch-labs | PASS | ⭐⭐⭐⭐ | #528 | Clean |
+| judgeval | PASS | ⭐⭐⭐ | #713 | 仅测试文件 |
+
+**累计指标（Test Run 6-8）：**
+- 总跑 22 repos, 19 PASS+PUSHED (86%), 3 HUMAN_REVIEW (14%)
+- 17 PRs 已提交到 upstream（2 CLA 问题，1 merged by maintainer）
+- 人工 code review 发现 4 个代码质量问题（均已修复+pushed）
+- 平均 worker attempt: 1.0（首次执行即 PASS）
+
+**D3.9 code review gate 已实装，Pipeline 质量链闭环（Worker → Grading → Code Review → PR）。下一步：D4 运维化。**
 
 ### 8.2 Orchestrator 不是"薄层"（不变，接受现实）
 
@@ -308,6 +337,10 @@ QUEUED → EXECUTING → PUSHED → CI_WAIT → REVIEW_WAIT → DONE
 | D2.5：Commit 质量修复 | **✅ 已完成** | — |
 | D3：边界修复 + Test Run 7 验证 | **✅ 已完成（4/5 PASS+PUSHED tick 1）** | — |
 | D3.5：自我改进闭环 | **✅ 已完成** | — |
+| D3.6：LLM PR Description 生成 | **✅ 已完成** | — |
+| D3.7：批量验证（19/22 repos） | **✅ 已完成** | — |
+| D3.8：Code review findings → skill update + skill-3 fix | **✅ 已完成** | — |
+| D3.9：17 PR 深度 review + code review gate 实装 | **✅ 已完成** | — |
 | **D4：运维化（常驻 + 持久化 + UX）** | **未做** | **⭐ 最高** |
 | D-forge：Forge 切回 | 等外部修复 | 独立 |
 
@@ -496,6 +529,20 @@ Forge 422 修复后验证并切回。独立于 D3/D4。
 44. **Metrics 有局限但可接受。** `git diff --numstat HEAD` 不包含新 untracked 文件（added_lines=0），但 changed_files_count 和 changed_files 列表已足够支撑 grading 决策。不需要额外计入 untracked 文件行数。
 45. **自我改进闭环 = 测试发现问题 → 编码回 skill instructions → 下次不犯。** 这是 AI centric 的核心：不是人写更多规则，而是每次运行的经验自动改善下一次的 worker 行为。Skills 是经验的持久化载体。
 46. **Grading 架构迁移不需要做（至少现在不需要）。** Hybrid grading（rules 提取证据 + heuristic 语义覆盖）在 5/5 repos 上正确工作。AI centric ≠ 所有东西都用 LLM。基础设施应该是确定性的，Agent 应该是智能的。
+47. **PR Description 不应傻拼接模板，应该让 LLM 读懂 template 后智能填充。** Repo PR template 是结构指引（section 顺序、checkbox、placeholder），不是要原样输出的内容。LLM 读 template + diff + evidence → 按 template 格式生成内容，比"raw template prepend + hardcoded stub"有效得多。
+
+**D3.7 批量验证后（19/22 PASS，16 PRs）：**
+48. **量化 grading 通过 ≠ 代码质量达标（升级版 #40）。** Grade=PASS 只验证了"改了文件、跑了测试、diff 在预算内"。不检查：unbound variable、os.environ 污染、脆弱的字符串检测逻辑。Pipeline 需要在 PUSHED → PR 之间加 code review gate（LLM diff review），或在 skill-2 中强化 self-review。
+49. **os.environ 全局污染是 Worker 常犯的反模式。** Worker 倾向于用 `os.environ["KEY"] = value` 来配置 API client，因为这是最简单的方式。但这会污染进程全局状态，影响其他 provider。正确做法：显式 kwargs 传参。需在 forge_rules 中明确禁止。
+50. **模型检测逻辑必须用 prefix match，不能用 substring。** `"/" in model_string` 会匹配任何带斜杠的模型名（如 `org/model`），不只是 `forge/xxx`。必须用 `startswith("forge/")` 或等价前缀匹配。
+51. **Preflight 对混合语言项目应宽容。** inspect_ai 是 Python 项目但有 yarn.lock，preflight 要求 yarn 在 PATH → 失败。修复：当 `uses_python and uses_js` 时，JS 工具链检查降级为 warning。
+52. **Skill-3 的 prompt 必须区分 integration 和 iteration。** `render_skill_chain_prompt()` 对所有 state 都发送 "integrate Forge" prompt，导致 ITERATING 状态下 worker 无法正确理解任务是"fix CI / address review comments"。需要 state-aware prompt routing。
+
+**D3.9 深度 review + code review gate 后：**
+53. **Pipeline 需要 code review gate（定量 grading ≠ 定性审查）。** 17/17 深度 review 发现 4 个逻辑 bug，全部通过了 grading（PASS）。Grading 只检查"改了文件、跑了测试、diff 在预算内"，不检查 elif 路由正确性、factory 注册完整性、类型兼容性。解决：在 PUSHED → PR 之间插入 LLM code review gate（`run-code-review` CLI + `review_code_changes()` manager tool + `code_review_checklist.md` 外部知识库）。
+54. **Worker 无法执行代码结构重排。** weave elif block reordering：即使 task packet 详细描述了 root cause（elif mutual exclusivity）和 fix approach（swap blocks），Worker 只添加了变量初始化（`extra_headers = {}`），未重排 elif 顺序。Worker 擅长"添加新代码"，不擅长"重组已有代码的逻辑结构"。这类 fix 需要 NEEDS_HUMAN 升级或更强的 Worker 指令。
+55. **Review 经验必须编码到可持久化的外部文件。** 17 个 repo 的 review 发现了 9 类系统性问题（reference provider alignment、dispatch chain integrity、env var handling 等）。这些经验编码到 `code_review_checklist.md`（外部可迭代）+ `forge_rules.md`（Worker skill-2 instructions）+ `self_review_checklist.md`（Worker 自检）。三层防线：Worker 自检 → Manager code review → Human gate。
+56. **PR body 不应包含营销文本。** About Forge 模板原含 Motivation、Why Forge、Key Benefits sections，被多个 repo maintainer 视为低质量贡献信号。清理后仅保留：About Forge 标准描述 + maintenance disclosure + References。LLM 生成的 Usage 和 Test Evidence 也需从用户视角（env vars/CLI/config），不是内部实现视角。
 
 ---
 
@@ -722,6 +769,73 @@ OpenHands V1 SDK（2025）的架构选择：
 - Skill-1 analysis_checklist：env.example + changelog convention 检查
 
 **Grading 架构迁移延期**：hybrid grading 是正确中间态。AI centric ≠ all LLM，基础设施应确定性。
+
+### Phase D3.6：LLM PR Description 生成 — ✅ 已完成
+
+**变更内容：**
+1. `manager_llm.py`：新增 `generate_pr_description()` — 接收 diff + evidence + repo PR template，LLM 按 template 结构填充（有 template → 遵循 template heading/checkbox/section；无 template → 默认 Summary/Changes/Usage/Test Evidence）
+2. `cli.py`：`request-open-pr` handler 在无 `--body` 时自动调用 LLM 生成。新增 `--skip-llm-body`、`--llm-model` 参数。LLM 生成成功时跳过 raw template prepend（避免重复）
+3. `cli_pr.py`：`_load_about_forge_text()` 剥离 `## Changes` section（LLM 生成更好的版本）
+4. `pr_description_template.md`：移除 `## Changes` section（保留 About Forge + Motivation + Why Forge + Key Benefits + References）
+
+**数据流：** `request-open-pr` → load PR template + git diff + digest evidence → LLM `generate_pr_description()` → append About Forge → PR body。Fallback：LLM 失败 → `_build_manager_pr_body_stub()` 静态模板。
+
+### Phase D3.7：批量验证 — ✅ 已完成（2026-03-08）
+
+**规模：** 22 repos（#11-#34 subset + #35-#46 全部），19/22 PASS+PUSHED，16 PRs 已提交 upstream。
+
+**修复的 Pipeline Bug：**
+1. `runtime_analysis.py`：DoD gate contract check — `actual_mode == "agentpr"` 替代 `!= "agentpr_autonomous"`（空 mode 不再误触 missing_contract）
+2. `preflight.py`：Python+JS 混合项目 JS 工具检查降级为 warning（inspect_ai yarn.lock 问题）
+
+**人工 Code Review 发现的代码质量问题（4 个，已本地修复）：**
+1. weave：`extra_headers` unbound variable（条件分支遗漏初始化）
+2. octotools：`"/" in model_string` 误匹配所有带斜杠模型名 → 改为 `startswith("forge/")`
+3. DAMO-ConvAI：`LLM_Name = Literal[...]` 硬编码 → 改为 `Union[Literal[...], str]` + FORGE_API_KEY validation
+4. Controllable-RAG-Agent：`os.environ` 全局污染 → 改为 module-level vars + explicit kwargs
+
+**3 个 HUMAN_REVIEW 根因：**
+- ragflow-plus：Worker 完全没写代码（branch=main，无 Forge commit）
+- trustgraph：workspace 拉了 212 files upstream changes → 非 Forge 代码
+- weave：代码有 bug（已修复但未提交 PR）
+
+**关键发现 → D3.8 行动：**
+- Pipeline 缺 code review gate：grading 只做量化（diff/test），不做定性审查（逻辑正确性）
+- Skill-3 prompt gap：ITERATING 状态用 integration prompt 而不是 fix prompt
+- Skill-2 需编码新的反模式到 forge_rules 和 self_review_checklist
+
+### Phase D3.8：Code Review 修复 — ✅ 已完成（2026-03-08）
+
+**完成内容：**
+1. Push 4 个 repo 的本地修复（DAMO-ConvAI Union type、pipecat os.getenv、octotools factory routing、Controllable-RAG-Agent os.environ）
+2. 更新 skill-2 instructions：`forge_rules.md`（+4 rules: no os.environ mutation, prefix match, initialize vars, Union type）+ `self_review_checklist.md`（+4 items）
+3. 修复 `render_skill_chain_prompt()`：ITERATING 状态专用 prompt（CI fix / review response，不再发送 "integrate Forge"）
+4. `preflight.py`：Python+JS 混合项目 JS 工具检查降级为 warning
+5. `runtime_analysis.py`：DoD gate contract check 修复（`actual_mode == "agentpr"`）
+
+### Phase D3.9：深度 Review + Code Review Gate — ✅ 已完成（2026-03-10）
+
+**完成内容：**
+
+**A1 — PR body 质量修复：**
+- `pr_description_template.md`：移除 Motivation/Why Forge/Key Benefits 营销文本，仅保留 About Forge 标准描述 + maintenance disclosure + References
+
+**A2 — LLM PR description prompt 修复：**
+- `manager_llm.py`：Usage section 改为用户视角（env vars/CLI/config）、Test Evidence 改为真实命令+结果、过滤内部 grading keys（reason_code/next_action/semantic/grade 等）
+
+**A3 — Skill-2 编码 review 经验：**
+- `forge_rules.md`：+Reference Provider Selection (CRITICAL) section、+Repo Extension Mechanisms section、+3 new pitfalls（elif chain、factory/registry、downstream impact）
+- `self_review_checklist.md`：+Reference Provider Check section、+Downstream Impact Check section
+
+**A4 — Code Review Gate 系统（核心新增）：**
+- `forge_integration/code_review_checklist.md`（NEW）：7 sections 编码 17 repo review 经验，含 severity classification（HIGH/MEDIUM/LOW）
+- `manager_llm.py`：`CodeReviewIssue`/`CodeReviewResult` dataclasses + `review_code_changes()` 方法（读 diff + changed files + sibling reference files + checklist → structured verdict）
+- `cli.py`：`run-code-review` subparser + `_run_code_review()` handler（~130 lines）
+- `manager_decision.py`：PUSHED 状态新规则（no review → RUN_CODE_REVIEW、HAS_ISSUES → RETRY to ITERATING、CLEAN → WAIT_HUMAN for PR gate）
+- `manager_loop.py`：code_review artifact lookup in `_build_run_facts()` + dispatch handler
+
+**Weave #6297 修复：**
+- Worker commit（只加 `extra_headers = {}`）已 reset，正确 elif 重排已 commit（3a0529d）+ force push
 
 ### Phase D4：运维化（D3 之后）
 

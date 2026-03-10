@@ -30,6 +30,8 @@ from .cli_inspect import (
     write_skills_feedback_markdown,
 )
 from .cli_pr import (
+    _build_manager_pr_body_stub,
+    _load_repo_pr_template_text,
     build_request_open_pr_body,
     read_pr_open_request,
     resolve_external_read_only_paths,
@@ -50,6 +52,7 @@ from .db import Database
 from .executor import ScriptExecutor
 from .github_webhook import run_github_webhook_server
 from .manager_loop import ManagerLoopConfig, ManagerLoopRunner
+from .manager_llm import ManagerLLMClient, ManagerLLMError
 from .manager_tools import analyze_worker_output, get_global_stats, notify_user
 from .models import (
     AgentRuntimeGrade,
@@ -124,6 +127,226 @@ DEFAULT_WORKSPACE_ROOT = Path(
 DEFAULT_INTEGRATION_ROOT = PROJECT_ROOT / "forge_integration"
 DEFAULT_SKILLS_SOURCE_ROOT = PROJECT_ROOT / "skills"
 DEFAULT_POLICY_PATH = PROJECT_ROOT / "orchestrator" / "manager_policy.json"
+
+
+def _generate_pr_body_with_llm(
+    *,
+    repo_dir: Path,
+    run_id: str,
+    project_name: str,
+    service: OrchestratorService,
+    llm_model: str | None = None,
+) -> str:
+    """Try to generate PR description via LLM. Returns empty string on failure."""
+    import subprocess
+
+    try:
+        diff_result = subprocess.run(
+            ["git", "diff", "HEAD~1..HEAD"],
+            cwd=str(repo_dir),
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        diff_text = (diff_result.stdout or "")[:4000]
+        stat_result = subprocess.run(
+            ["git", "show", "--stat", "HEAD"],
+            cwd=str(repo_dir),
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        diff_stat = (stat_result.stdout or "")[:2000]
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+
+    if not diff_text.strip():
+        return ""
+
+    # Load repo PR template (LLM will follow its structure)
+    _, pr_template_text = _load_repo_pr_template_text(repo_dir)
+
+    # Load digest artifact for evidence
+    evidence: dict[str, Any] = {}
+    digest_payload, _ = rt.load_digest_artifact_payload(service, run_id=run_id)
+    if isinstance(digest_payload, dict):
+        classification = digest_payload.get("classification")
+        if isinstance(classification, dict):
+            evidence["grade"] = classification.get("grade", "")
+            evidence["reason_code"] = classification.get("reason_code", "")
+        evidence["test_commands"] = digest_payload.get("test_commands", [])
+        evidence["changed_files"] = digest_payload.get("changed_files", [])
+
+    try:
+        client = ManagerLLMClient.from_runtime(
+            api_base=None,
+            model=llm_model,
+            timeout_sec=30,
+            api_key_env="AGENTPR_MANAGER_API_KEY",
+        )
+        return client.generate_pr_description(
+            project_name=project_name,
+            diff_text=diff_text,
+            diff_stat=diff_stat,
+            evidence=evidence,
+            pr_template=pr_template_text,
+        )
+    except (ManagerLLMError, Exception):  # noqa: BLE001
+        return ""
+
+
+def _run_code_review(
+    *,
+    repo_dir: Path,
+    run_id: str,
+    project_name: str,
+    service: OrchestratorService,
+    llm_model_override: str | None = None,
+) -> dict[str, Any]:
+    """Run LLM-based deep code review on pushed changes.
+
+    Reads the diff, changed files, sibling reference files, and the review
+    checklist, then sends everything to the LLM for structured review.
+    """
+    import subprocess
+
+    # 1. Get git diff
+    try:
+        diff_result = subprocess.run(
+            ["git", "diff", "HEAD~1..HEAD"],
+            cwd=str(repo_dir),
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        diff_text = diff_result.stdout or ""
+        stat_result = subprocess.run(
+            ["git", "diff", "--name-only", "HEAD~1..HEAD"],
+            cwd=str(repo_dir),
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        changed_file_paths = [
+            f.strip() for f in stat_result.stdout.strip().splitlines() if f.strip()
+        ]
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {"ok": False, "error": f"git_error: {exc}"}
+
+    if not diff_text.strip():
+        return {"ok": True, "verdict": "CLEAN", "summary": "No diff to review."}
+
+    # 2. Read changed files content
+    changed_files_content: dict[str, str] = {}
+    for fpath in changed_file_paths:
+        full_path = repo_dir / fpath
+        if full_path.is_file() and full_path.stat().st_size < 100_000:
+            try:
+                changed_files_content[fpath] = full_path.read_text(
+                    encoding="utf-8", errors="replace"
+                )
+            except OSError:
+                pass
+
+    # 3. Read sibling files (potential reference providers)
+    sibling_files_content: dict[str, str] = {}
+    seen_dirs: set[str] = set()
+    code_extensions = {".py", ".ts", ".tsx", ".js", ".jsx"}
+    for fpath in changed_file_paths:
+        full_path = repo_dir / fpath
+        if full_path.suffix not in code_extensions:
+            continue
+        parent = full_path.parent
+        parent_key = str(parent)
+        if parent_key in seen_dirs:
+            continue
+        seen_dirs.add(parent_key)
+        if not parent.is_dir():
+            continue
+        sibling_count = 0
+        for sibling in sorted(parent.iterdir()):
+            if sibling_count >= 5:
+                break
+            if not sibling.is_file():
+                continue
+            if sibling.suffix not in code_extensions:
+                continue
+            rel = str(sibling.relative_to(repo_dir))
+            if rel in changed_files_content:
+                continue  # skip files we already have
+            if sibling.stat().st_size > 80_000:
+                continue
+            try:
+                sibling_files_content[rel] = sibling.read_text(
+                    encoding="utf-8", errors="replace"
+                )
+                sibling_count += 1
+            except OSError:
+                pass
+
+    # 4. Load review checklist
+    checklist_path = DEFAULT_INTEGRATION_ROOT / "code_review_checklist.md"
+    checklist = ""
+    if checklist_path.is_file():
+        try:
+            checklist = checklist_path.read_text(encoding="utf-8")
+        except OSError:
+            pass
+    if not checklist:
+        checklist = "No review checklist available. Use your best judgment."
+
+    # 5. Call LLM reviewer
+    try:
+        client = ManagerLLMClient.from_runtime(
+            api_base=None,
+            model=llm_model_override,
+            timeout_sec=60,
+            api_key_env="AGENTPR_MANAGER_API_KEY",
+        )
+        result = client.review_code_changes(
+            project_name=project_name,
+            diff_text=diff_text,
+            changed_files_content=changed_files_content,
+            sibling_files_content=sibling_files_content,
+            checklist=checklist,
+        )
+    except (ManagerLLMError, Exception) as exc:  # noqa: BLE001
+        return {
+            "ok": False,
+            "error": f"llm_review_failed: {exc}",
+            "fallback": "Review could not be completed. Proceed with caution.",
+        }
+
+    # 6. Store review result as artifact
+    review_data = {
+        "verdict": result.verdict,
+        "issues": [
+            {
+                "severity": i.severity,
+                "file": i.file,
+                "description": i.description,
+                "suggested_fix": i.suggested_fix,
+            }
+            for i in result.issues
+        ],
+        "reference_provider": result.reference_provider,
+        "summary": result.summary,
+    }
+    service.add_artifact(
+        run_id,
+        artifact_type="code_review",
+        uri=f"inline://code_review/{run_id}",
+        metadata=review_data,
+    )
+
+    return {
+        "ok": True,
+        "run_id": run_id,
+        **review_data,
+        "high_issue_count": sum(1 for i in result.issues if i.severity == "HIGH"),
+        "medium_issue_count": sum(1 for i in result.issues if i.severity == "MEDIUM"),
+        "low_issue_count": sum(1 for i in result.issues if i.severity == "LOW"),
+    }
 
 
 def resolve_default_worker_prompt_file() -> Path:
@@ -579,6 +802,16 @@ def build_parser() -> argparse.ArgumentParser:
     f.add_argument("--project")
     f.add_argument("--commit-title")
 
+    cr = sub.add_parser(
+        "run-code-review",
+        help="Run LLM-based deep code review on pushed changes before PR creation",
+    )
+    cr.add_argument("--run-id", required=True)
+    cr.add_argument(
+        "--llm-model",
+        help="Override LLM model for code review.",
+    )
+
     ro = sub.add_parser(
         "request-open-pr",
         help="Create a pending PR-open request with confirmation token",
@@ -606,6 +839,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--skip-about-forge",
         action="store_true",
         help="Skip appending the shared About Forge section.",
+    )
+    ro.add_argument(
+        "--skip-llm-body",
+        action="store_true",
+        help="Skip LLM-based PR description generation; use static stub instead.",
+    )
+    ro.add_argument(
+        "--llm-model",
+        help="Override LLM model for PR description generation.",
     )
     ro.add_argument("--draft", action="store_true", help="Create draft PR")
     ro.add_argument(
@@ -2325,6 +2567,28 @@ def main() -> int:
             )
             return 0
 
+        if args.command == "run-code-review":
+            snapshot = service.get_run_snapshot(args.run_id)
+            run = snapshot["run"]
+            current_state = RunState(snapshot["state"])
+            if current_state != RunState.PUSHED:
+                raise ValueError(
+                    "run-code-review is allowed only when run state is PUSHED."
+                )
+            repo_dir = Path(run["workspace_dir"])
+            if not repo_dir.exists():
+                raise ValueError(f"Workspace not found: {repo_dir}")
+
+            review_result = _run_code_review(
+                repo_dir=repo_dir,
+                run_id=args.run_id,
+                project_name=str(run.get("repo") or "unknown"),
+                service=service,
+                llm_model_override=getattr(args, "llm_model", None),
+            )
+            print_json(review_result)
+            return 0
+
         if args.command == "request-open-pr":
             snapshot = service.get_run_snapshot(args.run_id)
             run = snapshot["run"]
@@ -2345,14 +2609,33 @@ def main() -> int:
                 if args.project_name is not None
                 else repo_dir.name
             )
+            # If no user body provided, try LLM generation
+            llm_body_used = False
+            if not user_body and not bool(getattr(args, "skip_llm_body", False)):
+                llm_body = _generate_pr_body_with_llm(
+                    repo_dir=repo_dir,
+                    run_id=args.run_id,
+                    project_name=project_name,
+                    service=service,
+                    llm_model=getattr(args, "llm_model", None),
+                )
+                if llm_body:
+                    user_body = llm_body
+                    llm_body_used = True
+                else:
+                    user_body = _build_manager_pr_body_stub(project_name=project_name)
+            # When LLM generated the body it already incorporated the repo
+            # PR template, so skip raw prepend to avoid duplication.
+            skip_prepend = llm_body_used or bool(args.skip_repo_pr_template)
             body, body_meta = build_request_open_pr_body(
                 repo_dir=repo_dir,
                 integration_root=Path(args.integration_root),
                 user_body=user_body,
                 project_name=project_name,
-                prepend_repo_pr_template=not bool(args.skip_repo_pr_template),
+                prepend_repo_pr_template=not skip_prepend,
                 append_about_forge=not bool(args.skip_about_forge),
             )
+            body_meta["llm_body_generated"] = llm_body_used
             if not body.strip():
                 raise ValueError(
                     "PR body is empty after composition. "
@@ -2500,13 +2783,20 @@ def main() -> int:
                     f"checks={details}"
                 )
 
+            upstream_repo = f"{run['owner']}/{run['repo']}"
+            head_ref = str(request_payload["head"])
+            # Qualify head with fork owner for cross-fork PRs
+            fork_owner = executor.fork_owner(repo_dir)
+            if fork_owner and ":" not in head_ref:
+                head_ref = f"{fork_owner}:{head_ref}"
             result = executor.run_create_pr(
                 repo_dir=repo_dir,
                 title=str(request_payload["title"]),
                 body=str(request_payload["body"]),
                 base=str(request_payload["base"]),
-                head=str(request_payload["head"]),
+                head=head_ref,
                 draft=bool(request_payload["draft"]),
+                upstream_repo=upstream_repo,
             )
             service.add_step_attempt(
                 args.run_id,

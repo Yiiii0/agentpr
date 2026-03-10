@@ -76,6 +76,23 @@ class RetryStrategy:
     raw: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class CodeReviewIssue:
+    severity: str  # HIGH | MEDIUM | LOW
+    file: str
+    description: str
+    suggested_fix: str
+
+
+@dataclass(frozen=True)
+class CodeReviewResult:
+    verdict: str  # CLEAN | HAS_ISSUES
+    issues: list[CodeReviewIssue]
+    reference_provider: str
+    summary: str
+    raw: dict[str, Any]
+
+
 class ManagerLLMClient:
     def __init__(self, config: ManagerLLMConfig) -> None:
         self.config = config
@@ -765,6 +782,142 @@ class ManagerLLMClient:
         )
 
     # ------------------------------------------------------------------
+    # generate_pr_description
+    # ------------------------------------------------------------------
+
+    _PR_DESCRIPTION_SYSTEM_PROMPT_WITH_TEMPLATE = (
+        "You are writing a PR description for an open-source integration contribution.\n"
+        "This PR adds Forge (an open-source LLM inference middleware) as a new provider to {project_name}.\n\n"
+        "The repository provides a PR template (shown below). You MUST follow its structure:\n"
+        "- Fill in every section the template defines, using the commit diff and test evidence.\n"
+        "- If the template has checkboxes (e.g. `- [ ] Tests pass`), check them (`- [x]`) or leave unchecked based on evidence.\n"
+        "- If the template has placeholder text (e.g. `<!-- describe changes -->`), replace it with real content.\n"
+        "- Preserve the template's heading hierarchy and section order.\n"
+        "- If a template section is not applicable, write 'N/A' rather than omitting it.\n\n"
+        "After filling the template, append this exact line at the end:\n"
+        "I work at TensorBlock and will help maintain this integration.\n\n"
+        "Rules:\n"
+        "- Be technical, not marketing. No superlatives.\n"
+        "- Lead with what the code does, not what Forge is.\n"
+        "- Use the actual class names, function names, and file paths from the diff.\n"
+        '- Do NOT include "About Forge", "Motivation", or "Why Forge" sections — those are appended separately.\n'
+        "- Usage section MUST be from a USER's perspective: environment variables to set and "
+        "how to invoke/configure the integration (CLI command, config file entry, or constructor call). "
+        "Do NOT show internal implementation functions that users never call directly.\n"
+        "- Test Evidence: describe what test commands actually ran and their results "
+        "(e.g. 'pytest ran 874 tests, all passed'). Do NOT output system internal codes or grading metadata.\n"
+        "- Keep total output under 500 words.\n\n"
+        "--- PR TEMPLATE ---\n{pr_template}\n--- END PR TEMPLATE ---"
+    )
+
+    _PR_DESCRIPTION_SYSTEM_PROMPT_DEFAULT = (
+        "You are writing a PR description for an open-source integration contribution.\n"
+        "This PR adds Forge (an open-source LLM inference middleware) as a new provider to {project_name}.\n\n"
+        "Based on the commit diff and test evidence, generate ONLY these sections in markdown:\n\n"
+        "## Summary\n"
+        "1-2 sentences. Lead with what the code does technically.\n"
+        'Example: "Adds ForgeAPI class extending OpenAICompatibleAPI, routing requests '
+        "through Forge's OpenAI-compatible API endpoint.\"\n\n"
+        "## Changes\n"
+        "Per-file, one line each. Use actual filenames from the diff.\n"
+        "Example:\n"
+        "- `src/services/forge/llm.py`: New ForgeAPI class with settings and model resolution\n"
+        "- `env.example`: Added FORGE_API_KEY and FORGE_API_BASE entries\n\n"
+        "## Usage\n"
+        "Show how a USER configures and uses Forge with this project. This means:\n"
+        "- Environment variables to set (FORGE_API_KEY, optionally FORGE_API_BASE)\n"
+        "- The user-facing command, config entry, or constructor call to select Forge\n"
+        "- Example model name format if applicable (e.g. `Provider/model-name`)\n"
+        "Do NOT show internal implementation functions, routing logic, or private methods. "
+        "If the project is a CLI tool, show the CLI command. If it's a library, show the import + instantiation. "
+        "If it's a GUI app, describe the configuration steps.\n\n"
+        "## Test Evidence\n"
+        "Describe what test/validation commands were actually executed and their results.\n"
+        "Example: 'Ran `pytest tests/` — 874 tests passed, 0 failed.'\n"
+        "Do NOT output internal grading codes, reason codes, or system metadata. "
+        "Only describe what a developer would see when running the tests.\n\n"
+        "Then add this exact line:\n"
+        "I work at TensorBlock and will help maintain this integration.\n\n"
+        "Rules:\n"
+        "- Be technical, not marketing. No superlatives.\n"
+        "- Lead with what the code does, not what Forge is.\n"
+        "- Use the actual class names, function names, and file paths from the diff.\n"
+        '- Do NOT include "About Forge", "Motivation", or "Why Forge" sections.\n'
+        "- Keep total output under 400 words."
+    )
+
+    def generate_pr_description(
+        self,
+        *,
+        project_name: str,
+        diff_text: str,
+        diff_stat: str,
+        evidence: dict[str, Any],
+        pr_template: str = "",
+    ) -> str:
+        """Generate diff-aware PR description sections via LLM.
+
+        When *pr_template* is provided the LLM follows its structure and fills
+        in sections / checkboxes.  Otherwise it falls back to a default
+        4-section layout (Summary / Changes / Usage / Test Evidence).
+        """
+        pr_template_text = (pr_template or "").strip()
+        if pr_template_text:
+            system_prompt = self._PR_DESCRIPTION_SYSTEM_PROMPT_WITH_TEMPLATE.format(
+                project_name=project_name,
+                pr_template=pr_template_text,
+            )
+        else:
+            system_prompt = self._PR_DESCRIPTION_SYSTEM_PROMPT_DEFAULT.format(
+                project_name=project_name,
+            )
+        # Filter evidence to only include user-facing information.
+        # Strip internal grading codes and system metadata that the LLM
+        # would otherwise echo into the PR body.
+        filtered_evidence: dict[str, Any] = {}
+        _internal_keys = {
+            "reason_code", "next_action", "semantic", "grade",
+            "artifact_type", "artifact_uri", "ok", "run_id",
+        }
+        for k, v in evidence.items():
+            if k in _internal_keys:
+                continue
+            if isinstance(v, dict):
+                filtered_evidence[k] = {
+                    sk: sv for sk, sv in v.items() if sk not in _internal_keys
+                }
+            else:
+                filtered_evidence[k] = v
+        user_content = json.dumps(
+            {
+                "diff_stat": diff_stat[:2000],
+                "diff": diff_text[:4000],
+                "evidence": filtered_evidence,
+            },
+            ensure_ascii=True,
+        )
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ]
+        payload = {
+            "model": self.config.model,
+            "temperature": 0.3,
+            "messages": messages,
+        }
+        data = self._request_chat_completion(payload)
+        choices = data.get("choices")
+        if not isinstance(choices, list) or not choices:
+            raise ManagerLLMError("pr description: missing choices")
+        message = (choices[0] or {}).get("message")
+        if not isinstance(message, dict):
+            raise ManagerLLMError("pr description: missing message")
+        text = self._extract_text_content(message.get("content"))
+        if not text:
+            raise ManagerLLMError("pr description: empty content")
+        return text
+
+    # ------------------------------------------------------------------
     # triage_review_comment
     # ------------------------------------------------------------------
 
@@ -1002,5 +1155,194 @@ class ManagerLLMClient:
             modified_instructions=modified_instructions,
             reason=reason or "retry strategy decision",
             confidence=confidence,
+            raw=raw,
+        )
+
+    # ------------------------------------------------------------------
+    # review_code_changes — deep code review before PR creation
+    # ------------------------------------------------------------------
+
+    _CODE_REVIEW_SYSTEM_PROMPT = (
+        "You are a senior code reviewer evaluating a Forge integration PR for {project_name}.\n\n"
+        "Your job is to find bugs, pattern violations, and downstream breakage that automated "
+        "tests cannot catch. You have access to:\n"
+        "1. The git diff (what changed)\n"
+        "2. The full content of each changed file (for context)\n"
+        "3. Sibling files in the same directories (potential reference providers)\n"
+        "4. A review checklist encoding lessons from 17 previous integration reviews\n\n"
+        "IMPORTANT REVIEW APPROACH:\n"
+        "- For each changed file, identify the MOST SIMILAR existing provider in the repo "
+        "and compare line-by-line.\n"
+        "- Check if the Forge code inserts into any dispatch chain (if/elif/match). If so, "
+        "analyze whether it shadows existing branches.\n"
+        "- Check if a factory, router, or registry needs to be updated but wasn't.\n"
+        "- Search for downstream callers of any modified functions/types.\n"
+        "- Check environment variable handling against the reference provider.\n\n"
+        "--- REVIEW CHECKLIST ---\n{checklist}\n--- END CHECKLIST ---\n\n"
+        "Return a JSON object with:\n"
+        "- verdict: 'CLEAN' or 'HAS_ISSUES'\n"
+        "- issues: array of {{severity: 'HIGH'|'MEDIUM'|'LOW', file: string, "
+        "description: string, suggested_fix: string}}\n"
+        "- reference_provider: which existing provider you compared against\n"
+        "- summary: 1-2 sentence overall assessment\n\n"
+        "Only flag real issues. Do NOT flag pre-existing repo patterns that are not "
+        "introduced by this PR. Focus on: does the Forge code break anything? "
+        "Does it match the repo's patterns?"
+    )
+
+    def review_code_changes(
+        self,
+        *,
+        project_name: str,
+        diff_text: str,
+        changed_files_content: dict[str, str],
+        sibling_files_content: dict[str, str],
+        checklist: str,
+    ) -> CodeReviewResult:
+        """Deep code review of worker-produced changes.
+
+        Args:
+            project_name: The repository name.
+            diff_text: Full git diff output.
+            changed_files_content: {filepath: content} for each changed file.
+            sibling_files_content: {filepath: content} for reference provider files.
+            checklist: The code review checklist markdown.
+
+        Returns:
+            CodeReviewResult with verdict, issues, and summary.
+        """
+        system_prompt = self._CODE_REVIEW_SYSTEM_PROMPT.format(
+            project_name=project_name,
+            checklist=checklist,
+        )
+
+        # Build user content with all context
+        user_parts: list[str] = []
+        user_parts.append("=== GIT DIFF ===")
+        user_parts.append(diff_text[:8000])
+        user_parts.append("\n=== CHANGED FILES (full content) ===")
+        for fpath, content in changed_files_content.items():
+            user_parts.append(f"\n--- {fpath} ---")
+            user_parts.append(content[:6000])
+        user_parts.append("\n=== SIBLING FILES (reference providers) ===")
+        for fpath, content in sibling_files_content.items():
+            user_parts.append(f"\n--- {fpath} ---")
+            user_parts.append(content[:6000])
+
+        user_content = "\n".join(user_parts)
+        # Truncate to stay within reasonable token limits
+        if len(user_content) > 60000:
+            user_content = user_content[:60000] + "\n... (truncated)"
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ]
+
+        tool_schema = {
+            "type": "function",
+            "function": {
+                "name": "submit_code_review",
+                "description": "Submit the code review results.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "verdict": {
+                            "type": "string",
+                            "enum": ["CLEAN", "HAS_ISSUES"],
+                            "description": "Overall review verdict.",
+                        },
+                        "issues": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "severity": {
+                                        "type": "string",
+                                        "enum": ["HIGH", "MEDIUM", "LOW"],
+                                    },
+                                    "file": {"type": "string"},
+                                    "description": {"type": "string"},
+                                    "suggested_fix": {"type": "string"},
+                                },
+                                "required": ["severity", "file", "description", "suggested_fix"],
+                            },
+                            "description": "List of issues found. Empty if CLEAN.",
+                        },
+                        "reference_provider": {
+                            "type": "string",
+                            "description": "Which existing provider was used as reference.",
+                        },
+                        "summary": {
+                            "type": "string",
+                            "description": "1-2 sentence overall assessment.",
+                        },
+                    },
+                    "required": ["verdict", "issues", "reference_provider", "summary"],
+                },
+            },
+        }
+
+        payload = {
+            "model": self.config.model,
+            "temperature": 0,
+            "messages": messages,
+            "tools": [tool_schema],
+            "tool_choice": {"type": "function", "function": {"name": "submit_code_review"}},
+        }
+
+        try:
+            data = self._request_chat_completion(payload)
+            return self._code_review_from_payload(self._extract_tool_call_payload(data), data)
+        except ManagerLLMError as exc:
+            if not self._should_try_json_fallback(exc):
+                raise
+            parsed = self._request_json_fallback(
+                messages=messages,
+                schema_instruction=(
+                    "Return ONLY one compact JSON object with fields: "
+                    "verdict ('CLEAN' or 'HAS_ISSUES'), "
+                    "issues (array of {severity, file, description, suggested_fix}), "
+                    "reference_provider (string), summary (string)."
+                ),
+            )
+            return self._code_review_from_payload(parsed, {"fallback_mode": "json_no_tools"})
+
+    @staticmethod
+    def _code_review_from_payload(
+        payload: Any,
+        raw: dict[str, Any],
+    ) -> CodeReviewResult:
+        if not isinstance(payload, dict):
+            raise ManagerLLMError("code review payload must be object")
+        verdict = str(payload.get("verdict") or "CLEAN").strip().upper()
+        if verdict not in {"CLEAN", "HAS_ISSUES"}:
+            verdict = "HAS_ISSUES"  # err on the side of caution
+        raw_issues = payload.get("issues")
+        issues: list[CodeReviewIssue] = []
+        if isinstance(raw_issues, list):
+            for item in raw_issues:
+                if not isinstance(item, dict):
+                    continue
+                severity = str(item.get("severity") or "MEDIUM").strip().upper()
+                if severity not in {"HIGH", "MEDIUM", "LOW"}:
+                    severity = "MEDIUM"
+                issues.append(CodeReviewIssue(
+                    severity=severity,
+                    file=str(item.get("file") or "unknown"),
+                    description=str(item.get("description") or ""),
+                    suggested_fix=str(item.get("suggested_fix") or ""),
+                ))
+        # If we have issues but verdict says CLEAN, override
+        high_issues = [i for i in issues if i.severity == "HIGH"]
+        if high_issues and verdict == "CLEAN":
+            verdict = "HAS_ISSUES"
+        reference_provider = str(payload.get("reference_provider") or "unknown").strip()
+        summary = str(payload.get("summary") or "").strip()
+        return CodeReviewResult(
+            verdict=verdict,
+            issues=issues,
+            reference_provider=reference_provider,
+            summary=summary or "Review completed.",
             raw=raw,
         )

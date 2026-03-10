@@ -506,6 +506,15 @@ class ManagerLoopRunner:
         # Use run updated_at as proxy for state_entered_at
         state_entered_at = str(run.get("updated_at") or "") or None
 
+        # Check for code review artifact
+        code_review_art = self.service.latest_artifact(run_id, artifact_type="code_review")
+        has_code_review = code_review_art is not None
+        code_review_verdict: str | None = None
+        if has_code_review and isinstance(code_review_art, dict):
+            meta = code_review_art.get("metadata")
+            if isinstance(meta, dict):
+                code_review_verdict = str(meta.get("verdict") or "").strip().upper() or None
+
         return ManagerRunFacts(
             run_id=run_id,
             owner=str(run["owner"]),
@@ -524,6 +533,8 @@ class ManagerLoopRunner:
             retry_should_retry=retry_should_retry,
             retry_target_state=retry_target_state,
             state_entered_at=state_entered_at,
+            has_code_review=has_code_review,
+            code_review_verdict=code_review_verdict,
         )
 
     def _latest_worker_grade(
@@ -733,6 +744,9 @@ class ManagerLoopRunner:
                     target_state,
                 ]
             )
+
+        if action.kind == ManagerActionKind.RUN_CODE_REVIEW:
+            return self._run_cli(["run-code-review", "--run-id", run_id])
 
         if action.kind == ManagerActionKind.SYNC_GITHUB:
             return self._run_cli(["sync-github", "--run-id", run_id])

@@ -82,6 +82,10 @@ class PreflightChecker:
             checks.append(self._check_command("python3.11"))
         for cmd in sorted(python_tools):
             checks.append(self._check_command(cmd))
+        # JS tools: hard requirement only for pure-JS projects.
+        # When project is also Python, JS toolchain is likely for docs/website
+        # and missing tools should not block the run.
+        js_tools_optional = uses_python and uses_js
         for cmd in sorted(js_tools):
             checks.append(self._check_command(cmd))
 
@@ -91,9 +95,15 @@ class PreflightChecker:
             if uses_js:
                 checks.append(self._check_url("https://registry.npmjs.org/"))
 
+        js_cmd_names = {f"cmd.{cmd}" for cmd in js_tools}
         for check in checks:
             if not check.ok:
-                failures.append(f"{check.name}: {check.detail}")
+                if js_tools_optional and check.name in js_cmd_names:
+                    warnings.append(
+                        f"{check.name}: {check.detail} (optional — project is primarily Python)"
+                    )
+                else:
+                    failures.append(f"{check.name}: {check.detail}")
 
         if not uses_python and not uses_js:
             warnings.append(

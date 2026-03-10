@@ -36,10 +36,11 @@ LINT_OR_VALIDATION_COMMAND_PATTERNS: tuple[str, ...] = (
 )
 
 READ_COMMAND_PATTERNS: tuple[str, ...] = (
-    r"^\s*(rg|grep|egrep|fgrep|ag)\s",
-    r"^\s*(cat|head|tail|less|more)\s",
-    r"^\s*(find|fd)\s",
-    r"^\s*(ls|tree|wc)\s",
+    # Use \b instead of ^ to match inside /bin/zsh -lc '...' wrapper from codex exec
+    r"\b(rg|grep|egrep|fgrep|ag)\s",
+    r"\b(cat|head|tail|less|more)\s",
+    r"\b(find|fd)\s",
+    r"\b(ls|tree|wc)\s",
 )
 
 TEST_INFRA_DEPENDENCY_PATTERNS: tuple[str, ...] = (
@@ -1619,10 +1620,8 @@ def evaluate_pr_gate_readiness(
         "runtime_success_recovered_test_failures",
         "runtime_success_no_test_infra_with_validation",
     }
-    if not contract_available:
-        failed_checks.append(
-            {"code": "missing_contract", "message": "contract artifact is required for PR gate"}
-        )
+    # Contract check is deferred until we know skills_mode (autonomous mode
+    # produces contract internally, not as a separate artifact).
     if not isinstance(digest, dict):
         failed_checks.append(
             {"code": "missing_digest", "message": "latest run_digest is required for PR gate"}
@@ -1732,7 +1731,13 @@ def evaluate_pr_gate_readiness(
     skills = _safe_dict(digest.get("skills"))
     actual_mode = str(skills.get("mode") or "").strip()
     missing_required = list(skills.get("missing_required") or [])
-    if expected_mode and actual_mode and expected_mode != actual_mode:
+    # agentpr and agentpr_autonomous are compatible modes
+    _COMPATIBLE_SKILLS_MODES = {
+        "agentpr": {"agentpr", "agentpr_autonomous"},
+        "agentpr_autonomous": {"agentpr", "agentpr_autonomous"},
+    }
+    compatible = _COMPATIBLE_SKILLS_MODES.get(expected_mode, set())
+    if expected_mode and actual_mode and actual_mode not in compatible and expected_mode != actual_mode:
         failed_checks.append(
             {
                 "code": "skills_mode_mismatch",
@@ -1745,6 +1750,12 @@ def evaluate_pr_gate_readiness(
                 "code": "missing_required_skills",
                 "message": ", ".join(str(item) for item in missing_required[:5]),
             }
+        )
+    # Contract artifact: only required when actual_mode is explicitly "agentpr".
+    # Autonomous mode produces contract internally; empty mode means no skills data.
+    if not contract_available and actual_mode == "agentpr":
+        failed_checks.append(
+            {"code": "missing_contract", "message": "contract artifact is required for PR gate"}
         )
 
     return {

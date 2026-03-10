@@ -454,6 +454,56 @@ def render_skill_chain_prompt(
 
     task_packet_json = json.dumps(task_packet, ensure_ascii=True, sort_keys=True, indent=2)
 
+    # --- Post-push iteration prompt (CI fix / review response) ---
+    _ITERATION_STATES = {RunState.ITERATING, RunState.CI_WAIT, RunState.REVIEW_WAIT}
+    if plan.run_state in _ITERATION_STATES:
+        return (
+            "AgentPR worker task: fix CI failures or address PR review comments.\n"
+            "\n"
+            "A PR has already been opened for a Forge LLM provider integration in this repo.\n"
+            "Your job is to read the failure/review evidence, make targeted fixes, and revalidate.\n"
+            "\n"
+            "## Instructions\n"
+            "Read the skill instructions at $agentpr-ci-review-fix for the full workflow.\n"
+            "\n"
+            "## Workflow\n"
+            "1. **Collect evidence** — Read the task packet below for CI failure logs, "
+            "review comments, or other signals that need attention.\n"
+            "2. **Create a narrow fix plan** — Bind each change to one failing signal "
+            "or reviewer request. Prefer the smallest reversible patch.\n"
+            "3. **Implement and validate** — Make targeted fixes. Run only the relevant "
+            "test/lint commands first, then broader checks if needed. Keep diff small.\n"
+            "4. **Report routing decision** — Your output determines next steps.\n"
+            f"{optional_block}"
+            "\n"
+            "## Expected output\n"
+            "- status: PASS | RETRYABLE | HUMAN_REVIEW\n"
+            "- fixes_applied: [list of what you fixed and why]\n"
+            "- validation: [{command, exit_code, summary}]\n"
+            "- notes: any remaining issues or blockers\n"
+            "\n"
+            "## Hard Rules\n"
+            "- Do NOT rewrite large parts of the implementation — this is incremental fix only.\n"
+            "- Do NOT force-push unless explicitly required.\n"
+            "- Do NOT mark PASS without command evidence.\n"
+            "- Push fix commits normally (not force push — PR is already open).\n"
+            "\n"
+            "## Environment\n"
+            "- Write access: repo directory + .agentpr_runtime/ + /tmp only.\n"
+            "- Install deps locally: pip install -e, npm install, bun install, uv sync — all available.\n"
+            "- Do NOT use sudo.\n"
+            "\n"
+            "Task packet (JSON):\n"
+            "```json\n"
+            f"{task_packet_json}\n"
+            "```\n"
+            "\n"
+            "Base context:\n"
+            "---\n"
+            f"{base_prompt.strip()}\n"
+        )
+
+    # --- Initial integration prompt ---
     if plan.mode == "agentpr_autonomous":
         return (
             "AgentPR worker task: integrate Forge LLM provider into this repository.\n"

@@ -58,6 +58,16 @@ def _load_repo_pr_template_text(repo_dir: Path) -> tuple[str, str]:
     return primary, normalize_text_block(read_text_if_exists(path))
 
 
+def _strip_changes_section(text: str) -> str:
+    """Remove ## Changes section from About Forge text (LLM generates it instead)."""
+    return re.sub(
+        r"\n## Changes\n.*?(?=\n## |\Z)",
+        "",
+        text,
+        flags=re.DOTALL,
+    ).strip()
+
+
 def _load_about_forge_text(
     *,
     integration_root: Path,
@@ -77,7 +87,7 @@ def _load_about_forge_text(
             )
             if section:
                 section = section.replace("${PROJECT}", project_name)
-                return section, "finish.sh"
+                return _strip_changes_section(section), "finish.sh"
 
     pr_template_path = integration_root / "pr_description_template.md"
     pr_template_text = read_text_if_exists(pr_template_path)
@@ -93,7 +103,7 @@ def _load_about_forge_text(
             )
             if section:
                 section = section.replace("[Project Name]", project_name)
-                return section, "pr_description_template.md"
+                return _strip_changes_section(section), "pr_description_template.md"
     return "", ""
 
 
