@@ -16,3 +16,4 @@ data/
 start_claude_code.sh
 .trae/
 test/
+log.txt
