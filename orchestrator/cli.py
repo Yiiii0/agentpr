@@ -1341,6 +1341,57 @@ def build_parser() -> argparse.ArgumentParser:
         help="Max agent turns per session (default: 15).",
     )
 
+    # ── Agent loop (persistent daemon) ────────────────────────────────
+    al = sub.add_parser(
+        "run-agent-loop",
+        help="Run the agent-based manager loop (persistent daemon).",
+    )
+    al.add_argument("--run-id", help="Optional single run id target.")
+    al.add_argument(
+        "--prompt-file",
+        type=Path,
+        default=DEFAULT_WORKER_PROMPT_FILE,
+        help="Worker prompt file.",
+    )
+    al.add_argument(
+        "--skills-mode",
+        choices=["off", "agentpr", "agentpr_autonomous"],
+        default="agentpr",
+        help="Skills mode for worker.",
+    )
+    al.add_argument(
+        "--max-turns",
+        type=int,
+        default=15,
+        help="Max agent turns per tick (default: 15).",
+    )
+    al.add_argument(
+        "--interval-sec",
+        type=int,
+        default=180,
+        help="Tick interval in seconds (default: 180).",
+    )
+    al.add_argument(
+        "--max-loops",
+        type=int,
+        default=None,
+        help="Max number of loops (default: unlimited).",
+    )
+    al.add_argument(
+        "--persistent",
+        action="store_true",
+        help="Keep running even when idle (daemon mode).",
+    )
+    al.add_argument(
+        "--telegram-token",
+        help="Telegram bot token for notifications.",
+    )
+    al.add_argument(
+        "--telegram-chat-id",
+        type=int,
+        help="Telegram chat ID for notifications.",
+    )
+
     return parser
 
 
@@ -1389,6 +1440,15 @@ def resolve_startup_doctor_profile(args: argparse.Namespace) -> dict[str, Any] |
     if command == "agent-tick":
         return {
             "profile": "agent-tick",
+            "check_network": True,
+            "require_gh_auth": True,
+            "require_codex": True,
+            "require_telegram_token": False,
+            "require_webhook_secret": False,
+        }
+    if command == "run-agent-loop":
+        return {
+            "profile": "agent-loop",
             "check_network": True,
             "require_gh_auth": True,
             "require_codex": True,
@@ -1888,6 +1948,55 @@ def main() -> int:
                 "error": result.error,
             })
             return 0 if result.error is None else 1
+
+        if args.command == "run-agent-loop":
+            from .agent_loop import AgentLoopConfig, run_agent_loop
+            from .agent_session import create_config_from_env
+
+            agent_config = create_config_from_env(
+                max_turns=getattr(args, "max_turns", 15),
+                timeout_sec=120,
+            )
+            loop_config = AgentLoopConfig(
+                interval_sec=getattr(args, "interval_sec", 180),
+                max_loops=getattr(args, "max_loops", None),
+                persistent=getattr(args, "persistent", False),
+                max_turns_per_tick=getattr(args, "max_turns", 15),
+            )
+
+            # Set up optional Telegram sender
+            telegram_sender = None
+            tg_token = getattr(args, "telegram_token", None) or os.environ.get("AGENTPR_TELEGRAM_BOT_TOKEN", "")
+            tg_chat_id = getattr(args, "telegram_chat_id", None)
+            if not tg_chat_id:
+                tg_chat_id_str = os.environ.get("AGENTPR_TELEGRAM_ADMIN_CHAT_ID", "")
+                if tg_chat_id_str.strip():
+                    try:
+                        tg_chat_id = int(tg_chat_id_str.strip())
+                    except ValueError:
+                        pass
+            if tg_token and tg_chat_id:
+                from .telegram_bot import TelegramClient
+
+                tg_client = TelegramClient(tg_token)
+
+                def _tg_send(text: str) -> None:
+                    tg_client.send_message(chat_id=tg_chat_id, text=text)
+
+                telegram_sender = _tg_send
+                logger.info("Telegram notifications enabled (chat_id=%d).", tg_chat_id)
+
+            exit_code = run_agent_loop(
+                service=service,
+                agent_config=agent_config,
+                loop_config=loop_config,
+                workspace_root=args.workspace_root,
+                integration_root=args.integration_root,
+                prompt_file=getattr(args, "prompt_file", None),
+                skills_mode=getattr(args, "skills_mode", "agentpr"),
+                telegram_sender=telegram_sender,
+            )
+            return exit_code
 
         if args.command == "manager-tick":
             config = build_manager_loop_config_from_args(args)

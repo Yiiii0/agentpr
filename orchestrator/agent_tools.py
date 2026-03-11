@@ -15,7 +15,7 @@ import os
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .models import RunState, StepName
 from .service import OrchestratorService
@@ -43,6 +43,7 @@ class AgentToolkit:
         prompt_file: Path | None = None,
         skills_mode: str | None = "agentpr",
         codex_sandbox: str | None = None,
+        telegram_sender: Callable[[str], None] | None = None,
     ) -> None:
         self.service = service
         self.workspace_root = workspace_root
@@ -50,6 +51,7 @@ class AgentToolkit:
         self.prompt_file = prompt_file
         self.skills_mode = skills_mode
         self.codex_sandbox = codex_sandbox
+        self._telegram_sender = telegram_sender
 
     def execute(self, tool_name: str, args: dict[str, Any]) -> str:
         """Dispatch a tool call by name. Returns result string."""
@@ -656,10 +658,17 @@ class AgentToolkit:
         message: str,
         priority: str = "normal",
     ) -> str:
-        """Send notification to human operator. Currently logs; Telegram integration in E2."""
+        """Send notification to human operator via Telegram (if configured)."""
         logger.info("HUMAN NOTIFICATION [%s]: %s", priority, message)
-        # TODO(E2): Send via Telegram bot
-        return f"OK: Notification sent (priority={priority}): {message[:200]}"
+        if self._telegram_sender:
+            try:
+                prefix = "⚠️ " if priority == "high" else ""
+                self._telegram_sender(f"{prefix}[AgentPR] {message}")
+                return f"OK: Notification sent via Telegram (priority={priority}): {message[:200]}"
+            except Exception as exc:
+                logger.warning("Telegram send failed: %s", exc)
+                return f"OK: Notification logged (Telegram send failed: {exc}): {message[:200]}"
+        return f"OK: Notification logged (no Telegram configured): {message[:200]}"
 
     # ── Tool 8b: reply_human ───────────────────────────────────────────
 
@@ -667,10 +676,16 @@ class AgentToolkit:
         self,
         message: str,
     ) -> str:
-        """Reply to the current Telegram conversation. Stub for E1; connected in E2."""
+        """Reply to the current Telegram conversation."""
         logger.info("REPLY TO HUMAN: %s", message)
-        # TODO(E2): Send via Telegram bot to current conversation
-        return f"OK: Reply sent: {message[:200]}"
+        if self._telegram_sender:
+            try:
+                self._telegram_sender(message)
+                return f"OK: Reply sent via Telegram: {message[:200]}"
+            except Exception as exc:
+                logger.warning("Telegram reply failed: %s", exc)
+                return f"OK: Reply logged (Telegram send failed: {exc}): {message[:200]}"
+        return f"OK: Reply logged (no Telegram configured): {message[:200]}"
 
     # ── Tool 9: update_skill ────────────────────────────────────────────
 
