@@ -1,6 +1,6 @@
 # AgentPR Master Plan
 
-> 更新：2026-03-10 | 状态：D4 完成，战略转向 merge rate 优化
+> 更新：2026-03-11 | 状态：E2 完成（Manager Agent 重构），E3 验证待做
 > 归档：`docs/AGENTPR_MASTER_PLAN_ARCHIVE_20260310_PRE_LEAN.md`（详细历史）
 
 ---
@@ -17,25 +17,26 @@
 
 ## 2. 当前主矛盾
 
-**Pipeline 技术闭环已完成。瓶颈从"能不能跑通"转移到"maintainer 会不会 merge"。**
+**Manager Agent 重构完成（E0-E2）。9 x 1-shot → 真正的 Agent with tools。**
 
-- 22 repos 测试，19/22 PASS+PUSHED (86%)
-- 17 PRs 提交，17/17 深度 review，4 代码修复，1 merged (5.9%)
-- Code review gate + 双 PR 模式 + 常驻 daemon 已实装
-- **Merge rate (5.9%) 才是下一步优化目标，不是 pipeline 功能**
+- Manager 从 ~7.3K 行 plumbing 替换为 ~2K 行 agent loop + tools（并行运行，旧代码未删）
+- Agent 生产验证通过：26 tool calls / tick，正确处理 20 个 active runs
+- 22 repos 测试，19/22 PASS+PUSHED (86%)，17 PRs，1 merged (5.9%)
+- **下一步：E3 验证 + 旧代码清理 + merge rate 优化**
 
 ---
 
 ## 3. 架构
 
 ```
-Human (Telegram)  →  Manager (LLM + tools)  →  Worker (codex exec)  →  GitHub PR
-      |                      |                        |
-  NL + /commands        决策、审查、通知          读 repo、改代码、跑测试
+Human (Telegram)  →  Manager Agent (LLM + 10 tools)  →  Worker (codex exec)  →  GitHub PR
+      |                        |                              |
+  NL + /commands          多轮推理、审查、通知            读 repo、改代码、跑测试
 ```
 
-**3 进程**：Telegram Bot + Manager Loop (persistent daemon) + GitHub Webhook Server
+**3 进程**：Telegram Bot + Agent Loop (persistent daemon) + GitHub Webhook Server
 **连接**：SQLite DB + `.wake_manager` 信号文件（零依赖跨进程通知）
+**Agent Loop**：每 tick 从 DB 重建 context → Agent session (max 15 turns) → tools 执行副作用 → 等待下一事件
 
 ### 状态机（V2，10 状态）
 
@@ -58,25 +59,34 @@ QUEUED → EXECUTING → PUSHED → Code Review → PR Gate → CI_WAIT → REVI
 
 ## 4. LLM 架构
 
-**全部 9 个方法均为无记忆 1-shot 调用。** 无跨 tick 记忆，facts 每次从 DB 重建。
+### 新架构：Manager Agent（Phase E, 2026-03-11）
 
-| # | 方法 | 位置 | 用途 | temp | 价值 |
-|---|------|------|------|------|------|
-| 1 | `decide_action` | Manager Loop | 状态机决策 | 0 | 中（rules 够用） |
-| 2 | `grade_worker_output` | Runtime | 语义分级 | 0 | 中 |
-| 3 | `explain_decision_card` | Telegram | 人类可读解释 | 0 | 低 |
-| 4 | `decide_bot_action` | Telegram | NL→命令路由 | 0 | 低 |
-| 5 | `triage_review_comment` | Manager Loop | review 评论分流 | 0 | 中 |
-| 6 | `suggest_retry_strategy` | Manager Loop | 失败诊断+重试策略 | 0 | 中 |
-| 7 | **`generate_pr_description`** | CLI | diff-aware PR body | 0.3 | **高** |
-| 8 | **`review_code_changes`** | CLI | 深度代码审查 | 0 | **高** |
-| 9 | **`assess_pr_readiness`** | Manager Loop | PR 就绪评估 | 0 | **高** |
+**单 Agent session with tools，替代 9 x 1-shot。** 通过 Forge `/chat/completions` 路由，模型无关。
 
-**关键洞察**：只有 #7 #8 #9 直接影响 PR 质量（高价值）。其余是分类器，rules+heuristic 已够用。
+```
+Event → build context from DB → Agent session (max 15 turns) → tools side effects → done
+```
 
-**优点**：无状态、可重启、tick 解耦、failure-safe。
-**缺点**：无跨 tick 推理连续性（"上次试了 X 不行，换 Y"做不到）。
-**当前够用**：Rules 处理 90%+ 路径，LLM 做边界判断。
+**10 个 Agent tools**（安全检查嵌入 tool 实现）：
+
+| Tool | 用途 | 安全检查 |
+|------|------|---------|
+| `query_runs` | 查询 run 状态/详情 | — |
+| `update_state` | 状态转移 | state_machine.can_transition() |
+| `read_evidence` | 读 worker 产出/grade/review | — |
+| `execute_worker` | 启动 codex exec | retry_count < 3, 状态必须是 EXECUTING/ITERATING |
+| `github_api` | create_pr/read_ci/read_reviews/post_comment | PR gate + DoD via CLI pipeline |
+| `review_code` | 深度代码审查 | 委托 run-code-review CLI（保留专门 prompt） |
+| `generate_pr_body` | diff-aware PR body | 委托 ManagerLLMClient（保留专门 prompt） |
+| `notify_human` | Telegram 通知 | — |
+| `reply_human` | Telegram 回复 | — |
+| `update_skill` | 更新 skill 文件 | 文件白名单（低风险 only） |
+
+**9 → 2 specialized tools + Agent 内在推理。** #7（PR body）和 #8（code review）保留专门 prompt，因为需要丰富的 context（diff、sibling files、checklist）。其余 7 个 1-shot 方法被 Agent 的多轮推理能力替代。
+
+### 旧架构（保留运行，待 E3 后清理）
+
+9 个 1-shot 方法在 `manager_llm.py`，通过 `manager_loop.py` + `manager_decision.py` 规则引擎调用。
 
 ---
 
@@ -95,16 +105,24 @@ Worker 执行 → Hybrid Grading (rules+LLM) → Code Review (LLM) → PR Gate �
 
 ---
 
-## 6. 战略方向：D5 Merge Rate 优化
+## 6. 战略方向
+
+### 近期：E3 验证 + 旧代码清理
+
+| 优先级 | 项目 | 预期影响 |
+|--------|------|---------|
+| ⭐ | **E3 验证**：5+ repos 跑 `run-agent-loop` 完整流程 | 验证 Agent vs 旧 Manager |
+| ⭐ | **旧代码清理**：删除 manager_decision.py, manager_agent.py, 部分 manager_loop.py | 净减 ~5K 行 |
+| 高 | **Agent session 成本对比**：token usage vs 旧 9 x 1-shot | 数据驱动模型选择 |
+
+### 中期：Merge Rate 优化
 
 | 优先级 | 项目 | 预期影响 |
 |--------|------|---------|
 | ⭐ | **收割现有 17 PRs**：签 CLA、bump 零回应 PR | 直接提升 merge 数 |
 | ⭐ | **Repo targeting**：只选有 registry/factory 的 repo | 提升 PR 质量 |
 | 高 | **Scale to 50 repos**：测量真实 merge rate | 获取 PMF 数据 |
-| 高 | **Repo 可集成性评估**（新 LLM 方法）：preflight 评估 → 跳过不适合的 | 避免低质量 PR |
-| 中 | **PR follow-up 自动化**：3 天无回应 → 礼貌 bump | 提升 respond rate |
-| 中 | **CLA 签署策略** | 解除 2 个 blocked PRs |
+| 中 | **PR follow-up 自动化**：Agent 自动 bump | 提升 respond rate |
 
 ---
 
@@ -116,7 +134,9 @@ Worker 执行 → Hybrid Grading (rules+LLM) → Code Review (LLM) → PR Gate �
 4. Commit 白名单：.py .pyi .ts .tsx .js .jsx .mjs .md .mdx .rst（新文件）。Lock files NEVER commit
 5. Upstream default branch：始终用 `gh api repos/OWNER/REPO --jq '.default_branch'`
 6. Hybrid grading 是正确中间态。AI centric ≠ all LLM
-7. Manager function-calling。Forge 422 修复前用 Codex 原生 provider
+7. **Manager Agent via Forge `/chat/completions`**，模型无关（GPT-4o / Claude / Gemini 均通过验证）
+8. **安全在 tools 层，不在 agent 层**。Agent 自由行动，tools 拒绝非法操作
+9. **不引入框架**。30 行 agent loop + OpenAI function-calling format 足够
 
 ---
 
@@ -135,6 +155,9 @@ Worker 执行 → Hybrid Grading (rules+LLM) → Code Review (LLM) → PR Gate �
 | D3.8 Review→Skill | 03-08 | forge_rules +4、self_review +4、ITERATING prompt fix |
 | D3.9 Code Review Gate | 03-09 | `review_code_changes()` + checklist + PUSHED→CLEAN/HAS_ISSUES 流程 |
 | D4 运维化 | 03-10 | persistent daemon、wake file、进度通知、双 PR 模式、auto-title |
+| E0 Agent Spike | 03-10 | agent loop + 9 tools + system prompt。5 turns / 18 tool calls 验证通过 |
+| E1 Full Tool Layer | 03-10 | 10 tools + safety fixes + LLM body gen + PR flow + context builder |
+| E2 Integration | 03-11 | agent_loop.py daemon + Telegram 通知 + webhook 集成 + audit。26 tool calls 生产验证 |
 
 ### 验证数据
 
@@ -142,6 +165,7 @@ Worker 执行 → Hybrid Grading (rules+LLM) → Code Review (LLM) → PR Gate �
 - **17 PRs 提交**：1 merged (octotools #53), 13 clean, 2 CLA blocked, 1 maintainer positive
 - **Code review 发现**：4 逻辑 bug（DAMO-ConvAI Union type, pipecat os.getenv, octotools factory, weave elif），全部修复
 - **平均 worker attempt**：1.0（首次执行即 PASS）
+- **Agent 生产验证**：26 tool calls/tick, 15K input + 1.5K output tokens, 正确处理 20 active runs
 
 ---
 
@@ -232,17 +256,25 @@ Worker 执行 → Hybrid Grading (rules+LLM) → Code Review (LLM) → PR Gate �
 
 ### 架构审视 (#57-#59)
 
-57. **Manager 无记忆的 1-shot 是最大结构性限制。** 当前够用但距 North Star 有差距
-58. **无状态设计优点不应被低估。** 可重启、可恢复、failure-safe。改进方向：更多 artifacts 作为上下文
-59. LLM 覆盖全流程但深度不够（每个都是 1-shot）。模式化任务够用，复杂任务可能需要多步推理
+57. **Manager 无记忆的 1-shot 是最大结构性限制。** ~~当前够用但距 North Star 有差距~~ → Phase E 已解决：Agent session 内多轮推理
+58. **无状态设计优点不应被低估。** 可重启、可恢复、failure-safe。→ Phase E 保留：session 间无状态，session 内有推理
+59. ~~LLM 覆盖全流程但深度不够（每个都是 1-shot）~~ → Phase E 已解决：Agent 自主多步决策
 
 ### 战略洞察 (#60-#64)
 
 60. **PASS rate ≠ merge rate，优化错误指标是最大浪费。** 86% PASS，5.9% merge
 61. **代码质量和 repo 架构强相关。** Registry/factory repo → clean code。需修改已有代码 → bugs
 62. **修 bug 的 PR 比加 provider 的 PR 更容易被 merge。** octotools 被 merge 因为它修了真实 bug
-63. **9 个 LLM 方法中只有 3 个高价值（#7 #8 #9）。** 其余是分类器，rules 已够用
+63. **9 个 LLM 方法中只有 3 个高价值（#7 #8 #9）。** → Phase E：9 → 2 specialized tools + Agent 推理
 64. **"给现有方法加上下文"（低 ROI）≠ "让 Manager 做新事情"（高 ROI）**
+
+### Manager Agent 重构 (#65-#69)
+
+65. **30 行 agent loop 替代 7.3K 行 plumbing。** 不需要框架——`/chat/completions` + for 循环 + tool_executor 就是 agent 框架
+66. **Forge 多轮 tool-calling 模型无关。** GPT-4o / Claude Sonnet 4 / Gemini 2.5 Flash 均通过验证。通过 `AGENTPR_MANAGER_MODEL` 切换，无需改代码
+67. **Agent 的错误处理比规则引擎更聪明。** Agent 读到 ERROR 后自行调整策略（换工具、升级人工），规则引擎只能走预设分支
+68. **工具输出包含下一步建议是关键 ACI 设计。** `_suggest_action()` 让 Agent 知道该做什么，不只是返回 raw data
+69. **并行运行是安全的迁移策略。** `run-agent-loop` 和 `run-manager-loop` 共存，新旧对比后再删旧代码
 
 ---
 
@@ -258,6 +290,8 @@ Worker 执行 → Hybrid Grading (rules+LLM) → Code Review (LLM) → PR Gate �
 
 ## 11. 技术债
 
+- **旧 Manager 代码清理**（E3 后）：删除 manager_decision.py, manager_agent.py, manager_tools.py, 简化 manager_loop.py (~7.3K 行)
+- **Telegram inbound → Agent session**：当前只有 outbound 通知，inbound 消息仍走旧 Bot 路由
 - Forge 422 修复后切回（独立于主线）
 - Bot 会话持久化 ✅（SQLite `bot_sessions` 表）
 - Review triage 用户确认 ✅（`/approve_triage` + artifact gate）
