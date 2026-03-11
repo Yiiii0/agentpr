@@ -1316,6 +1316,31 @@ def build_parser() -> argparse.ArgumentParser:
         help="Keep running even when all runs are idle (daemon mode).",
     )
 
+    # ── Agent-based commands (Phase E) ────────────────────────────────
+    at = sub.add_parser(
+        "agent-tick",
+        help="Run one Manager Agent tick (multi-turn tool-calling loop).",
+    )
+    at.add_argument("--run-id", help="Optional single run id target.")
+    at.add_argument(
+        "--prompt-file",
+        type=Path,
+        default=DEFAULT_WORKER_PROMPT_FILE,
+        help="Worker prompt file.",
+    )
+    at.add_argument(
+        "--skills-mode",
+        choices=["off", "agentpr", "agentpr_autonomous"],
+        default="agentpr",
+        help="Skills mode for worker.",
+    )
+    at.add_argument(
+        "--max-turns",
+        type=int,
+        default=15,
+        help="Max agent turns per session (default: 15).",
+    )
+
     return parser
 
 
@@ -1356,6 +1381,15 @@ def resolve_startup_doctor_profile(args: argparse.Namespace) -> dict[str, Any] |
         return {
             "profile": "agent",
             "check_network": not bool(getattr(args, "skip_network_check", False)),
+            "require_gh_auth": True,
+            "require_codex": True,
+            "require_telegram_token": False,
+            "require_webhook_secret": False,
+        }
+    if command == "agent-tick":
+        return {
+            "profile": "agent-tick",
+            "check_network": True,
             "require_gh_auth": True,
             "require_codex": True,
             "require_telegram_token": False,
@@ -1769,6 +1803,63 @@ def main() -> int:
             return 0
 
         enforce_startup_doctor_gate(args)
+
+        if args.command == "agent-tick":
+            from .agent_prompts import MANAGER_SYSTEM_PROMPT, build_tick_context
+            from .agent_session import AgentResult, create_config_from_env, run_agent_session
+            from .agent_tools import AgentToolkit, get_tool_schemas
+
+            agent_config = create_config_from_env(
+                max_turns=getattr(args, "max_turns", 15),
+                timeout_sec=120,
+            )
+            toolkit = AgentToolkit(
+                service=service,
+                workspace_root=args.workspace_root,
+                integration_root=args.integration_root,
+                prompt_file=getattr(args, "prompt_file", None),
+                skills_mode=getattr(args, "skills_mode", "agentpr"),
+            )
+
+            # Build context: list active runs
+            runs = service.list_runs(limit=50)
+            _TERMINAL = {"DONE", "SKIPPED", "FAILED_TERMINAL"}
+            non_terminal = [
+                r for r in runs
+                if r.get("current_state", r.get("state", "")).upper() not in _TERMINAL
+            ]
+            if args.run_id:
+                non_terminal = [r for r in non_terminal if r.get("run_id") == args.run_id]
+
+            if not non_terminal:
+                print_json({"ok": True, "message": "No active runs to process.", "turns": 0})
+                return 0
+
+            runs_summary = "\n".join(
+                f"- {r.get('run_id', '?')} | {r.get('owner', '?')}/{r.get('repo', '?')} | {r.get('current_state', r.get('state', '?'))}"
+                for r in non_terminal
+            )
+            context = build_tick_context(active_runs_summary=runs_summary)
+
+            result: AgentResult = run_agent_session(
+                config=agent_config,
+                system_prompt=MANAGER_SYSTEM_PROMPT,
+                context=context,
+                tools=get_tool_schemas(),
+                tool_executor=toolkit.execute,
+            )
+
+            print_json({
+                "ok": result.error is None,
+                "turns": result.turns_used,
+                "tool_calls": len(result.tool_calls_made),
+                "tools_used": [tc["name"] for tc in result.tool_calls_made],
+                "input_tokens": result.total_input_tokens,
+                "output_tokens": result.total_output_tokens,
+                "final_text": result.final_text[:1000],
+                "error": result.error,
+            })
+            return 0 if result.error is None else 1
 
         if args.command == "manager-tick":
             config = build_manager_loop_config_from_args(args)
