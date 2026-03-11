@@ -103,6 +103,15 @@ class PRReadinessResult:
     raw: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class ChatResponse:
+    """Response from the conversational chat agent."""
+
+    reply: str | None
+    tool_calls: list[dict[str, Any]]
+    raw: dict[str, Any]
+
+
 class ManagerLLMClient:
     def __init__(self, config: ManagerLLMConfig) -> None:
         self.config = config
@@ -532,6 +541,61 @@ class ManagerLLMClient:
                     "fallback_reason": str(exc),
                 },
             )
+
+    def chat_with_human(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+    ) -> ChatResponse:
+        """Conversational agent for human interaction. Returns text and/or tool calls."""
+        payload: dict[str, Any] = {
+            "model": self.config.model,
+            "temperature": 0.3,
+            "messages": messages,
+        }
+        if tools:
+            payload["tools"] = tools
+
+        data = self._request_chat_completion(payload)
+        choices = data.get("choices")
+        if not isinstance(choices, list) or not choices:
+            raise ManagerLLMError("manager llm missing choices")
+        message = (choices[0] or {}).get("message")
+        if not isinstance(message, dict):
+            raise ManagerLLMError("manager llm missing message")
+
+        reply = self._extract_text_content(message.get("content"))
+
+        tool_calls: list[dict[str, Any]] = []
+        tool_calls_raw = message.get("tool_calls")
+        if isinstance(tool_calls_raw, list):
+            for tc in tool_calls_raw:
+                if not isinstance(tc, dict):
+                    continue
+                tc_id = str(tc.get("id") or "")
+                fn = tc.get("function")
+                if not isinstance(fn, dict):
+                    continue
+                name = str(fn.get("name") or "")
+                args_str = str(fn.get("arguments") or "{}")
+                try:
+                    parsed_args = json.loads(args_str)
+                except json.JSONDecodeError:
+                    parsed_args = {}
+                tool_calls.append({
+                    "id": tc_id,
+                    "type": "function",
+                    "function": {"name": name, "arguments": args_str},
+                    "parsed_args": parsed_args,
+                    "name": name,
+                })
+
+        return ChatResponse(
+            reply=reply or None,
+            tool_calls=tool_calls,
+            raw=data,
+        )
 
     def _request_chat_completion(self, payload: dict[str, Any]) -> dict[str, Any]:
         body = json.dumps(payload).encode("utf-8")

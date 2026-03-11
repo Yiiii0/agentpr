@@ -10,7 +10,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from .manager_llm import BotLLMSelection, ManagerLLMClient, ManagerLLMError
+from .manager_llm import BotLLMSelection, ChatResponse, ManagerLLMClient, ManagerLLMError
 from .models import RunState
 from .service import OrchestratorService
 from .telegram_bot_helpers import (
@@ -1009,54 +1009,9 @@ def render_run_detail(
             top_duration_ms = int(first.get("total_duration_ms") or 0)
 
     lines.append("")
-    why_llm_text = ""
-    why_llm_actions: list[str] = []
-    if decision_why_mode != DECISION_WHY_MODE_OFF and decision_llm_client is not None:
-        try:
-            explanation = decision_llm_client.explain_decision_card(
-                decision_card={
-                    "run_id": run_id,
-                    "repo": f"{run['owner']}/{run['repo']}",
-                    "state": {"before": state_before, "after": state_after},
-                    "classification": {
-                        "grade": grade,
-                        "reason_code": reason_code,
-                        "next_action": next_action,
-                    },
-                    "recommendation": {
-                        "action": action,
-                        "priority": priority,
-                        "why_machine": why,
-                    },
-                    "validation": {
-                        "test_command_count": test_count,
-                        "failed_test_command_count": failed_test_count,
-                    },
-                    "changes": {
-                        "changed_files_count": changed_files_count,
-                        "added_lines": added_lines,
-                        "deleted_lines": deleted_lines,
-                    },
-                }
-            )
-            why_llm_text = clamp_str(explanation.why_llm, max_len=280)
-            why_llm_actions = [
-                clamp_str(item, max_len=180) for item in explanation.suggested_actions
-            ][:3]
-        except ManagerLLMError:
-            why_llm_text = ""
-
     lines.append("Decision Card:")
     lines.append(f"- decision: {action} (priority={priority})")
-    lines.append(f"- why_machine: {why}")
-    if why_llm_text:
-        lines.append(f"- why_llm: {why_llm_text}")
-        if why_llm_actions:
-            lines.append(f"- suggested_actions_llm: {' | '.join(why_llm_actions)}")
-    elif decision_why_mode != DECISION_WHY_MODE_OFF:
-        lines.append(
-            "- why_llm: unavailable (configure manager API key/model for decision explanation)."
-        )
+    lines.append(f"- why: {why}")
     lines.append(f"- runtime: grade={grade} reason={reason_code} next={next_action}")
     lines.append(f"- reason_detail: {reason_detail}")
     lines.append(f"- state_flow: {state_before} -> {state_after}")
@@ -1508,26 +1463,26 @@ def handle_natural_language(
             decision_why_mode=decision_why_mode,
         )
 
+    # Use conversational chat agent
     normalized = str(text).strip()
     if not normalized:
         return "Empty message."
+    # Track run_id mentions for context
     explicit_run_id = extract_run_id_from_text(normalized)
     if explicit_run_id:
         set_last_run_id(conversation_state, explicit_run_id)
-    llm_context = {
-        "last_run_id": get_last_run_id(conversation_state),
-        "explicit_run_id": explicit_run_id,
-        "states": [state.value for state in RunState],
-        "recent_runs": service.list_runs(limit=min(max(int(list_limit), 1), 8)),
-        "commands": list(BOT_NL_ALLOWED_ACTIONS),
-        "nl_mode": mode,
-        "recent_messages": conversation_state.get("recent_messages", [])[-5:],
-    }
+
     try:
-        selection = llm_client.decide_bot_action(
-            user_text=normalized,
-            context=llm_context,
-            allowed_actions=BOT_NL_ALLOWED_ACTIONS,
+        return handle_chat_agent(
+            user_message=normalized,
+            service=service,
+            db_path=db_path,
+            workspace_root=workspace_root,
+            integration_root=integration_root,
+            project_root=project_root,
+            list_limit=list_limit,
+            conversation_state=conversation_state,
+            llm_client=llm_client,
         )
     except ManagerLLMError as exc:
         if mode == NL_MODE_HYBRID:
@@ -1544,40 +1499,7 @@ def handle_natural_language(
                 decision_why_mode=decision_why_mode,
             )
             return f"[manager:rules_fallback] {fallback}"
-        return f"manager nl routing failed: {exc}"
-
-    if selection.action not in BOT_NL_ALLOWED_ACTIONS:
-        if mode == NL_MODE_HYBRID:
-            fallback = handle_natural_language_rules(
-                text=text,
-                service=service,
-                db_path=db_path,
-                workspace_root=workspace_root,
-                integration_root=integration_root,
-                project_root=project_root,
-                list_limit=list_limit,
-                conversation_state=conversation_state,
-                decision_llm_client=decision_llm_client,
-                decision_why_mode=decision_why_mode,
-            )
-            return f"[manager:rules_fallback] {fallback}"
-        return f"manager returned unsupported action: {selection.action}"
-
-    result = execute_nl_selection(
-        selection=selection,
-        explicit_run_id=explicit_run_id,
-        text=normalized,
-        service=service,
-        db_path=db_path,
-        workspace_root=workspace_root,
-        integration_root=integration_root,
-        project_root=project_root,
-        list_limit=list_limit,
-        conversation_state=conversation_state,
-        decision_llm_client=decision_llm_client,
-        decision_why_mode=decision_why_mode,
-    )
-    return f"[manager:{selection.action}] {result}"
+        return f"manager chat agent failed: {exc}"
 
 
 def handle_natural_language_rules(
@@ -1800,3 +1722,350 @@ def execute_nl_selection(
     return f"unsupported action: {action}"
 
 
+# ── Conversational Chat Agent ──────────────────────────────────────
+
+CHAT_AGENT_TOOLS: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "list_runs",
+            "description": "List recent runs with their status.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max runs to return. Default 10.",
+                    },
+                },
+                "required": [],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_run_details",
+            "description": "Get detailed status, evidence, and grading for a specific run.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "run_id": {
+                        "type": "string",
+                        "description": "The run ID.",
+                    },
+                },
+                "required": ["run_id"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_run",
+            "description": "Create new runs for one or more repositories.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "repo_refs": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Repository references in owner/repo format.",
+                    },
+                },
+                "required": ["repo_refs"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "pause_run",
+            "description": "Pause an active run.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "run_id": {"type": "string"},
+                },
+                "required": ["run_id"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "resume_run",
+            "description": "Resume a paused run.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "run_id": {"type": "string"},
+                    "target_state": {
+                        "type": "string",
+                        "enum": ["QUEUED", "EXECUTING", "ITERATING"],
+                        "description": "State to resume to. Default EXECUTING.",
+                    },
+                },
+                "required": ["run_id"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "retry_run",
+            "description": "Retry a failed run.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "run_id": {"type": "string"},
+                    "target_state": {
+                        "type": "string",
+                        "enum": ["QUEUED", "EXECUTING", "ITERATING"],
+                        "description": "State to retry from. Default EXECUTING.",
+                    },
+                },
+                "required": ["run_id"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_overview",
+            "description": "Get global overview with state counts and pass rates across all runs.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "approve_pr",
+            "description": "Approve PR creation for a run. Requires the confirm_token for safety.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "run_id": {"type": "string"},
+                    "confirm_token": {
+                        "type": "string",
+                        "description": "Security token from the PR request notification.",
+                    },
+                },
+                "required": ["run_id", "confirm_token"],
+                "additionalProperties": False,
+            },
+        },
+    },
+]
+
+
+def handle_chat_agent(
+    *,
+    user_message: str,
+    service: OrchestratorService,
+    db_path: Path,
+    workspace_root: Path,
+    integration_root: Path,
+    project_root: Path,
+    list_limit: int,
+    conversation_state: dict[str, Any],
+    llm_client: ManagerLLMClient,
+) -> str:
+    """Conversational agent — replaces decide_bot_action + explain_decision_card.
+
+    The agent understands natural language, can call tools, and responds conversationally.
+    """
+    # Build conversation history (in-memory, persisted in chat_history key)
+    history: list[dict[str, Any]] = conversation_state.get("chat_history", [])
+
+    # Build context summary for system prompt
+    recent_runs = service.list_runs(limit=8)
+    runs_summary = ", ".join(
+        f"{r.get('owner')}/{r.get('repo')}({r.get('display_state') or r.get('current_state')})"
+        for r in recent_runs
+    ) or "none"
+
+    system_prompt = (
+        "You are the AgentPR Manager — an intelligent AI agent managing an autonomous "
+        "PR creation pipeline for open-source integration contributions.\n"
+        "You communicate with the operator via Telegram. Use tools to query real data and execute actions.\n\n"
+        f"Active runs: {runs_summary}\n\n"
+        "Rules:\n"
+        "- Be concise — this is Telegram, not email\n"
+        "- Match the operator's language (Chinese or English)\n"
+        "- Use tools to get real data, don't invent information\n"
+        "- When you execute an action, confirm what you did\n"
+        "- For PR approval, always require confirm_token (safety measure)\n"
+        "- You can explain decisions, suggest next steps, and flag issues\n"
+        "- You're a competent colleague, not a terminal"
+    )
+
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": system_prompt},
+        *history[-20:],
+        {"role": "user", "content": user_message},
+    ]
+
+    # Agent loop: LLM may call tools, we execute and feed results back
+    final_reply: str | None = None
+    for _iteration in range(3):
+        try:
+            response = llm_client.chat_with_human(
+                messages=messages, tools=CHAT_AGENT_TOOLS
+            )
+        except ManagerLLMError as exc:
+            final_reply = f"Agent error: {exc}"
+            break
+
+        if not response.tool_calls:
+            final_reply = response.reply or "I couldn't process that."
+            break
+
+        # Append assistant message with tool calls
+        assistant_msg: dict[str, Any] = {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": tc["id"],
+                    "type": "function",
+                    "function": {
+                        "name": tc["name"],
+                        "arguments": tc["function"]["arguments"],
+                    },
+                }
+                for tc in response.tool_calls
+            ],
+        }
+        if response.reply:
+            assistant_msg["content"] = response.reply
+        messages.append(assistant_msg)
+
+        # Execute each tool call and append results
+        for tc in response.tool_calls:
+            result = _execute_chat_tool(
+                tool_name=tc["name"],
+                args=tc.get("parsed_args") or {},
+                service=service,
+                db_path=db_path,
+                workspace_root=workspace_root,
+                integration_root=integration_root,
+                project_root=project_root,
+                list_limit=list_limit,
+                conversation_state=conversation_state,
+            )
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tc["id"],
+                "content": result,
+            })
+
+        # After tool execution, continue loop for LLM to see results and respond
+        final_reply = response.reply
+    else:
+        # Exhausted iterations — use last reply or default
+        if final_reply is None:
+            final_reply = "Action completed."
+
+    if final_reply is None:
+        final_reply = "I couldn't process that."
+
+    # Update conversation history
+    history.append({"role": "user", "content": user_message})
+    history.append({"role": "assistant", "content": final_reply})
+    # Keep last 40 turns
+    conversation_state["chat_history"] = history[-40:]
+
+    return final_reply
+
+
+def _execute_chat_tool(
+    *,
+    tool_name: str,
+    args: dict[str, Any],
+    service: OrchestratorService,
+    db_path: Path,
+    workspace_root: Path,
+    integration_root: Path,
+    project_root: Path,
+    list_limit: int,
+    conversation_state: dict[str, Any],
+) -> str:
+    """Execute a chat agent tool call. Returns text result for the LLM."""
+
+    def dispatch(cmd: str) -> str:
+        return handle_bot_command(
+            text=cmd,
+            service=service,
+            db_path=db_path,
+            workspace_root=workspace_root,
+            integration_root=integration_root,
+            project_root=project_root,
+            list_limit=list_limit,
+            decision_llm_client=None,
+            decision_why_mode=None,
+        )
+
+    if tool_name == "list_runs":
+        limit = max(1, min(int(args.get("limit") or list_limit), 50))
+        return dispatch(f"/list {limit}")
+
+    if tool_name == "get_run_details":
+        run_id = str(args.get("run_id") or "").strip()
+        if not run_id:
+            return "Error: run_id is required"
+        set_last_run_id(conversation_state, run_id)
+        return dispatch(f"/show {run_id}")
+
+    if tool_name == "create_run":
+        repo_refs = args.get("repo_refs") or []
+        if not repo_refs:
+            return "Error: repo_refs is required"
+        prompt_version = resolve_default_prompt_version()
+        refs_str = " ".join(str(r) for r in repo_refs[:10])
+        result = dispatch(f"/create {refs_str} --prompt-version {prompt_version}")
+        # Wake the manager loop
+        (db_path.parent / ".wake_manager").touch(exist_ok=True)
+        return result
+
+    if tool_name == "pause_run":
+        run_id = str(args.get("run_id") or "").strip()
+        if not run_id:
+            return "Error: run_id is required"
+        return dispatch(f"/pause {run_id}")
+
+    if tool_name == "resume_run":
+        run_id = str(args.get("run_id") or "").strip()
+        if not run_id:
+            return "Error: run_id is required"
+        target = str(args.get("target_state") or "EXECUTING")
+        return dispatch(f"/resume {run_id} {target}")
+
+    if tool_name == "retry_run":
+        run_id = str(args.get("run_id") or "").strip()
+        if not run_id:
+            return "Error: run_id is required"
+        target = str(args.get("target_state") or "EXECUTING")
+        return dispatch(f"/retry {run_id} {target}")
+
+    if tool_name == "get_overview":
+        return dispatch("/overview")
+
+    if tool_name == "approve_pr":
+        run_id = str(args.get("run_id") or "").strip()
+        token = str(args.get("confirm_token") or "").strip()
+        if not run_id or not token:
+            return "Error: both run_id and confirm_token are required for PR approval"
+        return dispatch(f"/approve_pr {run_id} {token}")
+
+    return f"Unknown tool: {tool_name}"
