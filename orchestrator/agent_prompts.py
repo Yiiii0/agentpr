@@ -1,4 +1,4 @@
-"""System prompts for the Manager Agent."""
+"""System prompts and context builders for the Manager Agent."""
 
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ For a typical run lifecycle:
 1. QUEUED: update_state to EXECUTING, then execute_worker
 2. After worker: read_evidence to check grade
 3. If PASS + PUSHED: review_code for deep code review
-4. If review CLEAN: generate_pr_body, then github_api(create_pr)
+4. If review CLEAN: generate_pr_body, then github_api(action='create_pr', params={title, body})
 5. After PR: monitor CI (github_api read_ci) and reviews (github_api read_reviews)
 6. If issues: update_state to ITERATING, execute_worker with fix task
 
@@ -47,6 +47,11 @@ For a typical run lifecycle:
 - Process ALL runs that need attention, not just one
 - Be concise in your reasoning — tools give you the data you need
 - If a tool returns ERROR, read the message and adjust your approach
+- When multiple runs need attention, process them in priority order:
+  1. PUSHED runs (need review + PR creation)
+  2. ITERATING/FAILED runs (need attention)
+  3. CI_WAIT/REVIEW_WAIT runs (check status)
+  4. QUEUED runs (start new work)
 """
 
 
@@ -55,8 +60,13 @@ def build_tick_context(
     active_runs_summary: str,
     pending_events: str | None = None,
     global_stats: str | None = None,
+    recent_decisions: str | None = None,
 ) -> str:
-    """Build context for a periodic tick session."""
+    """Build context for a periodic tick session.
+
+    Provides the agent with all runs needing attention, any pending events,
+    and optional history of recent decisions for cross-tick reasoning.
+    """
     parts = ["## Current Tick\n"]
 
     if pending_events:
@@ -64,12 +74,43 @@ def build_tick_context(
 
     parts.append(f"### Active Runs\n{active_runs_summary}\n")
 
+    if recent_decisions:
+        parts.append(f"### Recent Decision History\n{recent_decisions}\n")
+
     if global_stats:
         parts.append(f"### Global Stats\n{global_stats}\n")
 
     parts.append(
         "Review all active runs and take appropriate actions. "
-        "For each run that needs attention, use the available tools."
+        "For each run that needs attention, use the available tools. "
+        "Process runs in priority order: PUSHED > ITERATING/FAILED > CI_WAIT/REVIEW_WAIT > QUEUED."
+    )
+
+    return "\n".join(parts)
+
+
+def build_single_run_context(
+    *,
+    run_summary: str,
+    event_description: str | None = None,
+    recent_decisions: str | None = None,
+) -> str:
+    """Build context for a session focused on a single run.
+
+    Used when an event targets a specific run (e.g., CI failure, review comment).
+    """
+    parts = ["## Single Run Focus\n"]
+
+    if event_description:
+        parts.append(f"### Event\n{event_description}\n")
+
+    parts.append(f"### Run State\n{run_summary}\n")
+
+    if recent_decisions:
+        parts.append(f"### Recent Decisions for this Run\n{recent_decisions}\n")
+
+    parts.append(
+        "Focus on this run. Read evidence, assess the situation, and take appropriate action."
     )
 
     return "\n".join(parts)
@@ -92,7 +133,10 @@ def build_telegram_context(
     if runs_summary:
         parts.append(f"### Current Runs\n{runs_summary}\n")
 
-    parts.append("Respond helpfully. You can use tools to check status or take actions.")
+    parts.append(
+        "Respond helpfully using reply_human(). "
+        "You can use tools to check status or take actions the user requests."
+    )
 
     return "\n".join(parts)
 

@@ -1805,7 +1805,11 @@ def main() -> int:
         enforce_startup_doctor_gate(args)
 
         if args.command == "agent-tick":
-            from .agent_prompts import MANAGER_SYSTEM_PROMPT, build_tick_context
+            from .agent_prompts import (
+                MANAGER_SYSTEM_PROMPT,
+                build_single_run_context,
+                build_tick_context,
+            )
             from .agent_session import AgentResult, create_config_from_env, run_agent_session
             from .agent_tools import AgentToolkit, get_tool_schemas
 
@@ -1828,18 +1832,42 @@ def main() -> int:
                 r for r in runs
                 if r.get("current_state", r.get("state", "")).upper() not in _TERMINAL
             ]
+
             if args.run_id:
-                non_terminal = [r for r in non_terminal if r.get("run_id") == args.run_id]
+                # Single-run focus mode
+                target_runs = [r for r in runs if r.get("run_id") == args.run_id]
+                if not target_runs:
+                    print_json({"ok": False, "error": f"Run {args.run_id} not found."})
+                    return 1
+                r = target_runs[0]
+                run_summary = (
+                    f"- {r.get('run_id', '?')} | "
+                    f"{r.get('owner', '?')}/{r.get('repo', '?')} | "
+                    f"{r.get('current_state', r.get('state', '?'))}"
+                )
+                context = build_single_run_context(run_summary=run_summary)
+            else:
+                if not non_terminal:
+                    print_json({"ok": True, "message": "No active runs to process.", "turns": 0})
+                    return 0
 
-            if not non_terminal:
-                print_json({"ok": True, "message": "No active runs to process.", "turns": 0})
-                return 0
+                from .agent_tools import _format_run_summary
 
-            runs_summary = "\n".join(
-                f"- {r.get('run_id', '?')} | {r.get('owner', '?')}/{r.get('repo', '?')} | {r.get('current_state', r.get('state', '?'))}"
-                for r in non_terminal
-            )
-            context = build_tick_context(active_runs_summary=runs_summary)
+                runs_summary = "\n".join(_format_run_summary(r) for r in non_terminal)
+
+                # Build global stats
+                total = len(runs)
+                active = len(non_terminal)
+                by_state: dict[str, int] = {}
+                for r in non_terminal:
+                    s = r.get("current_state", r.get("state", "?"))
+                    by_state[s] = by_state.get(s, 0) + 1
+                stats = f"Total: {total}, Active: {active}. By state: {by_state}"
+
+                context = build_tick_context(
+                    active_runs_summary=runs_summary,
+                    global_stats=stats,
+                )
 
             result: AgentResult = run_agent_session(
                 config=agent_config,

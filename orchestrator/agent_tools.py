@@ -13,7 +13,7 @@ import json
 import logging
 import os
 import subprocess
-from datetime import UTC, datetime
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -62,6 +62,7 @@ class AgentToolkit:
             "review_code": self.review_code,
             "generate_pr_body": self.generate_pr_body,
             "notify_human": self.notify_human,
+            "reply_human": self.reply_human,
             "update_skill": self.update_skill,
         }.get(tool_name)
 
@@ -129,6 +130,10 @@ class AgentToolkit:
 
         current = RunState(snap.get("state", snap.get("run", {}).get("current_state", "")))
 
+        # Same state — no-op
+        if current == target:
+            return f"OK: {run_id} already in {current.value}."
+
         # Check transition validity
         if not can_transition(current, target):
             valid = [t.value for t in allowed_targets(current)]
@@ -140,10 +145,18 @@ class AgentToolkit:
         # Execute via service (which records the event)
         try:
             if target == RunState.PAUSED:
-                self.service.pause_run(run_id, reason=reason or "Agent paused")
+                self.service.pause_run(run_id)
             elif target == RunState.DONE:
-                self.service.mark_done(run_id, reason=reason or "Agent marked done")
-            elif target in (RunState.FAILED, RunState.FAILED_TERMINAL):
+                self.service.mark_done(run_id)
+            elif is_terminal(target):
+                # SKIPPED, FAILED_TERMINAL
+                self.service.record_step_failure(
+                    run_id,
+                    step=StepName.AGENT,
+                    reason_code="agent_decision",
+                    error_message=reason or f"Agent decided: {target.value}",
+                )
+            elif target == RunState.FAILED:
                 self.service.record_step_failure(
                     run_id,
                     step=StepName.AGENT,
@@ -151,19 +164,18 @@ class AgentToolkit:
                     error_message=reason or "Agent decided to fail",
                 )
             elif target == RunState.NEEDS_HUMAN_REVIEW:
-                self.service.pause_run(run_id, reason=reason or "Agent escalated to human")
-                # Transition to NEEDS_HUMAN_REVIEW via resume
-                self.service.resume_run(run_id, target_state=target, reason=reason)
-            elif target == RunState.EXECUTING:
-                self.service.retry_run(run_id, target_state=target, reason=reason or "Agent retry")
-            elif target == RunState.ITERATING:
-                self.service.retry_run(run_id, target_state=target, reason=reason or "Agent iterate")
+                # Direct resume to NEEDS_HUMAN_REVIEW if allowed from current state
+                self.service.resume_run(run_id, target_state=target)
+            elif target in (RunState.EXECUTING, RunState.ITERATING):
+                # Retry-type transitions
+                self.service.retry_run(run_id, target_state=target)
             else:
-                # Generic resume for other transitions
-                self.service.resume_run(run_id, target_state=target, reason=reason)
+                # Generic resume for other forward transitions
+                self.service.resume_run(run_id, target_state=target)
         except Exception as exc:
             return f"ERROR: State transition failed: {exc}"
 
+        logger.info("Agent transitioned %s: %s → %s (reason: %s)", run_id, current.value, target.value, reason)
         return f"OK: {run_id} transitioned {current.value} → {target.value}. Reason: {reason}"
 
     # ── Tool 3: read_evidence ───────────────────────────────────────────
@@ -218,7 +230,10 @@ class AgentToolkit:
             parts.append(f"Summary: {rmeta.get('summary', 'N/A')}")
             if rmeta.get("issues"):
                 for issue in rmeta["issues"][:5]:
-                    parts.append(f"- Issue: {issue}")
+                    if isinstance(issue, dict):
+                        parts.append(f"- [{issue.get('severity', '?')}] {issue.get('file', '?')}: {issue.get('description', '?')}")
+                    else:
+                        parts.append(f"- {issue}")
 
         # PR info
         if run_data.get("pr_number"):
@@ -237,9 +252,8 @@ class AgentToolkit:
 
         # Git diff (if requested and workspace exists)
         if include_diff:
-            repo = run_data.get("repo", "")
-            workspace_dir = self.workspace_root / repo
-            if workspace_dir.exists():
+            workspace_dir = _resolve_workspace(run_data, self.workspace_root)
+            if workspace_dir and workspace_dir.exists():
                 diff = _git_diff(workspace_dir)
                 if diff:
                     parts.append(f"\n### Diff (truncated to 4000 chars)")
@@ -266,29 +280,26 @@ class AgentToolkit:
         retry_count = self.service.count_step_attempts(run_id, step=StepName.AGENT)
         if retry_count >= _MAX_RETRIES:
             return (
-                f"ERROR: Max retries ({_MAX_RETRIES}) exceeded for {run_id}. "
-                f"Use notify_human() to escalate, or update_state() to NEEDS_HUMAN_REVIEW."
+                f"ERROR: Max retries ({_MAX_RETRIES}) exceeded for {run_id} "
+                f"(attempts: {retry_count}). "
+                f"Use notify_human() to escalate, or update_state(to_state='NEEDS_HUMAN_REVIEW')."
             )
 
         # Safety: must be in a valid state for execution
         current_state = RunState(snap.get("state", run_data.get("current_state", "")))
-        if current_state not in (RunState.EXECUTING, RunState.ITERATING, RunState.IMPLEMENTING):
+        valid_exec_states = (
+            RunState.EXECUTING, RunState.ITERATING,
+            RunState.IMPLEMENTING, RunState.LOCAL_VALIDATING,
+        )
+        if current_state not in valid_exec_states:
             return (
                 f"ERROR: Cannot execute worker in state {current_state.value}. "
-                f"Use update_state() to transition to EXECUTING first."
+                f"Use update_state(to_state='EXECUTING') first. "
+                f"Valid states for worker: {[s.value for s in valid_exec_states]}"
             )
 
         if not self.prompt_file:
             return "ERROR: No prompt_file configured. Cannot launch worker."
-
-        repo = run_data.get("repo", "")
-        workspace_dir = self.workspace_root / repo
-
-        # Auto-prepare workspace if needed
-        if not workspace_dir.exists():
-            prep_result = self._run_cli(["run-prepare", "--run-id", run_id])
-            if not prep_result["ok"]:
-                return f"ERROR: Workspace preparation failed: {prep_result.get('error', 'unknown')}"
 
         # Build worker command
         argv = [
@@ -325,42 +336,106 @@ class AgentToolkit:
         """Interact with GitHub for this run's repository."""
         params = params or {}
 
-        if action == "create_pr":
-            return self._create_pr(run_id, params)
-        elif action == "read_ci":
-            return self._read_ci(run_id)
-        elif action == "read_reviews":
-            return self._read_reviews(run_id)
-        elif action == "read_pr_template":
-            return self._read_pr_template(run_id)
-        else:
-            return f"ERROR: Unknown action '{action}'. Valid: create_pr, read_ci, read_reviews, read_pr_template"
+        actions = {
+            "create_pr": self._create_pr,
+            "read_ci": self._read_ci,
+            "read_reviews": self._read_reviews,
+            "read_pr_template": self._read_pr_template,
+            "post_comment": self._post_comment,
+        }
+        handler = actions.get(action)
+        if not handler:
+            return f"ERROR: Unknown action '{action}'. Valid: {', '.join(actions.keys())}"
+        return handler(run_id, params)
 
     def _create_pr(self, run_id: str, params: dict[str, Any]) -> str:
-        """Create a PR with safety checks."""
+        """Create a PR through the request-open-pr + approve-open-pr pipeline."""
         title = params.get("title", "")
         body = params.get("body", "")
-        if not title or not body:
-            return "ERROR: PR title and body are required."
 
-        # Use existing request-open-pr + approve-open-pr flow
-        result = self._run_cli(["request-open-pr", "--run-id", run_id])
+        # Build request-open-pr args
+        argv = ["request-open-pr", "--run-id", run_id]
+        if title:
+            argv.extend(["--title", title])
+
+        # If agent provided body, write to temp file and pass as --body-file
+        body_file = None
+        if body:
+            try:
+                body_file = tempfile.NamedTemporaryFile(
+                    mode="w", suffix=".md", prefix="pr_body_",
+                    dir=str(self.integration_root.parent / "orchestrator" / "data"),
+                    delete=False,
+                )
+                body_file.write(body)
+                body_file.close()
+                argv.extend(["--body-file", body_file.name, "--skip-llm-body"])
+            except OSError as exc:
+                return f"ERROR: Failed to write PR body to temp file: {exc}"
+        # If no body provided, let the CLI generate it via LLM
+
+        result = self._run_cli(argv)
         if not result["ok"]:
-            return f"ERROR: PR creation failed: {result.get('error', 'unknown')}"
+            return f"ERROR: PR request creation failed: {result.get('error', 'unknown')}"
 
-        approve_result = self._run_cli(["approve-open-pr", "--run-id", run_id])
-        if not approve_result["ok"]:
+        # Parse request output for confirm_token and request_file
+        request_file = None
+        confirm_token = None
+        try:
+            output = json.loads(result.get("output", "{}"))
+            request_file = output.get("request_file")
+            confirm_token = output.get("confirm_token")
+        except (json.JSONDecodeError, TypeError):
+            # Try to find from artifacts
+            art = self.service.latest_artifact(run_id, artifact_type="pr_open_request")
+            if art:
+                meta = art.get("metadata") or {}
+                request_file = meta.get("request_file") or art.get("uri")
+                confirm_token = meta.get("confirm_token")
+
+        if not request_file or not confirm_token:
+            return (
+                f"PR request created for {run_id}, but could not extract confirm_token. "
+                f"Use the CLI to approve manually: approve-open-pr --run-id {run_id}"
+            )
+
+        # Auto-approve the PR
+        approve_argv = [
+            "approve-open-pr",
+            "--run-id", run_id,
+            "--request-file", str(request_file),
+            "--confirm-token", confirm_token,
+            "--confirm",
+        ]
+        approve_result = self._run_cli(approve_argv)
+
+        # Clean up temp file
+        if body_file:
+            try:
+                os.unlink(body_file.name)
+            except OSError:
+                pass
+
+        if approve_result["ok"]:
+            # Try to get PR number from output
+            try:
+                approve_output = json.loads(approve_result.get("output", "{}"))
+                pr_number = approve_output.get("pr_number", "?")
+                return f"OK: PR #{pr_number} created for {run_id}."
+            except (json.JSONDecodeError, TypeError):
+                return f"OK: PR created for {run_id}."
+        else:
             return f"ERROR: PR approval failed: {approve_result.get('error', 'unknown')}"
 
-        return f"OK: PR created for {run_id}."
-
-    def _read_ci(self, run_id: str) -> str:
+    def _read_ci(self, run_id: str, params: dict[str, Any]) -> str:
+        """Sync GitHub CI status for a run."""
         result = self._run_cli(["sync-github", "--run-id", run_id])
         if result["ok"]:
             return f"GitHub sync completed for {run_id}. Use read_evidence() to see updated CI status."
         return f"ERROR: GitHub sync failed: {result.get('error', 'unknown')}"
 
-    def _read_reviews(self, run_id: str) -> str:
+    def _read_reviews(self, run_id: str, params: dict[str, Any]) -> str:
+        """Read PR reviews from GitHub."""
         try:
             snap = self.service.get_run_snapshot(run_id)
         except KeyError:
@@ -369,35 +444,38 @@ class AgentToolkit:
         run_data = snap.get("run", snap)
         pr_number = run_data.get("pr_number")
         if not pr_number:
-            return f"No PR linked to {run_id}."
+            return f"No PR linked to {run_id}. Create a PR first."
 
-        repo = run_data.get("repo", "")
-        workspace_dir = self.workspace_root / repo
-        if not workspace_dir.exists():
-            return f"ERROR: Workspace not found for {repo}."
+        workspace_dir = _resolve_workspace(run_data, self.workspace_root)
+        if not workspace_dir or not workspace_dir.exists():
+            return f"ERROR: Workspace not found for {run_id}."
 
-        # Use gh CLI to get reviews
         try:
             proc = subprocess.run(
-                ["gh", "pr", "view", str(pr_number), "--json", "reviews,comments"],
+                ["gh", "pr", "view", str(pr_number), "--json", "reviews,comments,state,statusCheckRollup"],
                 capture_output=True, text=True, timeout=30,
                 cwd=str(workspace_dir),
             )
             if proc.returncode == 0:
-                return f"PR #{pr_number} reviews:\n{proc.stdout[:3000]}"
+                return f"PR #{pr_number} details:\n{proc.stdout[:3000]}"
             return f"ERROR: gh pr view failed: {proc.stderr[:500]}"
+        except FileNotFoundError:
+            return "ERROR: 'gh' CLI not found. Install GitHub CLI."
         except Exception as exc:
             return f"ERROR: {exc}"
 
-    def _read_pr_template(self, run_id: str) -> str:
+    def _read_pr_template(self, run_id: str, params: dict[str, Any]) -> str:
+        """Read the repo's PR template."""
         try:
             snap = self.service.get_run_snapshot(run_id)
         except KeyError:
             return f"ERROR: Run '{run_id}' not found."
 
         run_data = snap.get("run", snap)
-        repo = run_data.get("repo", "")
-        workspace_dir = self.workspace_root / repo
+        workspace_dir = _resolve_workspace(run_data, self.workspace_root)
+        if not workspace_dir or not workspace_dir.exists():
+            return f"ERROR: Workspace not found for {run_id}."
+
         template_paths = [
             workspace_dir / ".github" / "PULL_REQUEST_TEMPLATE.md",
             workspace_dir / ".github" / "pull_request_template.md",
@@ -408,10 +486,48 @@ class AgentToolkit:
                 return f"PR template found at {p.name}:\n{p.read_text()[:3000]}"
         return "No PR template found in this repo."
 
+    def _post_comment(self, run_id: str, params: dict[str, Any]) -> str:
+        """Post a comment on the PR."""
+        comment_body = params.get("body", "")
+        if not comment_body:
+            return "ERROR: Comment body is required (params.body)."
+
+        try:
+            snap = self.service.get_run_snapshot(run_id)
+        except KeyError:
+            return f"ERROR: Run '{run_id}' not found."
+
+        run_data = snap.get("run", snap)
+        pr_number = run_data.get("pr_number")
+        if not pr_number:
+            return f"No PR linked to {run_id}."
+
+        workspace_dir = _resolve_workspace(run_data, self.workspace_root)
+        if not workspace_dir or not workspace_dir.exists():
+            return f"ERROR: Workspace not found for {run_id}."
+
+        try:
+            proc = subprocess.run(
+                ["gh", "pr", "comment", str(pr_number), "--body", comment_body],
+                capture_output=True, text=True, timeout=30,
+                cwd=str(workspace_dir),
+            )
+            if proc.returncode == 0:
+                return f"OK: Comment posted on PR #{pr_number}."
+            return f"ERROR: gh pr comment failed: {proc.stderr[:500]}"
+        except FileNotFoundError:
+            return "ERROR: 'gh' CLI not found. Install GitHub CLI."
+        except Exception as exc:
+            return f"ERROR: {exc}"
+
     # ── Tool 6: review_code ─────────────────────────────────────────────
 
     def review_code(self, run_id: str) -> str:
-        """Perform deep code review using the existing review pipeline."""
+        """Perform deep code review using the existing review pipeline.
+
+        Delegates to the run-code-review CLI which handles diff extraction,
+        sibling file loading, checklist, and LLM review call.
+        """
         result = self._run_cli(["run-code-review", "--run-id", run_id])
         if result["ok"]:
             # Read the review artifact
@@ -421,23 +537,117 @@ class AgentToolkit:
                 lines = [f"Code Review for {run_id}:"]
                 lines.append(f"Verdict: {meta.get('verdict', 'N/A')}")
                 lines.append(f"Summary: {meta.get('summary', 'N/A')}")
+                if meta.get("reference_provider"):
+                    lines.append(f"Reference provider: {meta['reference_provider']}")
                 if meta.get("issues"):
                     lines.append("Issues:")
                     for issue in meta["issues"]:
-                        lines.append(f"  - {issue}")
+                        if isinstance(issue, dict):
+                            lines.append(
+                                f"  - [{issue.get('severity', '?')}] {issue.get('file', '?')}: "
+                                f"{issue.get('description', '?')}"
+                            )
+                            if issue.get("suggested_fix"):
+                                lines.append(f"    Fix: {issue['suggested_fix']}")
+                        else:
+                            lines.append(f"  - {issue}")
+                if meta.get("verdict") == "CLEAN":
+                    lines.append("\nCode is clean. Proceed to generate_pr_body() and github_api(create_pr).")
+                else:
+                    lines.append("\nCode has issues. Consider: update_state(to_state='ITERATING') and execute_worker(task='review_fix').")
                 return "\n".join(lines)
-            return f"Code review completed but no artifact found."
+            return "Code review completed but no artifact found. Check read_evidence() for details."
         return f"ERROR: Code review failed: {result.get('error', 'unknown')}"
 
     # ── Tool 7: generate_pr_body ────────────────────────────────────────
 
     def generate_pr_body(self, run_id: str) -> str:
-        """Generate diff-aware PR description using existing LLM pipeline."""
-        # Delegate to request-open-pr which handles LLM body generation
-        result = self._run_cli(["request-open-pr", "--run-id", run_id])
-        if result["ok"]:
-            return f"PR body generated for {run_id}. Ready for approval."
-        return f"ERROR: PR body generation failed: {result.get('error', 'unknown')}"
+        """Generate diff-aware PR description via LLM.
+
+        Calls ManagerLLMClient.generate_pr_description() directly to get
+        the body text. Returns the generated markdown.
+        """
+        try:
+            snap = self.service.get_run_snapshot(run_id)
+        except KeyError:
+            return f"ERROR: Run '{run_id}' not found."
+
+        run_data = snap.get("run", snap)
+        workspace_dir = _resolve_workspace(run_data, self.workspace_root)
+        if not workspace_dir or not workspace_dir.exists():
+            return f"ERROR: Workspace not found for {run_id}."
+
+        project_name = run_data.get("repo", "unknown")
+
+        # Get git diff + stat
+        try:
+            diff_proc = subprocess.run(
+                ["git", "diff", "HEAD~1..HEAD"],
+                cwd=str(workspace_dir), capture_output=True, text=True, timeout=15,
+            )
+            diff_text = (diff_proc.stdout or "")[:4000]
+            stat_proc = subprocess.run(
+                ["git", "show", "--stat", "HEAD"],
+                cwd=str(workspace_dir), capture_output=True, text=True, timeout=15,
+            )
+            diff_stat = (stat_proc.stdout or "")[:2000]
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return f"ERROR: Failed to get git diff: {exc}"
+
+        if not diff_text.strip():
+            return "ERROR: No diff found. Worker may not have committed changes."
+
+        # Load repo PR template
+        pr_template = ""
+        for tpl_name in (".github/PULL_REQUEST_TEMPLATE.md", ".github/pull_request_template.md", "PULL_REQUEST_TEMPLATE.md"):
+            tpl_path = workspace_dir / tpl_name
+            if tpl_path.exists():
+                try:
+                    pr_template = tpl_path.read_text(encoding="utf-8")[:3000]
+                except OSError:
+                    pass
+                break
+
+        # Load evidence from digest artifact
+        evidence: dict[str, Any] = {}
+        digest = self.service.latest_artifact(run_id, artifact_type="run_digest")
+        if digest:
+            meta = digest.get("metadata") or {}
+            classification = meta.get("classification")
+            if isinstance(classification, dict):
+                evidence["grade"] = classification.get("grade", "")
+                evidence["reason_code"] = classification.get("reason_code", "")
+            elif meta.get("grade"):
+                evidence["grade"] = meta["grade"]
+            evidence["test_commands"] = meta.get("test_commands", meta.get("test_command_count", []))
+            evidence["changed_files"] = meta.get("changed_files", [])
+
+        # Call LLM
+        try:
+            from .manager_llm import ManagerLLMClient
+
+            client = ManagerLLMClient.from_runtime(
+                api_base=None,
+                model=None,
+                timeout_sec=30,
+                api_key_env="AGENTPR_MANAGER_API_KEY",
+            )
+            body = client.generate_pr_description(
+                project_name=project_name,
+                diff_text=diff_text,
+                diff_stat=diff_stat,
+                evidence=evidence,
+                pr_template=pr_template,
+            )
+            if body:
+                return f"Generated PR body:\n\n{body}"
+            return "ERROR: LLM returned empty body. Use a manual body with github_api(create_pr, params={{body: '...'}})."
+        except Exception as exc:
+            logger.warning("LLM PR body generation failed: %s", exc)
+            return (
+                f"ERROR: LLM body generation failed: {exc}. "
+                f"You can provide a manual body to github_api(create_pr)."
+            )
 
     # ── Tool 8: notify_human ────────────────────────────────────────────
 
@@ -450,6 +660,17 @@ class AgentToolkit:
         logger.info("HUMAN NOTIFICATION [%s]: %s", priority, message)
         # TODO(E2): Send via Telegram bot
         return f"OK: Notification sent (priority={priority}): {message[:200]}"
+
+    # ── Tool 8b: reply_human ───────────────────────────────────────────
+
+    def reply_human(
+        self,
+        message: str,
+    ) -> str:
+        """Reply to the current Telegram conversation. Stub for E1; connected in E2."""
+        logger.info("REPLY TO HUMAN: %s", message)
+        # TODO(E2): Send via Telegram bot to current conversation
+        return f"OK: Reply sent: {message[:200]}"
 
     # ── Tool 9: update_skill ────────────────────────────────────────────
 
@@ -485,9 +706,8 @@ class AgentToolkit:
         if action == "append_rule":
             with open(target_path, "a") as f:
                 f.write(f"\n- {content}\n")
-            logger.info("Appended rule to %s: %s", file, content[:100])
+            logger.info("Appended rule to %s: %s (reason: %s)", file, content[:100], reason[:100])
         elif action == "modify_rule":
-            # For now, only append is safe. Modify requires more careful handling.
             return "ERROR: modify_rule not yet implemented. Use append_rule or notify_human() for complex changes."
 
         return f"OK: Updated {file}. Reason: {reason}"
@@ -536,6 +756,13 @@ class AgentToolkit:
 
 # ── Tool schemas (OpenAI function-calling format) ──────────────────────
 
+# All agent-addressable states (including terminal states the agent may need)
+_AGENT_STATES = [
+    "EXECUTING", "PUSHED", "CI_WAIT", "REVIEW_WAIT",
+    "ITERATING", "PAUSED", "NEEDS_HUMAN_REVIEW",
+    "DONE", "FAILED", "FAILED_TERMINAL",
+]
+
 TOOL_DEFINITIONS: dict[str, dict[str, Any]] = {
     "query_runs": {
         "type": "function",
@@ -578,7 +805,7 @@ TOOL_DEFINITIONS: dict[str, dict[str, Any]] = {
                     "run_id": {"type": "string", "description": "Run ID to transition."},
                     "to_state": {
                         "type": "string",
-                        "enum": [s.value for s in RunState if not is_terminal(s)],
+                        "enum": _AGENT_STATES,
                         "description": "Target state.",
                     },
                     "reason": {"type": "string", "description": "Why this transition."},
@@ -614,7 +841,7 @@ TOOL_DEFINITIONS: dict[str, dict[str, Any]] = {
             "name": "execute_worker",
             "description": (
                 "Launch a codex exec Worker. Blocks until complete. "
-                "Safety: checks retry count and state. "
+                "Safety: checks retry count (<3) and state (must be EXECUTING or ITERATING). "
                 "After completion, use read_evidence() to check results."
             ),
             "parameters": {
@@ -634,19 +861,26 @@ TOOL_DEFINITIONS: dict[str, dict[str, Any]] = {
         "type": "function",
         "function": {
             "name": "github_api",
-            "description": "Interact with GitHub: create PR, read CI status, read reviews, read PR template.",
+            "description": (
+                "Interact with GitHub: create PR, read CI status, read reviews, "
+                "read PR template, or post a comment on a PR."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "run_id": {"type": "string", "description": "Run ID."},
                     "action": {
                         "type": "string",
-                        "enum": ["create_pr", "read_ci", "read_reviews", "read_pr_template"],
+                        "enum": ["create_pr", "read_ci", "read_reviews", "read_pr_template", "post_comment"],
                         "description": "GitHub action to perform.",
                     },
                     "params": {
                         "type": "object",
-                        "description": "Action-specific parameters (e.g. title/body for create_pr).",
+                        "description": (
+                            "Action-specific parameters. "
+                            "For create_pr: {title, body}. "
+                            "For post_comment: {body}."
+                        ),
                     },
                 },
                 "required": ["run_id", "action"],
@@ -659,7 +893,7 @@ TOOL_DEFINITIONS: dict[str, dict[str, Any]] = {
             "name": "review_code",
             "description": (
                 "Deep code review on worker's changes. Uses accumulated review knowledge "
-                "(7-section checklist from 17 PR reviews). Returns CLEAN or HAS_ISSUES."
+                "(7-section checklist from 17 PR reviews). Returns CLEAN or HAS_ISSUES with details."
             ),
             "parameters": {
                 "type": "object",
@@ -675,8 +909,9 @@ TOOL_DEFINITIONS: dict[str, dict[str, Any]] = {
         "function": {
             "name": "generate_pr_body",
             "description": (
-                "Generate diff-aware PR description. Reads diff, evidence, repo PR template. "
-                "Produces technical summary, per-file changes, usage example, test evidence."
+                "Generate diff-aware PR description via LLM. Reads diff, evidence, "
+                "and repo PR template. Returns the generated markdown body text. "
+                "Use this before github_api(create_pr) to get a quality PR body."
             ),
             "parameters": {
                 "type": "object",
@@ -701,6 +936,20 @@ TOOL_DEFINITIONS: dict[str, dict[str, Any]] = {
                         "enum": ["low", "normal", "high"],
                         "description": "Priority level. Default: normal.",
                     },
+                },
+                "required": ["message"],
+            },
+        },
+    },
+    "reply_human": {
+        "type": "function",
+        "function": {
+            "name": "reply_human",
+            "description": "Reply to the current Telegram conversation.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "message": {"type": "string", "description": "Reply message."},
                 },
                 "required": ["message"],
             },
@@ -744,6 +993,21 @@ def get_tool_schemas() -> list[dict[str, Any]]:
 
 # ── Formatting helpers ──────────────────────────────────────────────────
 
+def _resolve_workspace(run_data: dict[str, Any], workspace_root: Path) -> Path | None:
+    """Resolve workspace directory from run data."""
+    # Prefer explicit workspace_dir from DB
+    ws = run_data.get("workspace_dir")
+    if ws:
+        p = Path(ws)
+        if p.exists():
+            return p
+    # Fallback: workspace_root / repo
+    repo = run_data.get("repo", "")
+    if repo:
+        return workspace_root / repo
+    return None
+
+
 def _format_run_summary(run: dict[str, Any]) -> str:
     """One-line summary of a run."""
     run_id = run.get("run_id", "?")
@@ -760,8 +1024,7 @@ def _format_run_summary(run: dict[str, Any]) -> str:
 
 def _format_run_detail(snap: dict[str, Any]) -> str:
     """Detailed run information. Handles both list_runs format and get_run_snapshot format."""
-    # get_run_snapshot returns {"run": {...}, "state": "...", "display_state": "..."}
-    run_data = snap.get("run", snap)  # Unwrap if nested
+    run_data = snap.get("run", snap)
     state = snap.get("state", run_data.get("current_state", "?"))
 
     lines = [
@@ -776,6 +1039,8 @@ def _format_run_detail(snap: dict[str, Any]) -> str:
         lines.append(f"PR: #{run_data['pr_number']}")
     if run_data.get("branch"):
         lines.append(f"Branch: {run_data['branch']}")
+    if run_data.get("workspace_dir"):
+        lines.append(f"Workspace: {run_data['workspace_dir']}")
 
     suggestion = _suggest_action(state, run_data)
     lines.append(f"\nSuggested: {suggestion}")
@@ -786,24 +1051,24 @@ def _suggest_action(state: str, run: dict[str, Any]) -> str:
     """Suggest next action based on state."""
     s = state.upper()
     if s == "QUEUED":
-        return "update_state to EXECUTING, then execute_worker"
+        return "update_state(to_state='EXECUTING'), then execute_worker()"
     elif s == "EXECUTING":
-        return "execute_worker, then read_evidence to check results"
+        return "execute_worker(), then read_evidence() to check results"
     elif s == "PUSHED":
-        return "review_code, then generate_pr_body and github_api(create_pr)"
+        return "review_code(), then generate_pr_body() and github_api(action='create_pr')"
     elif s == "CI_WAIT":
-        return "github_api(read_ci) to check CI status"
+        return "github_api(action='read_ci') to check CI status"
     elif s == "REVIEW_WAIT":
-        return "github_api(read_reviews) to check maintainer feedback"
+        return "github_api(action='read_reviews') to check maintainer feedback"
     elif s == "ITERATING":
-        return "execute_worker(task='ci_fix' or 'review_fix')"
+        return "execute_worker(task='ci_fix' or 'review_fix'), then read_evidence()"
     elif s == "NEEDS_HUMAN_REVIEW":
-        return "Wait for human input or notify_human with update"
+        return "Wait for human input or notify_human() with update"
     elif s in ("DONE", "SKIPPED", "FAILED_TERMINAL"):
         return "Terminal state — no action needed"
     elif s == "FAILED":
-        return "Analyze failure, retry or escalate to human"
-    return "Read evidence and decide"
+        return "Analyze failure via read_evidence(), then retry or escalate"
+    return "read_evidence() and decide"
 
 
 def _git_diff(workspace_dir: Path) -> str:
