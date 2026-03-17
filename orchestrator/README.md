@@ -38,11 +38,12 @@ This package provides a minimal Phase A implementation:
 20. `manager_policy.py`: central defaults for agent/bot/webhook runtime behavior
 21. Run analysis artifacts: `run_digest` (JSON) + `manager_insight` (Markdown) per agent attempt
 22. Stage-level observability is persisted in `run_digest.stages` (step totals/attempt timeline/top step)
-23. `manager_decision.py`: rule-based next-action decision for manager loop
-24. `manager_loop.py`: manager automation runner (`manager-tick` / `run-manager-loop`)
-25. `manager_llm.py`: OpenAI-compatible manager LLM function-calling client (`rules|llm|hybrid`)
-26. `manager_tools.py`: manager tool primitives (`analyze_worker_output`, `get_global_stats`, `notify_user`)
-27. `manager_agent.py`: tool-driven manager decision core (rules/llm/hybrid with deterministic fallback)
+23. `manager_llm.py`: OpenAI-compatible manager LLM client (PR body generation, code review)
+24. `manager_tools.py`: manager tool primitives (`analyze_worker_output`, `get_global_stats`, `notify_user`)
+25. `agent_session.py`: Multi-turn agent session loop via Forge `/chat/completions`
+26. `agent_tools.py`: 10 agent tools with embedded safety checks
+27. `agent_prompts.py`: Agent system prompt + context builders
+28. `agent_loop.py`: Persistent agent daemon (`agent-tick` / `run-agent-loop`)
 
 Operational commands added:
 

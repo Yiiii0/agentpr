@@ -51,7 +51,6 @@ from .cli_worker import (
 from .db import Database
 from .executor import ScriptExecutor
 from .github_webhook import run_github_webhook_server
-from .manager_loop import ManagerLoopConfig, ManagerLoopRunner
 from .manager_llm import ManagerLLMClient, ManagerLLMError
 from .manager_tools import analyze_worker_output, get_global_stats, notify_user
 from .models import (
@@ -377,102 +376,6 @@ def add_idempotency_arg(command_parser: argparse.ArgumentParser) -> None:
         help="Optional idempotency key. Provide this for retriable command callers.",
     )
 
-
-def add_manager_common_args(command_parser: argparse.ArgumentParser) -> None:
-    command_parser.add_argument("--run-id", help="Optional single run id target.")
-    command_parser.add_argument(
-        "--limit",
-        type=int,
-        default=20,
-        help="Max runs scanned when --run-id is omitted (default: 20).",
-    )
-    command_parser.add_argument(
-        "--max-actions-per-run",
-        type=int,
-        default=4,
-        help="Max manager actions executed per run in one tick (default: 4).",
-    )
-    command_parser.add_argument(
-        "--prompt-file",
-        type=Path,
-        default=DEFAULT_WORKER_PROMPT_FILE,
-        help=(
-            "Prompt file used by run-agent-step actions "
-            f"(default: {DEFAULT_WORKER_PROMPT_FILE}; "
-            "env override: AGENTPR_WORKER_PROMPT_FILE)."
-        ),
-    )
-    command_parser.add_argument(
-        "--contract-template-file",
-        type=Path,
-        help="Optional template copied into auto-generated contract files.",
-    )
-    command_parser.add_argument(
-        "--disable-auto-contract",
-        action="store_true",
-        help="Disable automatic contract materialization when contract artifact is missing.",
-    )
-    command_parser.add_argument(
-        "--changes",
-        default="Automated integration updates from manager loop.",
-        help="Default --changes value for run-finish.",
-    )
-    command_parser.add_argument(
-        "--commit-title",
-        help="Optional default commit title for run-finish.",
-    )
-    command_parser.add_argument(
-        "--skills-mode",
-        choices=["off", "agentpr", "agentpr_autonomous"],
-        help="Optional skills mode override passed to run-agent-step.",
-    )
-    command_parser.add_argument(
-        "--codex-sandbox",
-        choices=["read-only", "workspace-write", "danger-full-access"],
-        help="Optional codex sandbox override passed to run-agent-step.",
-    )
-    command_parser.add_argument(
-        "--agent-arg",
-        action="append",
-        default=[],
-        help="Extra argument forwarded to run-agent-step (repeatable).",
-    )
-    command_parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Plan actions without executing them.",
-    )
-    command_parser.add_argument(
-        "--decision-mode",
-        choices=["rules", "llm", "hybrid"],
-        default="rules",
-        help="Manager decision strategy (default: rules).",
-    )
-    command_parser.add_argument(
-        "--manager-api-base",
-        help=(
-            "OpenAI-compatible API base for manager LLM "
-            "(default: AGENTPR_MANAGER_API_BASE or https://api.openai.com/v1)."
-        ),
-    )
-    command_parser.add_argument(
-        "--manager-model",
-        help="Manager LLM model (default: AGENTPR_MANAGER_MODEL or gpt-4o-mini).",
-    )
-    command_parser.add_argument(
-        "--manager-timeout-sec",
-        type=int,
-        default=20,
-        help="Manager LLM HTTP timeout seconds (default: 20).",
-    )
-    command_parser.add_argument(
-        "--manager-api-key-env",
-        default="AGENTPR_MANAGER_API_KEY",
-        help=(
-            "Env var name storing manager API key "
-            "(default: AGENTPR_MANAGER_API_KEY)."
-        ),
-    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1287,36 +1190,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Step-attempt rows loaded per run (default: 200).",
     )
 
-    mt = sub.add_parser(
-        "manager-tick",
-        help="Run one manager orchestration tick (rule-based actions)",
-    )
-    add_manager_common_args(mt)
-
-    ml = sub.add_parser(
-        "run-manager-loop",
-        help="Run manager orchestration loop continuously",
-    )
-    add_manager_common_args(ml)
-    ml.add_argument(
-        "--interval-sec",
-        type=int,
-        default=300,
-        help="Loop interval in seconds (default: 300).",
-    )
-    ml.add_argument(
-        "--max-loops",
-        type=int,
-        help="Optional max loop count for testing.",
-    )
-    ml.add_argument(
-        "--persistent",
-        action="store_true",
-        default=False,
-        help="Keep running even when all runs are idle (daemon mode).",
-    )
-
-    # ── Agent-based commands (Phase E) ────────────────────────────────
+    # ── Agent-based commands ────────────────────────────────
     at = sub.add_parser(
         "agent-tick",
         help="Run one Manager Agent tick (multi-turn tool-calling loop).",
@@ -1455,15 +1329,6 @@ def resolve_startup_doctor_profile(args: argparse.Namespace) -> dict[str, Any] |
             "require_telegram_token": False,
             "require_webhook_secret": False,
         }
-    if command in {"manager-tick", "run-manager-loop"}:
-        return {
-            "profile": "manager",
-            "check_network": True,
-            "require_gh_auth": True,
-            "require_codex": True,
-            "require_telegram_token": False,
-            "require_webhook_secret": False,
-        }
     if command == "simulate-bot-session":
         return {
             "profile": "simulate",
@@ -1517,47 +1382,6 @@ def run_startup_doctor(
         require_webhook_secret=require_webhook_secret,
     ).run()
     return report.to_dict()
-
-
-def build_manager_loop_config_from_args(args: argparse.Namespace) -> ManagerLoopConfig:
-    prompt_file = (
-        Path(args.prompt_file).expanduser().resolve()
-        if args.prompt_file is not None
-        else None
-    )
-    contract_template_file = (
-        Path(args.contract_template_file).expanduser().resolve()
-        if args.contract_template_file is not None
-        else None
-    )
-    return ManagerLoopConfig(
-        project_root=PROJECT_ROOT,
-        db_path=Path(args.db),
-        workspace_root=Path(args.workspace_root),
-        integration_root=Path(args.integration_root),
-        policy_file=Path(args.policy_file),
-        run_id=str(args.run_id).strip() if args.run_id else None,
-        limit=max(int(args.limit), 1),
-        max_actions_per_run=max(int(args.max_actions_per_run), 1),
-        prompt_file=prompt_file,
-        contract_template_file=contract_template_file,
-        auto_contract=not bool(args.disable_auto_contract),
-        default_changes=str(args.changes),
-        default_commit_title=(str(args.commit_title).strip() if args.commit_title else None),
-        codex_sandbox=(
-            str(args.codex_sandbox).strip() if args.codex_sandbox is not None else None
-        ),
-        skills_mode=str(args.skills_mode).strip() if args.skills_mode is not None else None,
-        agent_args=tuple(str(item) for item in (args.agent_arg or [])),
-        dry_run=bool(args.dry_run),
-        decision_mode=str(args.decision_mode).strip().lower(),
-        manager_api_base=(
-            str(args.manager_api_base).strip() if args.manager_api_base is not None else None
-        ),
-        manager_model=str(args.manager_model).strip() if args.manager_model is not None else None,
-        manager_timeout_sec=max(int(args.manager_timeout_sec), 1),
-        manager_api_key_env=str(args.manager_api_key_env).strip() or "AGENTPR_MANAGER_API_KEY",
-    )
 
 
 def enforce_startup_doctor_gate(args: argparse.Namespace) -> None:
@@ -1997,69 +1821,6 @@ def main() -> int:
                 telegram_sender=telegram_sender,
             )
             return exit_code
-
-        if args.command == "manager-tick":
-            config = build_manager_loop_config_from_args(args)
-            runner = ManagerLoopRunner(service=service, config=config)
-            report = runner.tick()
-            print_json(report)
-            return 0 if report["ok"] else 1
-
-        if args.command == "run-manager-loop":
-            config = build_manager_loop_config_from_args(args)
-            runner = ManagerLoopRunner(service=service, config=config)
-            loops = 0
-            fail_count = 0
-            consecutive_idle = 0
-            _IDLE_EXIT_TICKS = 3  # exit after N consecutive all-waiting ticks
-            persistent = bool(getattr(args, "persistent", False))
-            wake_path = Path(args.db).parent / ".wake_manager"
-            _HIBERNATE_INTERVAL = 600  # longer sleep when idle in persistent mode
-            try:
-                while True:
-                    report = runner.tick()
-                    print_json(report)
-                    if not bool(report.get("ok", False)):
-                        fail_count += 1
-                    progressed = int(report.get("progressed_count", 0))
-                    if progressed == 0 and int(report.get("run_count", 0)) > 0:
-                        consecutive_idle += 1
-                    else:
-                        consecutive_idle = 0
-                    loops += 1
-                    if args.max_loops is not None and loops >= max(int(args.max_loops), 1):
-                        break
-                    # Exit early if all runs are waiting/terminal for N ticks
-                    if consecutive_idle >= _IDLE_EXIT_TICKS and not persistent:
-                        print_json({
-                            "idle_exit": True,
-                            "reason": (
-                                f"all runs idle for {consecutive_idle} consecutive ticks, "
-                                "exiting. Resume with /retry or /resume when ready."
-                            ),
-                            "loops_completed": loops,
-                        })
-                        break
-                    # In persistent mode, hibernate when idle (longer interval)
-                    if persistent and consecutive_idle > 0:
-                        sleep_sec = min(
-                            max(int(args.interval_sec), 1) * 2,
-                            _HIBERNATE_INTERVAL,
-                        )
-                    else:
-                        sleep_sec = max(int(args.interval_sec), 1)
-                    # Check wake file: webhook or bot can signal immediate tick
-                    if wake_path.exists():
-                        try:
-                            wake_path.unlink(missing_ok=True)
-                        except OSError:
-                            pass
-                        sleep_sec = 1  # immediate next tick
-                        consecutive_idle = 0  # reset idle counter
-                    time.sleep(sleep_sec)
-            except KeyboardInterrupt:
-                return 130
-            return 0 if fail_count == 0 else 1
 
         if args.command == "create-run":
             budget = json.loads(args.budget_json)
@@ -2934,6 +2695,8 @@ def main() -> int:
                 metadata={
                     "base": base,
                     "head": head,
+                    "confirm_token": confirm_token,
+                    "request_file": str(request_path),
                     "expires_at": expires_at.isoformat(),
                     "body_meta": body_meta,
                 },

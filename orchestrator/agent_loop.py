@@ -68,7 +68,7 @@ def run_agent_loop(
 ) -> int:
     """Run the agent manager loop. Returns exit code.
 
-    This is the main entry point, equivalent to the existing run_manager_loop().
+    This is the main entry point for the manager agent loop.
     """
     wake_path = service.db.db_path.parent / ".wake_manager"
     consecutive_idle = 0
