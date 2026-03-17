@@ -316,16 +316,43 @@ class AgentToolkit:
 
         result = self._run_cli(argv)
 
-        if result["ok"]:
-            return (
-                f"OK: Worker completed for {run_id}. "
-                f"Use read_evidence(run_id='{run_id}') to check results."
-            )
-        else:
+        if not result["ok"]:
             return (
                 f"Worker failed for {run_id}: {result.get('error', 'unknown')}. "
                 f"Output: {result.get('output', '')[:500]}"
             )
+
+        # Check if worker made changes that need commit+push
+        # (when allow_agent_push=False, worker leaves changes uncommitted)
+        workspace_dir = _resolve_workspace(run_data, self.workspace_root)
+        if workspace_dir and workspace_dir.exists():
+            try:
+                diff_check = subprocess.run(
+                    ["git", "diff", "--stat"],
+                    cwd=str(workspace_dir), capture_output=True, text=True, timeout=10,
+                )
+                has_uncommitted = bool(diff_check.stdout.strip())
+            except (OSError, subprocess.TimeoutExpired):
+                has_uncommitted = False
+
+            if has_uncommitted:
+                # Run finish.sh to commit + push
+                finish_result = self._run_cli([
+                    "run-finish",
+                    "--run-id", run_id,
+                    "--changes", f"Add Forge as LLM provider for {run_data.get('repo', 'project')}",
+                ])
+                if not finish_result["ok"]:
+                    return (
+                        f"Worker completed for {run_id} but commit+push failed: "
+                        f"{finish_result.get('error', 'unknown')}. "
+                        f"Output: {finish_result.get('output', '')[:500]}"
+                    )
+
+        return (
+            f"OK: Worker completed for {run_id}. "
+            f"Use read_evidence(run_id='{run_id}') to check results."
+        )
 
     # ── Tool 5: github_api ──────────────────────────────────────────────
 
