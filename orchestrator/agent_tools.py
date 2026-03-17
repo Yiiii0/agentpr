@@ -610,19 +610,33 @@ class AgentToolkit:
                     pass
                 break
 
-        # Load evidence from digest artifact
+        # Load evidence from digest file (not just DB metadata, which is sparse)
         evidence: dict[str, Any] = {}
-        digest = self.service.latest_artifact(run_id, artifact_type="run_digest")
-        if digest:
-            meta = digest.get("metadata") or {}
-            classification = meta.get("classification")
-            if isinstance(classification, dict):
-                evidence["grade"] = classification.get("grade", "")
-                evidence["reason_code"] = classification.get("reason_code", "")
-            elif meta.get("grade"):
-                evidence["grade"] = meta["grade"]
-            evidence["test_commands"] = meta.get("test_commands", meta.get("test_command_count", []))
-            evidence["changed_files"] = meta.get("changed_files", [])
+        digest_art = self.service.latest_artifact(run_id, artifact_type="run_digest")
+        if digest_art:
+            digest_uri = str(digest_art.get("uri") or "").strip()
+            if digest_uri and Path(digest_uri).is_file():
+                try:
+                    full_digest = json.loads(Path(digest_uri).read_text(encoding="utf-8"))
+                    cls = full_digest.get("classification") or {}
+                    evidence["grade"] = cls.get("grade", "")
+                    evidence["reason_code"] = cls.get("reason_code", "")
+                    val = full_digest.get("validation") or {}
+                    evidence["test_commands"] = val.get("test_commands", [])
+                    evidence["failed_test_commands"] = val.get("failed_test_commands", [])
+                    evidence["test_command_count"] = val.get("test_command_count", 0)
+                    evidence["failed_test_command_count"] = val.get("failed_test_command_count", 0)
+                    chg = full_digest.get("changes") or {}
+                    evidence["changed_files"] = chg.get("changed_files", [])
+                    evidence["changed_files_count"] = chg.get("changed_files_count", 0)
+                    evidence["added_lines"] = chg.get("added_lines", 0)
+                except (json.JSONDecodeError, OSError):
+                    pass
+            if not evidence:
+                # Fallback to sparse metadata
+                meta = digest_art.get("metadata") or {}
+                evidence["grade"] = meta.get("grade", "")
+                evidence["reason_code"] = meta.get("reason_code", "")
 
         # Call LLM
         try:
@@ -748,8 +762,8 @@ class AgentToolkit:
                 "ok": proc.returncode == 0,
                 "command": " ".join(argv),
                 "returncode": proc.returncode,
-                "output": proc.stdout[:2000] if proc.stdout else "",
-                "error": proc.stderr[:2000] if proc.stderr else "",
+                "output": proc.stdout[:8000] if proc.stdout else "",
+                "error": proc.stderr[:4000] if proc.stderr else "",
             }
         except subprocess.TimeoutExpired:
             return {

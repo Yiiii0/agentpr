@@ -18,9 +18,14 @@ If `pip install` / `npm install` / `bun install` fails:
 - For JS/TS: `bun test` → `npm test` → `npx tsc --noEmit`
 - Report what you tried and what happened — a failed validation attempt is better than no attempt.
 
+## Change Substantiveness
+
+- Integration MUST include at least one **non-test source file** change (provider class, config, factory registration, or env example). Test-only changes are NOT a valid integration — the grading system will flag them as NEEDS_REVIEW.
+- If the repo has no clear integration point (no provider registry, no multi-provider architecture), report SKIP rather than modifying only test files.
+
 ## Classification
 
-- `PASS`: required checks passed and no policy violations.
+- `PASS`: required checks passed, non-test source files changed, and no policy violations.
 - `NEEDS REVIEW`: blocked by pre-existing env/repo issues or policy ambiguity.
 - `FAIL`: change introduces reproducible failures.
 - `SKIP`: repo architecture does not require/allow Forge integration path.

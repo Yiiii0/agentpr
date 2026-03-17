@@ -117,6 +117,21 @@ def contains_any_pattern(text: str, patterns: tuple[str, ...]) -> bool:
     return any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in patterns)
 
 
+def _is_test_file(path: str) -> bool:
+    """Check if a file path looks like a test file (not core source code)."""
+    parts = path.replace("\\", "/").lower().split("/")
+    basename = parts[-1] if parts else ""
+    # Directory-level: tests/, test/, __tests__/, spec/
+    if any(p in ("tests", "test", "__tests__", "spec", "specs") for p in parts[:-1]):
+        return True
+    # File-level: test_*.py, *_test.py, *.test.ts, *.spec.ts, conftest.py
+    if basename.startswith("test_") or basename.endswith(("_test.py", ".test.ts", ".test.js", ".spec.ts", ".spec.js")):
+        return True
+    if basename == "conftest.py":
+        return True
+    return False
+
+
 def summarize_command_categories(commands: list[str]) -> dict[str, int]:
     counts = {
         "dependency_install": 0,
@@ -836,6 +851,22 @@ def classify_agent_runtime(
                     "changed_files_count": 0,
                     "added_lines": 0,
                     "test_commands": test_signals[:12],
+                },
+            }
+        changed_files = list(diff_summary.get("changed_files") or [])
+        if (
+            run_state in {RunState.EXECUTING, RunState.IMPLEMENTING}
+            and changed_files
+            and all(_is_test_file(f) for f in changed_files)
+        ):
+            return {
+                "grade": AgentRuntimeGrade.HUMAN_REVIEW.value,
+                "reason_code": "test_only_changes",
+                "next_action": "escalate",
+                "evidence": {
+                    "changed_files": changed_files[:16],
+                    "changed_files_count": changed_files_count,
+                    "added_lines": added_lines,
                 },
             }
         if (max_changed_files > 0 and changed_files_count > max_changed_files) or (
