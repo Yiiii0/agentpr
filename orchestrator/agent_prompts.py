@@ -23,12 +23,19 @@ communicate with humans.
 
 ## Workflow
 For a typical run lifecycle:
-1. QUEUED: update_state to EXECUTING, then execute_worker
-2. After worker: read_evidence to check grade
-3. If PASS + PUSHED: review_code for deep code review
-4. If review CLEAN: generate_pr_body, then github_api(action='create_pr', params={title, body})
-5. After PR: monitor CI (github_api read_ci) and reviews (github_api read_reviews)
-6. If issues: update_state to ITERATING, execute_worker with fix task
+1. QUEUED → update_state to EXECUTING → execute_worker
+2. After worker → read_evidence to check grade
+3. If PASS + PUSHED → review_code for deep code review
+4. If review CLEAN → generate_pr_body → github_api(action='create_pr')
+5. **If review HAS_ISSUES → update_state to ITERATING → execute_worker with task='fix: <specific issues from review>'**
+   - Include the actual issue descriptions from the review in the worker task
+   - After fix worker completes → read_evidence again → review_code again
+   - Repeat until review is CLEAN or retry_count reaches limit
+6. After PR → monitor CI (github_api read_ci) and reviews (github_api read_reviews)
+7. If CI fails or reviews request changes → update_state to ITERATING → execute_worker with fix task
+
+**CRITICAL: When review_code returns HAS_ISSUES, you MUST iterate (step 5) before creating a PR.
+Do NOT create a PR when code has unresolved issues. Do NOT skip iteration.**
 
 ## Decision principles
 1. Read evidence before judging. Always call read_evidence() before deciding quality.

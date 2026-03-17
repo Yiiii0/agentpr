@@ -58,6 +58,7 @@ _ALLOWED_TRANSITIONS: dict[RunState, set[RunState]] = {
     },
     RunState.PUSHED: {
         RunState.CI_WAIT,
+        RunState.ITERATING,
         RunState.PAUSED,
         RunState.FAILED,
         RunState.NEEDS_HUMAN_REVIEW,

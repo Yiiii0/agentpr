@@ -1111,7 +1111,7 @@ def _suggest_action(state: str, run: dict[str, Any]) -> str:
     elif s == "EXECUTING":
         return "execute_worker(), then read_evidence() to check results"
     elif s == "PUSHED":
-        return "review_code(), then generate_pr_body() and github_api(action='create_pr')"
+        return "review_code() first. If CLEAN: generate_pr_body() → github_api(create_pr). If HAS_ISSUES: update_state(to_state='ITERATING') → execute_worker(task='fix: <issues>')"
     elif s == "CI_WAIT":
         return "github_api(action='read_ci') to check CI status"
     elif s == "REVIEW_WAIT":
