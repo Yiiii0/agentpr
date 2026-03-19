@@ -1,6 +1,6 @@
 # AgentPR Master Plan
 
-> 更新：2026-03-11 | 状态：E2 完成（Manager Agent 重构），E3 验证待做
+> 更新：2026-03-16 | 状态：E3 验证基本完成，进入 D5 Merge Rate 优化
 > 归档：`docs/AGENTPR_MASTER_PLAN_ARCHIVE_20260310_PRE_LEAN.md`（详细历史）
 
 ---
@@ -17,12 +17,12 @@
 
 ## 2. 当前主矛盾
 
-**Manager Agent 重构完成（E0-E2）。9 x 1-shot → 真正的 Agent with tools。**
+**Manager Agent 重构 + 验证完成（E0-E3）。旧代码已清理，Agent 端到端验证通过。**
 
-- Manager 从 ~7.3K 行 plumbing 替换为 ~2K 行 agent loop + tools（并行运行，旧代码未删）
-- Agent 生产验证通过：26 tool calls / tick，正确处理 20 个 active runs
-- 22 repos 测试，19/22 PASS+PUSHED (86%)，17 PRs，1 merged (5.9%)
-- **下一步：E3 验证 + 旧代码清理 + merge rate 优化**
+- Manager 从 ~7.3K 行 plumbing 替换为 ~2K 行 agent loop + tools，旧 manager 代码已删除
+- E3 验证：7 个 bug 修复，3 新 repo 端到端测试（worker → commit+push → code review → PR body 生成）
+- 22+3 repos 测试，Worker 86% PASS，Agent 正确处理全流程
+- **主矛盾转移：PASS rate (86%) → Merge rate (5.9%)。技术债已清，产品优化是下一步**
 
 ---
 
@@ -42,10 +42,12 @@ Human (Telegram)  →  Manager Agent (LLM + 10 tools)  →  Worker (codex exec) 
 
 ```
 QUEUED → EXECUTING → PUSHED → Code Review → PR Gate → CI_WAIT → REVIEW_WAIT → DONE
-                        ↑                      |              |
-                        └── ITERATING ←────────┘──────────────┘
+                        ↑          |                     |              |
+                        └── ITERATING ←──────────────────┘──────────────┘
 + PAUSED (任何非终态)  + NEEDS_HUMAN (升级)  + FAILED (终态)
 ```
+
+注：E3 新增 PUSHED → ITERATING 转移（代码审查发现问题时可迭代修复后重新 push）。
 
 ### 角色边界
 
@@ -73,33 +75,36 @@ Event → build context from DB → Agent session (max 15 turns) → tools side 
 |------|------|---------|
 | `query_runs` | 查询 run 状态/详情 | — |
 | `update_state` | 状态转移 | state_machine.can_transition() |
-| `read_evidence` | 读 worker 产出/grade/review | — |
-| `execute_worker` | 启动 codex exec | retry_count < 3, 状态必须是 EXECUTING/ITERATING |
-| `github_api` | create_pr/read_ci/read_reviews/post_comment | PR gate + DoD via CLI pipeline |
-| `review_code` | 深度代码审查 | 委托 run-code-review CLI（保留专门 prompt） |
-| `generate_pr_body` | diff-aware PR body | 委托 ManagerLLMClient（保留专门 prompt） |
+| `read_evidence` | 读 worker 产出/grade/review（从 digest 文件读取完整证据） | — |
+| `execute_worker` | 启动 codex exec + 自动 run-finish commit+push | retry_count < 3, 状态必须是 EXECUTING/ITERATING |
+| `github_api` | create_pr/read_ci/read_reviews/post_comment/read_pr_template | PR gate + DoD via CLI pipeline |
+| `review_code` | 深度代码审查（CLEAN → PR / HAS_ISSUES → 迭代） | 委托 run-code-review CLI（保留专门 prompt） |
+| `generate_pr_body` | diff-aware PR body（从 digest 文件读取完整证据） | 委托 ManagerLLMClient（保留专门 prompt） |
 | `notify_human` | Telegram 通知 | — |
 | `reply_human` | Telegram 回复 | — |
 | `update_skill` | 更新 skill 文件 | 文件白名单（低风险 only） |
 
 **9 → 2 specialized tools + Agent 内在推理。** #7（PR body）和 #8（code review）保留专门 prompt，因为需要丰富的 context（diff、sibling files、checklist）。其余 7 个 1-shot 方法被 Agent 的多轮推理能力替代。
 
-### 旧架构（保留运行，待 E3 后清理）
-
-9 个 1-shot 方法在 `manager_llm.py`，通过 `manager_loop.py` + `manager_decision.py` 规则引擎调用。
+E3 关键改进：
+- `execute_worker` 自动调用 `run-finish` 完成 commit+push（关闭 EXECUTING 卡住的 gap）
+- `generate_pr_body` 从 digest 文件读取完整证据（不再依赖稀疏 DB metadata）
+- `review_code` 返回 HAS_ISSUES 时，Agent prompt 明确要求迭代而非直接创建 PR
+- PR body 的维护声明只通过 About Forge 模板出现一次（不再由 LLM 重复生成）
 
 ---
 
 ## 5. 质量链
 
 ```
-Worker 执行 → Hybrid Grading (rules+LLM) → Code Review (LLM) → PR Gate → PR
-    ↑                                            |
-    └────────── ITERATING (fix issues) ──────────┘
+Worker 执行 → run-finish (commit+push) → Hybrid Grading → Code Review → PR Gate → PR
+    ↑                                                          |
+    └──────────────── ITERATING (fix issues) ──────────────────┘
 ```
 
-- **Grading**：Rules 提取证据包（test/lint/diff/exit_code），LLM 做语义判断。硬护栏不可被 LLM 覆盖。
-- **Code Review**：diff + changed files + sibling reference files + 7-section checklist → CLEAN/HAS_ISSUES。
+- **Grading**：Rules 提取证据包（test/lint/diff/exit_code），LLM 做语义判断。硬护栏不可被 LLM 覆盖。**E3 新增**：test-only changes 检测 → HUMAN_REVIEW（纯测试文件改动不是有效 integration）。
+- **Code Review**：diff + changed files + sibling reference files + 7-section checklist → CLEAN/HAS_ISSUES。**E3 修复**：HAS_ISSUES 时 Agent 必须迭代（PUSHED → ITERATING），不可跳过直接创建 PR。
+- **PR Body**：LLM 基于 commit diff + digest evidence 生成（Summary + Changes + Usage + Test Evidence），About Forge 固定模板拼接。
 - **PR Readiness**（auto mode）：code review + evidence + PR body + template + 7 principles → APPROVE/NEEDS_HUMAN。
 - **三层防线**：Worker self-review → Manager code review → Human gate。
 
@@ -107,22 +112,25 @@ Worker 执行 → Hybrid Grading (rules+LLM) → Code Review (LLM) → PR Gate �
 
 ## 6. 战略方向
 
-### 近期：E3 验证 + 旧代码清理
+### 近期：E3 收尾 + D5 Merge Rate 优化
+
+| 优先级 | 项目 | 状态 | 预期影响 |
+|--------|------|------|---------|
+| ✅ | **E3 旧代码清理**：删除 manager_loop.py, manager_decision.py, manager_agent.py + 死代码 | 完成（-2100 行） | 净减代码 |
+| ✅ | **E3 Bug 修复**：7 个 bug（证据读取、commit+push、迭代循环、PR body 等） | 完成 | Agent 端到端可用 |
+| ✅ | **E3 验证**：3 新 repo 端到端测试（magentic, ExtractThinker, promptulate） | 完成 | Worker→Push→Review→PR body 全通 |
+| 进行中 | **E3 PR 创建端到端**：approve-open-pr 实际创建 GitHub PR | 被 gh auth 阻塞 | 验证最后一环 |
+
+### 中期：D5 Merge Rate 优化（主矛盾）
 
 | 优先级 | 项目 | 预期影响 |
 |--------|------|---------|
-| ⭐ | **E3 验证**：5+ repos 跑 `run-agent-loop` 完整流程 | 验证 Agent vs 旧 Manager |
-| ⭐ | **旧代码清理**：删除 manager_decision.py, manager_agent.py, 部分 manager_loop.py | 净减 ~5K 行 |
-| 高 | **Agent session 成本对比**：token usage vs 旧 9 x 1-shot | 数据驱动模型选择 |
-
-### 中期：Merge Rate 优化
-
-| 优先级 | 项目 | 预期影响 |
-|--------|------|---------|
-| ⭐ | **收割现有 17 PRs**：签 CLA、bump 零回应 PR | 直接提升 merge 数 |
+| ⭐ | **收割现有 PRs**：签 CLA、bump 零回应 PR | 直接提升 merge 数 |
 | ⭐ | **Repo targeting**：只选有 registry/factory 的 repo | 提升 PR 质量 |
+| ⭐ | **Agent 迭代循环**：HAS_ISSUES 时自动修复+重新 review（已有基础设施） | 提升 PR 首次质量 |
 | 高 | **Scale to 50 repos**：测量真实 merge rate | 获取 PMF 数据 |
 | 中 | **PR follow-up 自动化**：Agent 自动 bump | 提升 respond rate |
+| 中 | **Worker 规则合规强化**：部分 worker 不遵守 forge_rules（如 os.environ 污染） | 减少 HAS_ISSUES |
 
 ---
 
@@ -137,6 +145,8 @@ Worker 执行 → Hybrid Grading (rules+LLM) → Code Review (LLM) → PR Gate �
 7. **Manager Agent via Forge `/chat/completions`**，模型无关（GPT-4o / Claude / Gemini 均通过验证）
 8. **安全在 tools 层，不在 agent 层**。Agent 自由行动，tools 拒绝非法操作
 9. **不引入框架**。30 行 agent loop + OpenAI function-calling format 足够
+10. **Agent 工具输出必须包含下一步建议**。`_suggest_action()` 对两种路径（CLEAN vs HAS_ISSUES）都给出明确指引
+11. **固定内容只在模板层出现，不在 LLM prompt 中重复**。避免分层拼接导致重复
 
 ---
 
@@ -158,14 +168,18 @@ Worker 执行 → Hybrid Grading (rules+LLM) → Code Review (LLM) → PR Gate �
 | E0 Agent Spike | 03-10 | agent loop + 9 tools + system prompt。5 turns / 18 tool calls 验证通过 |
 | E1 Full Tool Layer | 03-10 | 10 tools + safety fixes + LLM body gen + PR flow + context builder |
 | E2 Integration | 03-11 | agent_loop.py daemon + Telegram 通知 + webhook 集成 + audit。26 tool calls 生产验证 |
+| E3 Cleanup | 03-16 | 删除 3 旧 manager 文件 + 死代码清理（-2100 行） |
+| E3 Bug Fixes | 03-16 | 7 个 bug 修复：证据读取(A)、confirm_token(B+C)、test-only 检测(D+E)、auto run-finish(F)、迭代循环(G) |
+| E3 Validation | 03-16 | 3 新 repo 端到端测试。Worker→Push→Review→PR body 全通。LLM body 证据正确 |
 
 ### 验证数据
 
-- **22 repos 测试**：19 PASS+PUSHED (86%), 3 HUMAN_REVIEW
+- **25 repos 测试**：22 PASS+PUSHED (88%), 3 HUMAN_REVIEW（含 E3 新增 magentic, ExtractThinker, promptulate）
 - **17 PRs 提交**：1 merged (octotools #53), 13 clean, 2 CLA blocked, 1 maintainer positive
 - **Code review 发现**：4 逻辑 bug（DAMO-ConvAI Union type, pipecat os.getenv, octotools factory, weave elif），全部修复
 - **平均 worker attempt**：1.0（首次执行即 PASS）
 - **Agent 生产验证**：26 tool calls/tick, 15K input + 1.5K output tokens, 正确处理 20 active runs
+- **E3 端到端验证**：3 新 repo 均完成 worker + commit+push + code review + LLM PR body 生成
 
 ---
 
@@ -276,6 +290,16 @@ Worker 执行 → Hybrid Grading (rules+LLM) → Code Review (LLM) → PR Gate �
 68. **工具输出包含下一步建议是关键 ACI 设计。** `_suggest_action()` 让 Agent 知道该做什么，不只是返回 raw data
 69. **并行运行是安全的迁移策略。** `run-agent-loop` 和 `run-manager-loop` 共存，新旧对比后再删旧代码
 
+### E3 验证 (#70-#76)
+
+70. **状态机缺失转移是隐形 bug。** PUSHED→ITERATING 不在允许列表 → Agent 无法迭代修复代码。状态机必须覆盖所有合理的业务流程，不只是正向流程
+71. **Tool 输出截断会导致级联失败。** stdout 2000 字符截断 → JSON 被截断 → confirm_token 丢失 → PR 创建失败。任何 tool 的输出上限必须覆盖最大合理输出
+72. **DB metadata 和 artifact 文件的信息密度差距巨大。** Artifact metadata 只存 4 个字段，文件里有完整证据。Agent 工具必须从文件（而非 metadata）读取证据
+73. **Worker commit+push 不能假设由外部驱动。** `allow_agent_push=False` 时 worker 不 commit，但 Manager Agent 的 `execute_worker` 也没调 `run-finish` → 改动永远不 push。关键步骤必须有明确 owner
+74. **纯测试文件改动不是有效 integration。** 部分 worker 只加测试不改源码 → grading 判 PASS 但实际无集成价值。质量检查必须区分"有改动"和"有效改动"
+75. **LLM 生成内容与模板拼接必须去重。** PR body 中维护声明出现两次：LLM prompt 要求生成一次 + About Forge 模板包含一次。分层系统中固定内容应只在一层出现
+76. **Prompt 中的流程描述必须覆盖异常路径。** Agent prompt 只写了 "CLEAN → create PR"，没有明确写 "HAS_ISSUES → iterate"。Agent 会忽略未明确指示的路径
+
 ---
 
 ## 10. 安全与隔离
@@ -290,8 +314,10 @@ Worker 执行 → Hybrid Grading (rules+LLM) → Code Review (LLM) → PR Gate �
 
 ## 11. 技术债
 
-- **旧 Manager 代码清理**（E3 后）：删除 manager_decision.py, manager_agent.py, manager_tools.py, 简化 manager_loop.py (~7.3K 行)
+- ~~旧 Manager 代码清理~~ ✅ E3 已完成：删除 manager_loop.py (1313), manager_decision.py (403), manager_agent.py (219) + 死代码清理
 - **Telegram inbound → Agent session**：当前只有 outbound 通知，inbound 消息仍走旧 Bot 路由
+- **Worker 规则合规**：部分 worker 不遵守 forge_rules.md（如 ExtractThinker 直接修改 os.environ），需强化 worker prompt 或增加 post-execution 检查
+- **manager_llm.py 瘦身**：旧 9 x 1-shot 方法仍在（generate_pr_description 和 review_code_changes 被 Agent tools 复用，其余 7 个待清理）
 - Forge 422 修复后切回（独立于主线）
 - Bot 会话持久化 ✅（SQLite `bot_sessions` 表）
 - Review triage 用户确认 ✅（`/approve_triage` + artifact gate）
