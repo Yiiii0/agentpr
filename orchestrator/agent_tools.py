@@ -379,6 +379,23 @@ class AgentToolkit:
 
     def _create_pr(self, run_id: str, params: dict[str, Any]) -> str:
         """Create a PR through the request-open-pr + approve-open-pr pipeline."""
+        # ── Hard gate: code review must exist and be CLEAN ──
+        review_art = self.service.latest_artifact(run_id, artifact_type="code_review")
+        if not review_art:
+            return (
+                "ERROR: No code review found for this run. "
+                "You MUST call review_code() before creating a PR. "
+                "This is a mandatory quality gate, not optional."
+            )
+        review_verdict = (review_art.get("metadata") or {}).get("verdict", "")
+        if review_verdict != "CLEAN":
+            return (
+                f"ERROR: Code review verdict is '{review_verdict}', not CLEAN. "
+                f"Fix the issues first: update_state(to_state='ITERATING'), "
+                f"then execute_worker(task='fix: <issues from review>'). "
+                f"PR creation requires a CLEAN code review."
+            )
+
         title = params.get("title", "")
         body = params.get("body", "")
 

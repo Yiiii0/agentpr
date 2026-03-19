@@ -35,18 +35,37 @@ Execute contract-driven code changes with strict minimal-diff discipline, then r
 - Run required lint/test/typecheck commands from contract.
 - Capture command + outcome clearly.
 
-5. Final self-check.
+5. Final self-check — **with evidence**.
 - Run through `references/self_review_checklist.md` — every item must pass.
 - Ensure diff stays within budget and only intentional files changed.
 - Ensure no commit/push when manager policy disallows push.
+- **You MUST produce a `self_review` evidence block** (see Output Format). For each critical check, include the actual command output or code snippet that proves it passes — not just "checked" or "OK".
 
 ## Output Format
 
 Return a compact structured summary with:
 - `status`: `PASS | NEEDS REVIEW | FAIL | SKIP`
 - `files_changed`: explicit file list
-- `validation`: command/results list
+- `validation`: command/results list (command + exit_code + summary)
+- `self_review`: evidence for critical checklist items (see below)
 - `notes`: blockers or follow-up actions
+
+### self_review evidence (mandatory)
+
+For these critical items, provide **verifiable evidence** (actual command output or code snippet). Do NOT write "checked" or "OK" — show the proof.
+
+```
+self_review:
+  git_diff_files: <paste output of `git diff --name-only`>
+  lock_files_clean: <"no lock files in diff" or "reverted: git checkout poetry.lock">
+  reference_provider: <name and path of the most similar provider you copied>
+  os_environ_check: <paste output of `grep -n "os.environ\[" <your_changed_files>` — should be empty, or explain why it's safe>
+  base_url_value: <the actual default base_url string in your code>
+  env_var_name: <the actual env var name used for API key>
+  test_evidence: <command + exit_code + pass/fail count>
+```
+
+This evidence will be verified by the Manager's code review. Fabricated evidence will be caught and the run will be sent back for iteration.
 
 ## Hard Rules
 

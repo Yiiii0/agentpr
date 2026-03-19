@@ -1,7 +1,7 @@
 #!/bin/bash
 # Usage: ./prepare.sh OWNER REPO [BASE_BRANCH] [FEATURE_BRANCH]
 # Example: ./prepare.sh virattt dexter
-# Example: ./prepare.sh assafelovic gpt-researcher master feature/forge-run-001
+# Example: ./prepare.sh assafelovic gpt-researcher master feat/add-forge-integration
 # If BASE_BRANCH is not specified, auto-detects from upstream HEAD.
 # If FEATURE_BRANCH is not specified, generates a unique branch name per run.
 # Set AGENTPR_BASE_DIR to change workspace root (default: /Users/yi/Documents/Career/TensorBlcok/agentpr/workspaces).
@@ -21,7 +21,7 @@ if [ -z "$OWNER" ] || [ -z "$REPO" ]; then
 fi
 
 if [ -z "$FEATURE_BRANCH" ]; then
-  FEATURE_BRANCH="feature/forge-$(date +%Y%m%d-%H%M%S)"
+  FEATURE_BRANCH="feat/add-forge-integration"
 fi
 
 mkdir -p "$BASE_DIR"
