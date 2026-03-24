@@ -15,7 +15,8 @@ workspaces/
 data/
 start_claude_code.sh
 .trae/
-test/
+test/*.sh
+test/*.txt
 log.txt
 *.txt
 .claude/
