@@ -1,7 +1,7 @@
 # Manager Agent 重构：架构设计文档
 
-> 创建时间：2026-03-10
-> 状态：设计阶段，待对齐认知
+> 创建时间：2026-03-10 | 更新：2026-03-16
+> 状态：E0-E3 已完成，旧代码已删除
 > 目的：将 Manager 从 "9 x 1-shot LLM + Python 规则引擎" 升级为 "真正的 Agent"
 
 ---
@@ -785,40 +785,89 @@ Telegram session context:
 
 ---
 
-## 6. Implementation Plan
+## 6. Implementation Plan & Status
 
-### Phase E0: Spike（1-2 天）
+### Phase E0: Spike ✅ (2026-03-10)
 
 目标：验证 "Agent 替代 9 x 1-shot" 的可行性。
 
-1. 创建 `feature/manager-agent` branch
-2. 实现 agent loop（30 行）
-3. 实现 3 个核心 tools：query_runs, execute_worker, read_evidence
-4. 硬编码 system prompt
-5. 在 1-2 个 repo 上跑：对比 Agent session 的决策质量 vs 旧 manager 的决策
+实现：
+- `agent_session.py`（191 行）— 多轮 tool-calling loop via Forge `/chat/completions`
+- `agent_tools.py`（初版）— 9 个 tools + OpenAI function-calling schemas
+- `agent_prompts.py`（初版）— system prompt + context builders
+- `cli.py` 新增 `agent-tick` 命令
 
-验收：Agent 能正确推进一个 run 从 QUEUED 到 PUSHED。
+验证结果：
+- 5 turns, 18 tool calls, 正确的多步推理（query → sync CI → read evidence → review → escalate）
+- 11,532 input tokens / 862 output tokens
+- **结论：Agent loop 替代 9 x 1-shot 可行**
 
-### Phase E1: Tool Layer（2-3 天）
+### Phase E1: Tool Layer ✅ (2026-03-10)
 
-1. 实现全部 8-10 个 tools（含安全检查）
-2. 实现 context builder
-3. 实现 review_code + generate_pr_body specialized tools
-4. 单元测试 tools 的安全行为
+实现：
+- 10 个 tools（+reply_human），全部含嵌入式安全检查
+- `update_state()` 修复：去掉 service 方法的非法 kwargs，支持 DONE/FAILED 终态
+- `generate_pr_body()` 重写：直接调用 `ManagerLLMClient.generate_pr_description()`，返回 body 文本
+- `github_api(create_pr)` 重写：正确的 request-open-pr → parse confirm_token → approve-open-pr 流程
+- `github_api(post_comment)` 新增
+- Context builder：`build_single_run_context()` 支持单 run 聚焦 session
+- `_resolve_workspace()` helper：优先用 DB 的 workspace_dir
 
-### Phase E2: Integration（2-3 天）
+### Phase E2: Integration ✅ (2026-03-11)
 
-1. 替换 manager_loop.py → agent session dispatch
-2. 接入 GitHub webhook → agent event
-3. 接入 Telegram → agent conversation
-4. 实现 decision audit logging
+实现：
+- `agent_loop.py`（276 行）— 持久 daemon：wake file、idle 检测、hibernation、audit
+- `run-agent-loop` CLI 命令：`--interval-sec`, `--persistent`, `--telegram-token`, `--telegram-chat-id`
+- Telegram 通知：`notify_human()`/`reply_human()` 连接 `TelegramClient`
+- Webhook：无需修改（已写 DB + touch wake file，agent loop 自然拾取）
+- Audit：每 tick 记录 tool_calls/tokens/timing/errors
 
-### Phase E3: Validation（1-2 天）
+生产验证（agent-tick 真实运行）：
+- 26 tool calls, 15K input / 1.5K output tokens
+- 正确处理 20 个 active runs：read evidence × 20, execute worker × 1, notify human × 4
+- Agent 自主优先级排序、失败诊断、人工升级
 
-1. 在 5+ repos 上测试完整流程
-2. 对比成本（token usage）
-3. 对比质量（Agent 决策 vs 旧 Manager 决策）
-4. 收集数据驱动 DP 决定
+### Phase E3: Validation & Cleanup ✅ (2026-03-16)
+
+**旧代码清理：**
+- 删除 `manager_loop.py` (1313 行)、`manager_decision.py` (403 行)、`manager_agent.py` (219 行)
+- 清理 `manager_tools.py` (-78 行)、`agent_prompts.py` (-41 行)、`cli.py` (-241 行) 中的死代码
+- 合计删除 ~2,100 行
+
+**Bug 修复（7 个）：**
+
+| 修复 | 问题 | 根因 |
+|-----|------|------|
+| A | PR body 编造证据 | `generate_pr_body` 读 DB 稀疏 metadata 而非 digest 文件 |
+| B+C | confirm_token 丢失导致 PR 创建失败 | stdout 截断(2000→8000) + artifact metadata 未存 token |
+| D+E | 纯测试文件改动被判 PASS | 无 test-only 检测 + worker skill 缺指引 |
+| F | Worker 改动不 commit+push | `execute_worker` 未调 `run-finish` |
+| G | Agent 无法迭代修复代码 | PUSHED→ITERATING 不在状态机 + prompt 只描述正向流程 |
+
+**验证（3 新 repo 端到端测试）：**
+- magentic, ExtractThinker, promptulate — 全部 Worker PASS + commit+push 成功
+- LLM PR body 验证通过：使用实际文件名、类名、测试证据（非编造）
+- Code review 正确返回 HAS_ISSUES + 具体问题描述
+- PR body 维护声明去重（只在 About Forge 模板出现一次）
+
+**未完成：**
+- approve-open-pr 端到端（被 gh auth token 过期阻塞）
+- 迭代循环运行时测试（Fix G 已提交，需运行 agent-tick 验证）
+
+### 代码统计
+
+```
+新增文件：
+  agent_session.py    191 行  — 核心 agent loop
+  agent_tools.py    1,150 行  — 10 tools + schemas + helpers（含 E3 修复）
+  agent_prompts.py    118 行  — system prompt + 2 context builders（E3 清理后）
+  agent_loop.py       276 行  — 持久 daemon
+  cli.py             +228 行  — agent-tick + run-agent-loop
+
+合计新增：~1,963 行
+已删除（E3）：~2,100 行（manager_loop.py, manager_decision.py, manager_agent.py + 死代码）
+净效果：~-137 行（新 agent 代码已含，主要是旧代码清除）
+```
 
 ---
 
@@ -896,10 +945,13 @@ Phase D (D1-D4): 验证成功
   发现: 9/9 LLM 是 1-shot, 6/9 是 rules 够用的分类器
   发现: PASS ≠ merge, 需要 Manager 更聪明（repo targeting, PR quality, follow-up）
 
-Phase E (now): 回到原始 Vision
-  把 Manager 从 9 x 1-shot 升级为真正的 Agent
+Phase E (E0-E3 done, 2026-03-10~16): 回到原始 Vision
+  E0: Agent loop spike — 5 turns, 18 tool calls, 可行性验证通过
+  E1: 10 tools 全部实现，safety in tools，LLM 直接生成 PR body
+  E2: 持久 daemon, Telegram 通知, webhook 自然集成, audit
+  E3: 旧代码删除(-2100行), 7 bug 修复, 3 新 repo 端到端验证
   保留所有已验证的资产（Worker, DB, safety, skills, review knowledge）
-  删除 plumbing，保留 domain knowledge
+  ~1,964 行替代旧 manager 代码
 ```
 
 ## 附录 B: 从 64 条 Insights 中与此重构直接相关的

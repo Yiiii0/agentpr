@@ -10,46 +10,6 @@ from typing import Any
 from .service import OrchestratorService
 
 
-# ── Skill Improvement Proposal Patterns ──────────────────────────
-# Each pattern: (reason_code_match, proposal_key, skill_name, lesson, suggestion)
-# When a grading result matches reason_code_match, a proposal is generated.
-
-SKILL_IMPROVEMENT_PATTERNS: list[dict[str, str]] = [
-    {
-        "reason_code": "missing_test_evidence",
-        "proposal_key": "validation_resilience",
-        "skill_name": "agentpr-implement-and-validate",
-        "target_file": "references/validation_requirements.md",
-        "lesson": "Worker gave up validation after install failure. Zero test/lint commands detected.",
-        "suggestion": "Strengthen fallback validation: if install fails, still try pytest/ruff/pre-commit. A failed attempt is better than no attempt.",
-    },
-    {
-        "reason_code": "timeout_with_partial_changes",
-        "proposal_key": "timeout_handling",
-        "skill_name": "agentpr-implement-and-validate",
-        "target_file": "references/self_review_checklist.md",
-        "lesson": "Worker timed out but had partial code changes. Work should not be discarded.",
-        "suggestion": "Add timeout awareness: if running long, prioritize committing partial work over running more validation.",
-    },
-    {
-        "reason_code": "no_changes_detected",
-        "proposal_key": "early_stop_prevention",
-        "skill_name": "agentpr-implement-and-validate",
-        "target_file": "references/forge_rules.md",
-        "lesson": "Worker completed with exit_code=0 but made no code changes.",
-        "suggestion": "Worker may have analyzed the repo and stopped before implementing. Ensure Phase 2 (implementation) always produces code changes.",
-    },
-    {
-        "reason_code": "diff_budget_exceeded",
-        "proposal_key": "minimal_diff_discipline",
-        "skill_name": "agentpr-implement-and-validate",
-        "target_file": "references/forge_rules.md",
-        "lesson": "Worker exceeded the diff budget (too many files or lines changed).",
-        "suggestion": "Strengthen minimal-diff contract: limit touched files, prefer targeted patch over broad refactor.",
-    },
-]
-
-
 def analyze_worker_output(
     *,
     service: OrchestratorService,
@@ -281,44 +241,6 @@ def propose_skill_improvement(
         metadata=metadata,
     )
     return {"ok": True, "run_id": run_id, **metadata}
-
-
-def detect_skill_improvement_proposals(
-    *,
-    run_id: str,
-    reason_code: str,
-    grade: str,
-    evidence: dict[str, Any] | None = None,
-) -> list[dict[str, Any]]:
-    """Detect which skill improvement proposals should be generated based on grading result.
-
-    Returns a list of proposal dicts (without storing them — caller decides).
-    """
-    proposals: list[dict[str, Any]] = []
-    normalized_reason = str(reason_code).strip().lower()
-    normalized_grade = str(grade).strip().upper()
-
-    # Only generate proposals for non-PASS grades
-    if normalized_grade == "PASS":
-        return proposals
-
-    for pattern in SKILL_IMPROVEMENT_PATTERNS:
-        if pattern["reason_code"] == normalized_reason:
-            proposals.append({
-                "run_id": run_id,
-                "proposal_key": pattern["proposal_key"],
-                "skill_name": pattern["skill_name"],
-                "target_file": pattern["target_file"],
-                "lesson": pattern["lesson"],
-                "suggestion": pattern["suggestion"],
-                "evidence": {
-                    "reason_code": normalized_reason,
-                    "grade": normalized_grade,
-                    **(evidence or {}),
-                },
-            })
-
-    return proposals
 
 
 def list_skill_proposals(

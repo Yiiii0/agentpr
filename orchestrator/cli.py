@@ -51,7 +51,6 @@ from .cli_worker import (
 from .db import Database
 from .executor import ScriptExecutor
 from .github_webhook import run_github_webhook_server
-from .manager_loop import ManagerLoopConfig, ManagerLoopRunner
 from .manager_llm import ManagerLLMClient, ManagerLLMError
 from .manager_tools import analyze_worker_output, get_global_stats, notify_user
 from .models import (
@@ -210,10 +209,20 @@ def _run_code_review(
     """
     import subprocess
 
-    # 1. Get git diff
+    # 1. Get git diff (full feature branch diff, not just latest commit)
     try:
+        # Detect base branch
+        base_ref = "HEAD~1"
+        for candidate in ("main", "master", "develop"):
+            check = subprocess.run(
+                ["git", "rev-parse", "--verify", f"upstream/{candidate}"],
+                cwd=str(repo_dir), capture_output=True, text=True, timeout=5,
+            )
+            if check.returncode == 0:
+                base_ref = f"upstream/{candidate}"
+                break
         diff_result = subprocess.run(
-            ["git", "diff", "HEAD~1..HEAD"],
+            ["git", "diff", f"{base_ref}..HEAD"],
             cwd=str(repo_dir),
             capture_output=True,
             text=True,
@@ -221,7 +230,7 @@ def _run_code_review(
         )
         diff_text = diff_result.stdout or ""
         stat_result = subprocess.run(
-            ["git", "diff", "--name-only", "HEAD~1..HEAD"],
+            ["git", "diff", "--name-only", f"{base_ref}..HEAD"],
             cwd=str(repo_dir),
             capture_output=True,
             text=True,
@@ -377,102 +386,6 @@ def add_idempotency_arg(command_parser: argparse.ArgumentParser) -> None:
         help="Optional idempotency key. Provide this for retriable command callers.",
     )
 
-
-def add_manager_common_args(command_parser: argparse.ArgumentParser) -> None:
-    command_parser.add_argument("--run-id", help="Optional single run id target.")
-    command_parser.add_argument(
-        "--limit",
-        type=int,
-        default=20,
-        help="Max runs scanned when --run-id is omitted (default: 20).",
-    )
-    command_parser.add_argument(
-        "--max-actions-per-run",
-        type=int,
-        default=4,
-        help="Max manager actions executed per run in one tick (default: 4).",
-    )
-    command_parser.add_argument(
-        "--prompt-file",
-        type=Path,
-        default=DEFAULT_WORKER_PROMPT_FILE,
-        help=(
-            "Prompt file used by run-agent-step actions "
-            f"(default: {DEFAULT_WORKER_PROMPT_FILE}; "
-            "env override: AGENTPR_WORKER_PROMPT_FILE)."
-        ),
-    )
-    command_parser.add_argument(
-        "--contract-template-file",
-        type=Path,
-        help="Optional template copied into auto-generated contract files.",
-    )
-    command_parser.add_argument(
-        "--disable-auto-contract",
-        action="store_true",
-        help="Disable automatic contract materialization when contract artifact is missing.",
-    )
-    command_parser.add_argument(
-        "--changes",
-        default="Automated integration updates from manager loop.",
-        help="Default --changes value for run-finish.",
-    )
-    command_parser.add_argument(
-        "--commit-title",
-        help="Optional default commit title for run-finish.",
-    )
-    command_parser.add_argument(
-        "--skills-mode",
-        choices=["off", "agentpr", "agentpr_autonomous"],
-        help="Optional skills mode override passed to run-agent-step.",
-    )
-    command_parser.add_argument(
-        "--codex-sandbox",
-        choices=["read-only", "workspace-write", "danger-full-access"],
-        help="Optional codex sandbox override passed to run-agent-step.",
-    )
-    command_parser.add_argument(
-        "--agent-arg",
-        action="append",
-        default=[],
-        help="Extra argument forwarded to run-agent-step (repeatable).",
-    )
-    command_parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Plan actions without executing them.",
-    )
-    command_parser.add_argument(
-        "--decision-mode",
-        choices=["rules", "llm", "hybrid"],
-        default="rules",
-        help="Manager decision strategy (default: rules).",
-    )
-    command_parser.add_argument(
-        "--manager-api-base",
-        help=(
-            "OpenAI-compatible API base for manager LLM "
-            "(default: AGENTPR_MANAGER_API_BASE or https://api.openai.com/v1)."
-        ),
-    )
-    command_parser.add_argument(
-        "--manager-model",
-        help="Manager LLM model (default: AGENTPR_MANAGER_MODEL or gpt-4o-mini).",
-    )
-    command_parser.add_argument(
-        "--manager-timeout-sec",
-        type=int,
-        default=20,
-        help="Manager LLM HTTP timeout seconds (default: 20).",
-    )
-    command_parser.add_argument(
-        "--manager-api-key-env",
-        default="AGENTPR_MANAGER_API_KEY",
-        help=(
-            "Env var name storing manager API key "
-            "(default: AGENTPR_MANAGER_API_KEY)."
-        ),
-    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1287,33 +1200,80 @@ def build_parser() -> argparse.ArgumentParser:
         help="Step-attempt rows loaded per run (default: 200).",
     )
 
-    mt = sub.add_parser(
-        "manager-tick",
-        help="Run one manager orchestration tick (rule-based actions)",
+    # ── Agent-based commands ────────────────────────────────
+    at = sub.add_parser(
+        "agent-tick",
+        help="Run one Manager Agent tick (multi-turn tool-calling loop).",
     )
-    add_manager_common_args(mt)
+    at.add_argument("--run-id", help="Optional single run id target.")
+    at.add_argument(
+        "--prompt-file",
+        type=Path,
+        default=DEFAULT_WORKER_PROMPT_FILE,
+        help="Worker prompt file.",
+    )
+    at.add_argument(
+        "--skills-mode",
+        choices=["off", "agentpr", "agentpr_autonomous"],
+        default="agentpr",
+        help="Skills mode for worker.",
+    )
+    at.add_argument(
+        "--max-turns",
+        type=int,
+        default=15,
+        help="Max agent turns per session (default: 15).",
+    )
 
-    ml = sub.add_parser(
-        "run-manager-loop",
-        help="Run manager orchestration loop continuously",
+    # ── Agent loop (persistent daemon) ────────────────────────────────
+    al = sub.add_parser(
+        "run-agent-loop",
+        help="Run the agent-based manager loop (persistent daemon).",
     )
-    add_manager_common_args(ml)
-    ml.add_argument(
+    al.add_argument("--run-id", help="Optional single run id target.")
+    al.add_argument(
+        "--prompt-file",
+        type=Path,
+        default=DEFAULT_WORKER_PROMPT_FILE,
+        help="Worker prompt file.",
+    )
+    al.add_argument(
+        "--skills-mode",
+        choices=["off", "agentpr", "agentpr_autonomous"],
+        default="agentpr",
+        help="Skills mode for worker.",
+    )
+    al.add_argument(
+        "--max-turns",
+        type=int,
+        default=15,
+        help="Max agent turns per tick (default: 15).",
+    )
+    al.add_argument(
         "--interval-sec",
         type=int,
-        default=300,
-        help="Loop interval in seconds (default: 300).",
+        default=180,
+        help="Tick interval in seconds (default: 180).",
     )
-    ml.add_argument(
+    al.add_argument(
         "--max-loops",
         type=int,
-        help="Optional max loop count for testing.",
+        default=None,
+        help="Max number of loops (default: unlimited).",
     )
-    ml.add_argument(
+    al.add_argument(
         "--persistent",
         action="store_true",
-        default=False,
-        help="Keep running even when all runs are idle (daemon mode).",
+        help="Keep running even when idle (daemon mode).",
+    )
+    al.add_argument(
+        "--telegram-token",
+        help="Telegram bot token for notifications.",
+    )
+    al.add_argument(
+        "--telegram-chat-id",
+        type=int,
+        help="Telegram chat ID for notifications.",
     )
 
     return parser
@@ -1361,9 +1321,18 @@ def resolve_startup_doctor_profile(args: argparse.Namespace) -> dict[str, Any] |
             "require_telegram_token": False,
             "require_webhook_secret": False,
         }
-    if command in {"manager-tick", "run-manager-loop"}:
+    if command == "agent-tick":
         return {
-            "profile": "manager",
+            "profile": "agent-tick",
+            "check_network": True,
+            "require_gh_auth": True,
+            "require_codex": True,
+            "require_telegram_token": False,
+            "require_webhook_secret": False,
+        }
+    if command == "run-agent-loop":
+        return {
+            "profile": "agent-loop",
             "check_network": True,
             "require_gh_auth": True,
             "require_codex": True,
@@ -1423,47 +1392,6 @@ def run_startup_doctor(
         require_webhook_secret=require_webhook_secret,
     ).run()
     return report.to_dict()
-
-
-def build_manager_loop_config_from_args(args: argparse.Namespace) -> ManagerLoopConfig:
-    prompt_file = (
-        Path(args.prompt_file).expanduser().resolve()
-        if args.prompt_file is not None
-        else None
-    )
-    contract_template_file = (
-        Path(args.contract_template_file).expanduser().resolve()
-        if args.contract_template_file is not None
-        else None
-    )
-    return ManagerLoopConfig(
-        project_root=PROJECT_ROOT,
-        db_path=Path(args.db),
-        workspace_root=Path(args.workspace_root),
-        integration_root=Path(args.integration_root),
-        policy_file=Path(args.policy_file),
-        run_id=str(args.run_id).strip() if args.run_id else None,
-        limit=max(int(args.limit), 1),
-        max_actions_per_run=max(int(args.max_actions_per_run), 1),
-        prompt_file=prompt_file,
-        contract_template_file=contract_template_file,
-        auto_contract=not bool(args.disable_auto_contract),
-        default_changes=str(args.changes),
-        default_commit_title=(str(args.commit_title).strip() if args.commit_title else None),
-        codex_sandbox=(
-            str(args.codex_sandbox).strip() if args.codex_sandbox is not None else None
-        ),
-        skills_mode=str(args.skills_mode).strip() if args.skills_mode is not None else None,
-        agent_args=tuple(str(item) for item in (args.agent_arg or [])),
-        dry_run=bool(args.dry_run),
-        decision_mode=str(args.decision_mode).strip().lower(),
-        manager_api_base=(
-            str(args.manager_api_base).strip() if args.manager_api_base is not None else None
-        ),
-        manager_model=str(args.manager_model).strip() if args.manager_model is not None else None,
-        manager_timeout_sec=max(int(args.manager_timeout_sec), 1),
-        manager_api_key_env=str(args.manager_api_key_env).strip() or "AGENTPR_MANAGER_API_KEY",
-    )
 
 
 def enforce_startup_doctor_gate(args: argparse.Namespace) -> None:
@@ -1770,68 +1698,139 @@ def main() -> int:
 
         enforce_startup_doctor_gate(args)
 
-        if args.command == "manager-tick":
-            config = build_manager_loop_config_from_args(args)
-            runner = ManagerLoopRunner(service=service, config=config)
-            report = runner.tick()
-            print_json(report)
-            return 0 if report["ok"] else 1
+        if args.command == "agent-tick":
+            from .agent_prompts import (
+                MANAGER_SYSTEM_PROMPT,
+                build_single_run_context,
+                build_tick_context,
+            )
+            from .agent_session import AgentResult, create_config_from_env, run_agent_session
+            from .agent_tools import AgentToolkit, get_tool_schemas
 
-        if args.command == "run-manager-loop":
-            config = build_manager_loop_config_from_args(args)
-            runner = ManagerLoopRunner(service=service, config=config)
-            loops = 0
-            fail_count = 0
-            consecutive_idle = 0
-            _IDLE_EXIT_TICKS = 3  # exit after N consecutive all-waiting ticks
-            persistent = bool(getattr(args, "persistent", False))
-            wake_path = Path(args.db).parent / ".wake_manager"
-            _HIBERNATE_INTERVAL = 600  # longer sleep when idle in persistent mode
-            try:
-                while True:
-                    report = runner.tick()
-                    print_json(report)
-                    if not bool(report.get("ok", False)):
-                        fail_count += 1
-                    progressed = int(report.get("progressed_count", 0))
-                    if progressed == 0 and int(report.get("run_count", 0)) > 0:
-                        consecutive_idle += 1
-                    else:
-                        consecutive_idle = 0
-                    loops += 1
-                    if args.max_loops is not None and loops >= max(int(args.max_loops), 1):
-                        break
-                    # Exit early if all runs are waiting/terminal for N ticks
-                    if consecutive_idle >= _IDLE_EXIT_TICKS and not persistent:
-                        print_json({
-                            "idle_exit": True,
-                            "reason": (
-                                f"all runs idle for {consecutive_idle} consecutive ticks, "
-                                "exiting. Resume with /retry or /resume when ready."
-                            ),
-                            "loops_completed": loops,
-                        })
-                        break
-                    # In persistent mode, hibernate when idle (longer interval)
-                    if persistent and consecutive_idle > 0:
-                        sleep_sec = min(
-                            max(int(args.interval_sec), 1) * 2,
-                            _HIBERNATE_INTERVAL,
-                        )
-                    else:
-                        sleep_sec = max(int(args.interval_sec), 1)
-                    # Check wake file: webhook or bot can signal immediate tick
-                    if wake_path.exists():
-                        try:
-                            wake_path.unlink(missing_ok=True)
-                        except OSError:
-                            pass
-                        sleep_sec = 1  # immediate next tick
-                        consecutive_idle = 0  # reset idle counter
-                    time.sleep(sleep_sec)
-            except KeyboardInterrupt:
-                return 130
-            return 0 if fail_count == 0 else 1
+            agent_config = create_config_from_env(
+                max_turns=getattr(args, "max_turns", 15),
+                timeout_sec=120,
+            )
+            toolkit = AgentToolkit(
+                service=service,
+                workspace_root=args.workspace_root,
+                integration_root=args.integration_root,
+                prompt_file=getattr(args, "prompt_file", None),
+                skills_mode=getattr(args, "skills_mode", "agentpr"),
+            )
+
+            # Build context: list active runs
+            runs = service.list_runs(limit=50)
+            _TERMINAL = {"DONE", "SKIPPED", "FAILED_TERMINAL"}
+            non_terminal = [
+                r for r in runs
+                if r.get("current_state", r.get("state", "")).upper() not in _TERMINAL
+            ]
+
+            if args.run_id:
+                # Single-run focus mode
+                target_runs = [r for r in runs if r.get("run_id") == args.run_id]
+                if not target_runs:
+                    print_json({"ok": False, "error": f"Run {args.run_id} not found."})
+                    return 1
+                r = target_runs[0]
+                run_summary = (
+                    f"- {r.get('run_id', '?')} | "
+                    f"{r.get('owner', '?')}/{r.get('repo', '?')} | "
+                    f"{r.get('current_state', r.get('state', '?'))}"
+                )
+                context = build_single_run_context(run_summary=run_summary)
+            else:
+                if not non_terminal:
+                    print_json({"ok": True, "message": "No active runs to process.", "turns": 0})
+                    return 0
+
+                from .agent_tools import _format_run_summary
+
+                runs_summary = "\n".join(_format_run_summary(r) for r in non_terminal)
+
+                # Build global stats
+                total = len(runs)
+                active = len(non_terminal)
+                by_state: dict[str, int] = {}
+                for r in non_terminal:
+                    s = r.get("current_state", r.get("state", "?"))
+                    by_state[s] = by_state.get(s, 0) + 1
+                stats = f"Total: {total}, Active: {active}. By state: {by_state}"
+
+                context = build_tick_context(
+                    active_runs_summary=runs_summary,
+                    global_stats=stats,
+                )
+
+            result: AgentResult = run_agent_session(
+                config=agent_config,
+                system_prompt=MANAGER_SYSTEM_PROMPT,
+                context=context,
+                tools=get_tool_schemas(),
+                tool_executor=toolkit.execute,
+            )
+
+            print_json({
+                "ok": result.error is None,
+                "turns": result.turns_used,
+                "tool_calls": len(result.tool_calls_made),
+                "tools_used": [tc["name"] for tc in result.tool_calls_made],
+                "input_tokens": result.total_input_tokens,
+                "output_tokens": result.total_output_tokens,
+                "final_text": result.final_text[:1000],
+                "error": result.error,
+            })
+            return 0 if result.error is None else 1
+
+        if args.command == "run-agent-loop":
+            from .agent_loop import AgentLoopConfig, run_agent_loop
+            from .agent_session import create_config_from_env
+
+            agent_config = create_config_from_env(
+                max_turns=getattr(args, "max_turns", 15),
+                timeout_sec=120,
+            )
+            loop_config = AgentLoopConfig(
+                interval_sec=getattr(args, "interval_sec", 180),
+                max_loops=getattr(args, "max_loops", None),
+                persistent=getattr(args, "persistent", False),
+                max_turns_per_tick=getattr(args, "max_turns", 15),
+            )
+
+            # Set up optional Telegram sender
+            telegram_sender = None
+            tg_token = getattr(args, "telegram_token", None) or os.environ.get("AGENTPR_TELEGRAM_BOT_TOKEN", "")
+            tg_chat_id = getattr(args, "telegram_chat_id", None)
+            if not tg_chat_id:
+                tg_chat_id_str = os.environ.get("AGENTPR_TELEGRAM_ADMIN_CHAT_ID", "")
+                if tg_chat_id_str.strip():
+                    try:
+                        tg_chat_id = int(tg_chat_id_str.strip())
+                    except ValueError:
+                        pass
+            if tg_token and tg_chat_id:
+                from .telegram_bot import TelegramClient
+
+                tg_client = TelegramClient(tg_token)
+
+                def _tg_send(text: str) -> None:
+                    tg_client.send_message(chat_id=tg_chat_id, text=text)
+
+                telegram_sender = _tg_send
+                logger.info("Telegram notifications enabled (chat_id=%d).", tg_chat_id)
+
+            exit_code = run_agent_loop(
+                service=service,
+                agent_config=agent_config,
+                loop_config=loop_config,
+                workspace_root=args.workspace_root,
+                integration_root=args.integration_root,
+                prompt_file=getattr(args, "prompt_file", None),
+                skills_mode=getattr(args, "skills_mode", "agentpr"),
+                telegram_sender=telegram_sender,
+            )
+            return exit_code
 
         if args.command == "create-run":
             budget = json.loads(args.budget_json)
@@ -2606,9 +2605,10 @@ def main() -> int:
             snapshot = service.get_run_snapshot(args.run_id)
             run = snapshot["run"]
             current_state = RunState(snapshot["state"])
-            if current_state != RunState.PUSHED:
+            _REVIEW_ALLOWED = {RunState.PUSHED, RunState.ITERATING}
+            if current_state not in _REVIEW_ALLOWED:
                 raise ValueError(
-                    "run-code-review is allowed only when run state is PUSHED."
+                    f"run-code-review is allowed only when run state is PUSHED or ITERATING (current: {current_state.value})."
                 )
             repo_dir = Path(run["workspace_dir"])
             if not repo_dir.exists():
@@ -2706,6 +2706,8 @@ def main() -> int:
                 metadata={
                     "base": base,
                     "head": head,
+                    "confirm_token": confirm_token,
+                    "request_file": str(request_path),
                     "expires_at": expires_at.isoformat(),
                     "body_meta": body_meta,
                 },
