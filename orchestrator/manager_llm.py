@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from typing import Any
+
+from .agent_session import is_reasoning_model
+
+logger = logging.getLogger(__name__)
 
 
 class ManagerLLMError(RuntimeError):
@@ -130,9 +135,14 @@ class ManagerLLMClient:
         if not api_key:
             raise ManagerLLMError(f"missing manager api key env: {key_env}")
         resolved_base = str(api_base or os.environ.get("AGENTPR_MANAGER_API_BASE") or "https://api.openai.com/v1").rstrip("/")
-        resolved_model = str(model or os.environ.get("AGENTPR_MANAGER_MODEL") or "gpt-4o-mini").strip()
+        resolved_model = str(model or os.environ.get("AGENTPR_MANAGER_MODEL") or "tensorblock/gpt-4o").strip()
         if not resolved_model:
             raise ManagerLLMError("missing manager model")
+        # Reasoning models (o1/o3) have rate limits and timeout issues for
+        # specialized tasks; fall back to gpt-4o which is validated for quality
+        if is_reasoning_model(resolved_model):
+            logger.warning("Reasoning model %s not recommended for specialized LLM tasks; falling back to gpt-4o", resolved_model)
+            resolved_model = "tensorblock/gpt-4o"
         return cls(
             ManagerLLMConfig(
                 api_base=resolved_base,
@@ -598,6 +608,12 @@ class ManagerLLMClient:
         )
 
     def _request_chat_completion(self, payload: dict[str, Any]) -> dict[str, Any]:
+        # o1/o3 reasoning models: strip temperature, convert system→developer
+        if is_reasoning_model(self.config.model):
+            payload.pop("temperature", None)
+            for msg in payload.get("messages", []):
+                if msg.get("role") == "system":
+                    msg["role"] = "developer"
         body = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(
             url=f"{self.config.api_base}/chat/completions",
@@ -895,6 +911,7 @@ class ManagerLLMClient:
         "through Forge's OpenAI-compatible API endpoint.\"\n\n"
         "## Changes\n"
         "Per-file, one line each. Use actual filenames from the diff.\n"
+        "IMPORTANT: You MUST list EVERY file shown in diff_stat. Do NOT omit any file.\n"
         "Example:\n"
         "- `src/services/forge/llm.py`: New ForgeAPI class with settings and model resolution\n"
         "- `env.example`: Added FORGE_API_KEY and FORGE_API_BASE entries\n\n"
@@ -903,6 +920,8 @@ class ManagerLLMClient:
         "- Environment variables to set (FORGE_API_KEY, optionally FORGE_API_BASE)\n"
         "- The user-facing command, config entry, or constructor call to select Forge\n"
         "- Example model name format if applicable (e.g. `Provider/model-name`)\n"
+        "IMPORTANT: Extract the exact usage pattern from the diff or test files. "
+        "Do NOT invent API signatures. If tests show `LLM('forge/OpenAI/gpt-4o-mini')`, use that exact pattern.\n"
         "Do NOT show internal implementation functions, routing logic, or private methods. "
         "If the project is a CLI tool, show the CLI command. If it's a library, show the import + instantiation. "
         "If it's a GUI app, describe the configuration steps.\n\n"
@@ -947,38 +966,47 @@ class ManagerLLMClient:
         # Filter evidence to only include user-facing information.
         # Strip internal grading codes and system metadata that the LLM
         # would otherwise echo into the PR body.
-        filtered_evidence: dict[str, Any] = {}
         _internal_keys = {
             "reason_code", "next_action", "semantic", "grade",
             "artifact_type", "artifact_uri", "ok", "run_id",
         }
+        evidence_lines: list[str] = []
         for k, v in evidence.items():
             if k in _internal_keys:
                 continue
-            if isinstance(v, dict):
-                filtered_evidence[k] = {
-                    sk: sv for sk, sv in v.items() if sk not in _internal_keys
-                }
+            if isinstance(v, list):
+                evidence_lines.append(f"- {k}: {', '.join(str(x) for x in v)}")
+            elif isinstance(v, dict):
+                filtered = {sk: sv for sk, sv in v.items() if sk not in _internal_keys}
+                evidence_lines.append(f"- {k}: {json.dumps(filtered)}")
             else:
-                filtered_evidence[k] = v
-        user_content = json.dumps(
-            {
-                "diff_stat": diff_stat[:2000],
-                "diff": diff_text[:4000],
-                "evidence": filtered_evidence,
-            },
-            ensure_ascii=True,
+                evidence_lines.append(f"- {k}: {v}")
+
+        # Build user content as structured plaintext so the LLM can
+        # parse the diff's +/- structure directly (JSON-encoding flattens
+        # newlines into \n literals, destroying visual diff structure).
+        user_content = (
+            f"## Files Changed\n```\n{diff_stat[:2000]}\n```\n\n"
+            f"## Diff\n```diff\n{diff_text[:4000]}\n```\n\n"
+            f"## Test Evidence\n" + ("\n".join(evidence_lines) if evidence_lines else "No evidence available.")
         )
+        # o1/o3 models: use "developer" role instead of "system", no temperature
+        _is_reasoning = is_reasoning_model(self.config.model)
+        sys_role = "developer" if _is_reasoning else "system"
         messages = [
-            {"role": "system", "content": system_prompt},
+            {"role": sys_role, "content": system_prompt},
             {"role": "user", "content": user_content},
         ]
-        payload = {
+        payload: dict[str, Any] = {
             "model": self.config.model,
-            "temperature": 0.3,
             "messages": messages,
         }
+        if not _is_reasoning:
+            payload["temperature"] = 0.3
         data = self._request_chat_completion(payload)
+        # Log actual model returned by API (helps detect Forge routing issues)
+        resp_model = data.get("model", "unknown")
+        logger.info("PR body generated by model=%s (requested=%s)", resp_model, self.config.model)
         choices = data.get("choices")
         if not isinstance(choices, list) or not choices:
             raise ManagerLLMError("pr description: missing choices")

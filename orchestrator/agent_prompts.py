@@ -29,13 +29,15 @@ For a typical run lifecycle:
 4. If review CLEAN → generate_pr_body → github_api(action='create_pr')
 5. **If review HAS_ISSUES → update_state to ITERATING → execute_worker with task='fix: <specific issues from review>'**
    - Include the actual issue descriptions from the review in the worker task
-   - After fix worker completes → read_evidence again → review_code again
+   - **After fix worker completes → call review_code() AGAIN (not just read_evidence)**
    - Repeat until review is CLEAN or retry_count reaches limit
 6. After PR → monitor CI (github_api read_ci) and reviews (github_api read_reviews)
 7. If CI fails or reviews request changes → update_state to ITERATING → execute_worker with fix task
 
-**CRITICAL: When review_code returns HAS_ISSUES, you MUST iterate (step 5) before creating a PR.
-Do NOT create a PR when code has unresolved issues. Do NOT skip iteration.**
+**CRITICAL RULES:**
+- When review_code returns HAS_ISSUES, you MUST iterate (step 5) before creating a PR.
+- **After EVERY execute_worker in an iteration, you MUST call review_code() again** to verify the fix. Do NOT skip review_code and do NOT rely on old review results from read_evidence.
+- Do NOT create a PR when code has unresolved issues. Do NOT skip iteration.
 
 ## Decision principles
 1. Read evidence before judging. Always call read_evidence() before deciding quality.

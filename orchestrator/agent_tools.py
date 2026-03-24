@@ -223,11 +223,16 @@ class AgentToolkit:
         else:
             parts.append("\nNo worker evidence yet.")
 
-        # Code review artifact
+        # Code review artifact (with staleness check)
         review = self.service.latest_artifact(run_id, artifact_type="code_review")
         if review:
             rmeta = review.get("metadata") or {}
-            parts.append(f"\n### Code Review")
+            # Check if review is stale (older than latest run_digest)
+            review_ts = review.get("created_at", "")
+            digest_ts = (digest or {}).get("created_at", "")
+            is_stale = bool(digest_ts and review_ts and review_ts < digest_ts)
+            stale_tag = " ⚠️ STALE — this review was done BEFORE the latest worker run. Call review_code() for a fresh review." if is_stale else ""
+            parts.append(f"\n### Code Review{stale_tag}")
             parts.append(f"Verdict: {rmeta.get('verdict', 'N/A')}")
             parts.append(f"Summary: {rmeta.get('summary', 'N/A')}")
             if rmeta.get("issues"):
@@ -336,11 +341,20 @@ class AgentToolkit:
                 has_uncommitted = False
 
             if has_uncommitted:
+                # Derive commit message from task type
+                repo_name = run_data.get("repo", "project")
+                _task_lower = task.lower()
+                if "ci" in _task_lower or "lint" in _task_lower:
+                    commit_msg = f"Fix CI/lint issues for {repo_name}"
+                elif "review" in _task_lower or "fix" in _task_lower:
+                    commit_msg = f"Address review feedback for {repo_name}"
+                else:
+                    commit_msg = f"Add Forge as LLM provider for {repo_name}"
                 # Run finish.sh to commit + push
                 finish_result = self._run_cli([
                     "run-finish",
                     "--run-id", run_id,
-                    "--changes", f"Add Forge as LLM provider for {run_data.get('repo', 'project')}",
+                    "--changes", commit_msg,
                 ])
                 if not finish_result["ok"]:
                     return (
@@ -351,7 +365,7 @@ class AgentToolkit:
 
         return (
             f"OK: Worker completed for {run_id}. "
-            f"Use read_evidence(run_id='{run_id}') to check results."
+            f"Next: call review_code(run_id='{run_id}') to verify code quality."
         )
 
     # ── Tool 5: github_api ──────────────────────────────────────────────
@@ -396,6 +410,15 @@ class AgentToolkit:
                 f"PR creation requires a CLEAN code review."
             )
 
+        # Ensure run is in PUSHED state (may be ITERATING after fix iteration)
+        try:
+            snap = self.service.get_run_snapshot(run_id)
+            current = RunState(snap.get("state", snap.get("run", {}).get("current_state", "")))
+            if current == RunState.ITERATING:
+                self.service.resume_run(run_id, target_state=RunState.PUSHED)
+        except Exception as exc:
+            return f"ERROR: Cannot prepare state for PR creation: {exc}. Run is in unexpected state."
+
         title = params.get("title", "")
         body = params.get("body", "")
 
@@ -420,47 +443,57 @@ class AgentToolkit:
                 return f"ERROR: Failed to write PR body to temp file: {exc}"
         # If no body provided, let the CLI generate it via LLM
 
-        result = self._run_cli(argv)
-        if not result["ok"]:
-            return f"ERROR: PR request creation failed: {result.get('error', 'unknown')}"
-
-        # Parse request output for confirm_token and request_file
-        request_file = None
-        confirm_token = None
         try:
-            output = json.loads(result.get("output", "{}"))
-            request_file = output.get("request_file")
-            confirm_token = output.get("confirm_token")
-        except (json.JSONDecodeError, TypeError):
-            # Try to find from artifacts
-            art = self.service.latest_artifact(run_id, artifact_type="pr_open_request")
-            if art:
-                meta = art.get("metadata") or {}
-                request_file = meta.get("request_file") or art.get("uri")
-                confirm_token = meta.get("confirm_token")
+            result = self._run_cli(argv)
+            if not result["ok"]:
+                return f"ERROR: PR request creation failed: {result.get('error', 'unknown')}"
 
-        if not request_file or not confirm_token:
-            return (
-                f"PR request created for {run_id}, but could not extract confirm_token. "
-                f"Use the CLI to approve manually: approve-open-pr --run-id {run_id}"
-            )
-
-        # Auto-approve the PR
-        approve_argv = [
-            "approve-open-pr",
-            "--run-id", run_id,
-            "--request-file", str(request_file),
-            "--confirm-token", confirm_token,
-            "--confirm",
-        ]
-        approve_result = self._run_cli(approve_argv)
-
-        # Clean up temp file
-        if body_file:
+            # Parse request output for confirm_token and request_file
+            request_file = None
+            confirm_token = None
             try:
-                os.unlink(body_file.name)
-            except OSError:
-                pass
+                output = json.loads(result.get("output", "{}"))
+                request_file = output.get("request_file")
+                confirm_token = output.get("confirm_token")
+            except (json.JSONDecodeError, TypeError):
+                # Try to find from artifacts
+                art = self.service.latest_artifact(run_id, artifact_type="pr_open_request")
+                if art:
+                    meta = art.get("metadata") or {}
+                    request_file = meta.get("request_file") or art.get("uri")
+                    confirm_token = meta.get("confirm_token")
+
+            if not request_file or not confirm_token:
+                return (
+                    f"PR request created for {run_id}, but could not extract confirm_token. "
+                    f"Use the CLI to approve manually: approve-open-pr --run-id {run_id}"
+                )
+
+            # Dry-run mode: generate PR body but don't actually create GitHub PR
+            if os.environ.get("AGENTPR_PR_DRY_RUN", "").strip().lower() in ("1", "true", "yes"):
+                logger.info("DRY RUN: Skipping approve-open-pr for %s (request_file=%s)", run_id, request_file)
+                return (
+                    f"DRY RUN: PR request generated for {run_id}. "
+                    f"Request file: {request_file}. "
+                    f"To actually create the PR, run approve-open-pr manually or disable AGENTPR_PR_DRY_RUN."
+                )
+
+            # Auto-approve the PR
+            approve_argv = [
+                "approve-open-pr",
+                "--run-id", run_id,
+                "--request-file", str(request_file),
+                "--confirm-token", confirm_token,
+                "--confirm",
+            ]
+            approve_result = self._run_cli(approve_argv)
+        finally:
+            # Clean up temp file on all exit paths
+            if body_file:
+                try:
+                    os.unlink(body_file.name)
+                except OSError:
+                    pass
 
         if approve_result["ok"]:
             # Try to get PR number from output
@@ -625,15 +658,25 @@ class AgentToolkit:
 
         project_name = run_data.get("repo", "unknown")
 
-        # Get git diff + stat
+        # Get git diff + stat (full feature branch diff, not just latest commit)
         try:
+            # Detect base branch
+            base_branch = "main"
+            for candidate in ("main", "master", "develop"):
+                check = subprocess.run(
+                    ["git", "rev-parse", "--verify", f"upstream/{candidate}"],
+                    cwd=str(workspace_dir), capture_output=True, text=True, timeout=5,
+                )
+                if check.returncode == 0:
+                    base_branch = f"upstream/{candidate}"
+                    break
             diff_proc = subprocess.run(
-                ["git", "diff", "HEAD~1..HEAD"],
+                ["git", "diff", f"{base_branch}..HEAD"],
                 cwd=str(workspace_dir), capture_output=True, text=True, timeout=15,
             )
             diff_text = (diff_proc.stdout or "")[:4000]
             stat_proc = subprocess.run(
-                ["git", "show", "--stat", "HEAD"],
+                ["git", "diff", "--stat", f"{base_branch}..HEAD"],
                 cwd=str(workspace_dir), capture_output=True, text=True, timeout=15,
             )
             diff_stat = (stat_proc.stdout or "")[:2000]
@@ -689,7 +732,7 @@ class AgentToolkit:
             client = ManagerLLMClient.from_runtime(
                 api_base=None,
                 model=None,
-                timeout_sec=30,
+                timeout_sec=300,  # reasoning models (o1/o3) need longer
                 api_key_env="AGENTPR_MANAGER_API_KEY",
             )
             body = client.generate_pr_description(
@@ -1134,7 +1177,7 @@ def _suggest_action(state: str, run: dict[str, Any]) -> str:
     elif s == "REVIEW_WAIT":
         return "github_api(action='read_reviews') to check maintainer feedback"
     elif s == "ITERATING":
-        return "execute_worker(task='ci_fix' or 'review_fix'), then read_evidence()"
+        return "execute_worker(task='fix: <issues>') → review_code() to verify fix → if CLEAN: update_state('PUSHED') → create PR. MUST re-review after each iteration."
     elif s == "NEEDS_HUMAN_REVIEW":
         return "Wait for human input or notify_human() with update"
     elif s in ("DONE", "SKIPPED", "FAILED_TERMINAL"):

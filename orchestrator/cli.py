@@ -209,10 +209,20 @@ def _run_code_review(
     """
     import subprocess
 
-    # 1. Get git diff
+    # 1. Get git diff (full feature branch diff, not just latest commit)
     try:
+        # Detect base branch
+        base_ref = "HEAD~1"
+        for candidate in ("main", "master", "develop"):
+            check = subprocess.run(
+                ["git", "rev-parse", "--verify", f"upstream/{candidate}"],
+                cwd=str(repo_dir), capture_output=True, text=True, timeout=5,
+            )
+            if check.returncode == 0:
+                base_ref = f"upstream/{candidate}"
+                break
         diff_result = subprocess.run(
-            ["git", "diff", "HEAD~1..HEAD"],
+            ["git", "diff", f"{base_ref}..HEAD"],
             cwd=str(repo_dir),
             capture_output=True,
             text=True,
@@ -220,7 +230,7 @@ def _run_code_review(
         )
         diff_text = diff_result.stdout or ""
         stat_result = subprocess.run(
-            ["git", "diff", "--name-only", "HEAD~1..HEAD"],
+            ["git", "diff", "--name-only", f"{base_ref}..HEAD"],
             cwd=str(repo_dir),
             capture_output=True,
             text=True,
@@ -2595,9 +2605,10 @@ def main() -> int:
             snapshot = service.get_run_snapshot(args.run_id)
             run = snapshot["run"]
             current_state = RunState(snapshot["state"])
-            if current_state != RunState.PUSHED:
+            _REVIEW_ALLOWED = {RunState.PUSHED, RunState.ITERATING}
+            if current_state not in _REVIEW_ALLOWED:
                 raise ValueError(
-                    "run-code-review is allowed only when run state is PUSHED."
+                    f"run-code-review is allowed only when run state is PUSHED or ITERATING (current: {current_state.value})."
                 )
             repo_dir = Path(run["workspace_dir"])
             if not repo_dir.exists():

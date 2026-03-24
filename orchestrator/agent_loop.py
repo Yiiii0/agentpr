@@ -221,6 +221,23 @@ def agent_tick(
         tool_executor=toolkit.execute,
     )
 
+    # Auto-escalate on max_turns: transition in-progress runs to NEEDS_HUMAN_REVIEW
+    if result.error == "max_turns_exceeded":
+        _IN_PROGRESS = {"EXECUTING", "ITERATING", "PUSHED"}
+        for r in active_runs:
+            r_state = r.get("current_state", r.get("state", "")).upper()
+            r_id = r.get("run_id", "")
+            if r_state in _IN_PROGRESS and r_id:
+                try:
+                    toolkit.update_state(
+                        run_id=r_id,
+                        to_state="NEEDS_HUMAN_REVIEW",
+                        reason="Max agent turns exceeded — auto-escalating",
+                    )
+                    logger.warning("Auto-escalated %s to NEEDS_HUMAN_REVIEW (max turns)", r_id)
+                except Exception:
+                    logger.warning("Failed to auto-escalate %s", r_id, exc_info=True)
+
     return AgentTickResult(
         ok=result.error is None,
         turns_used=result.turns_used,
@@ -238,10 +255,8 @@ def _record_tick_audit(
     tick_result: AgentTickResult,
     tick_number: int,
 ) -> None:
-    """Record tick result as audit artifact for debugging and analysis."""
+    """Record tick result as audit JSONL for debugging and analysis."""
     try:
-        # Store as a global artifact (not run-specific)
-        # Use a special "system" run_id convention
         audit_data = {
             "tick_number": tick_number,
             "ok": tick_result.ok,
@@ -254,9 +269,15 @@ def _record_tick_audit(
             "error": tick_result.error,
             "timestamp": time.time(),
         }
-        logger.debug("Tick audit: %s", json.dumps(audit_data, ensure_ascii=False)[:500])
+        # Persist to JSONL file for cross-session analysis
+        audit_dir = service.db.db_path.parent / "data"
+        audit_dir.mkdir(parents=True, exist_ok=True)
+        audit_file = audit_dir / "agent_tick_audit.jsonl"
+        with open(audit_file, "a") as f:
+            f.write(json.dumps(audit_data, ensure_ascii=False) + "\n")
+        logger.debug("Tick audit written to %s", audit_file)
     except Exception:
-        pass  # Best-effort audit logging
+        logger.debug("Tick audit write failed", exc_info=True)
 
 
 def _sleep_with_wake(sleep_sec: int, wake_path: Path) -> None:

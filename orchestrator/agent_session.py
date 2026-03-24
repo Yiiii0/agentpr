@@ -18,6 +18,15 @@ from typing import Any, Callable
 
 logger = logging.getLogger("agentpr.agent_session")
 
+# Reasoning model tags — update this one list when new reasoning models appear
+_REASONING_TAGS = ("o1", "o3")
+
+
+def is_reasoning_model(model: str) -> bool:
+    """Check if a model is a reasoning model (o1/o3) that lacks tool-calling support."""
+    low = model.lower()
+    return any(tag in low for tag in _REASONING_TAGS)
+
 
 @dataclass(frozen=True)
 class AgentConfig:
@@ -49,12 +58,21 @@ def create_config_from_env(
     temperature: float = 0,
     timeout_sec: int = 120,
 ) -> AgentConfig:
-    """Create AgentConfig from environment variables (same as existing ManagerLLMClient)."""
+    """Create AgentConfig from environment variables.
+
+    Uses AGENTPR_AGENT_MODEL (defaults to tensorblock/gpt-4o) for the
+    multi-turn tool-calling agent.  This is intentionally separate from
+    AGENTPR_MANAGER_MODEL which controls specialized LLM tasks (PR body,
+    code review) and can be set to reasoning models like o1.
+    """
     api_key = os.environ.get("AGENTPR_MANAGER_API_KEY", "").strip()
     if not api_key:
         raise ValueError("AGENTPR_MANAGER_API_KEY not set")
     api_base = os.environ.get("AGENTPR_MANAGER_API_BASE", "https://api.openai.com/v1").rstrip("/")
-    model = os.environ.get("AGENTPR_MANAGER_MODEL", "tensorblock/gpt-4o").strip()
+    model = os.environ.get("AGENTPR_AGENT_MODEL", os.environ.get("AGENTPR_MANAGER_MODEL", "tensorblock/gpt-4o")).strip()
+    # Reasoning models (o1/o3) don't support tool-calling; fallback to gpt-4o
+    if is_reasoning_model(model):
+        model = "tensorblock/gpt-4o"
     return AgentConfig(
         api_base=api_base,
         api_key=api_key,
@@ -77,8 +95,10 @@ def run_agent_session(
 
     Uses OpenAI /chat/completions format through Forge — model-agnostic.
     """
+    # o1/o3 reasoning models use "developer" role instead of "system"
+    _sys_role = "developer" if is_reasoning_model(config.model) else "system"
     messages: list[dict[str, Any]] = [
-        {"role": "system", "content": system_prompt},
+        {"role": _sys_role, "content": system_prompt},
         {"role": "user", "content": context},
     ]
 
@@ -87,12 +107,13 @@ def run_agent_session(
     for turn in range(config.max_turns):
         result.turns_used = turn + 1
 
-        # Call LLM
+        # Call LLM (o1/o3 reasoning models don't support temperature)
         payload: dict[str, Any] = {
             "model": config.model,
             "messages": messages,
-            "temperature": config.temperature,
         }
+        if not is_reasoning_model(config.model):
+            payload["temperature"] = config.temperature
         if tools:
             payload["tools"] = tools
 

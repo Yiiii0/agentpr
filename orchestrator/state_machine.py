@@ -84,6 +84,8 @@ _ALLOWED_TRANSITIONS: dict[RunState, set[RunState]] = {
     RunState.ITERATING: {
         RunState.IMPLEMENTING,
         RunState.LOCAL_VALIDATING,
+        RunState.PUSHED,  # after successful fix iteration + push
+        RunState.EXECUTING,  # restart full worker cycle
         RunState.PAUSED,
         RunState.FAILED,
         RunState.FAILED_RETRYABLE,

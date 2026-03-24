@@ -18,3 +18,4 @@ start_claude_code.sh
 test/
 log.txt
 *.txt
+.claude/
